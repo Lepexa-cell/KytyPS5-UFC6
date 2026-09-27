@@ -515,7 +515,8 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization,
+                                        bool                    float_image_atomics) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -561,10 +562,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+		// Image atomics operate on the raw texel bits, and only the integer atomics decode, so an
+		// atomic on an R32 sint or float surface is a uint atomic on the same bits.
+		// --no-float-image-atomics still turns the float case off.
+		const bool float_atomic =
+		    float_image_atomics && base.atomic && format == Prospero::BufferFormat::k32Float;
 		if (base.atomic &&
 		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
 		                   : format != Prospero::BufferFormat::k32UInt &&
-		                         format != Prospero::BufferFormat::k32Float)) {
+		                         format != Prospero::BufferFormat::k32SInt && !float_atomic)) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -587,12 +593,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
-			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
+			if ((!raw_sint_storage && !base.atomic &&
+			     image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));
 			}
+			// Integer image atomics operate on the raw 32-bit texel, independently of
+			// the descriptor numeric format. R32 float/sint loads and stores preserve
+			// the same register bits through this uint view.
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
@@ -1278,7 +1288,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	if (!BuildResourceSpecialization(program, snapshot, specialization)) {
+	if (!BuildResourceSpecialization(program, snapshot, specialization,
+	                                 runtime.float_image_atomics)) {
 		return FailIndirect(__LINE__);
 	}
 	return true;

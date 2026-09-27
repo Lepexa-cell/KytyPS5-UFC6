@@ -393,8 +393,11 @@ public:
 				}
 			}
 			if (plan.reads[0] != nullptr) {
-				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word)
-					m_program.memory_info[plan.memory[word]].planning_only = true;
+				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word) {
+					// A read the shader also uses as data stays a real load of the table.
+					if (!plan.kept[word])
+						m_program.memory_info[plan.memory[word]].planning_only = true;
+				}
 			}
 		}
 		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
@@ -402,7 +405,11 @@ public:
 		for (const auto& plan: m_indirect_descriptors) {
 			if (plan.handle->GetOpcode() != ValueOpcode::GetImageResource || plan.reads[0] == nullptr)
 				continue;
-			for (const auto* read: plan.reads) {
+			// A kept read keeps its value for its other users; only the handle takes the key.
+			if (plan.kept[0]) plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+				const auto* read = plan.reads[dword];
+				if (plan.kept[dword]) continue;
 				const auto first = std::ranges::find_if(m_indirect_descriptors, [&](const auto& candidate) {
 					return candidate.reads[0] == read;
 				});
@@ -443,6 +450,8 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		// Reads other code also consumes: they stay real loads instead of planning-only.
+		std::array<bool, 8>        kept {};
 	};
 
 	// A non-fatal compile gives the shader up instead: the failure unwinds to TrackResources,
@@ -1763,9 +1772,12 @@ private:
 				return RejectIndirect(handle, __LINE__);
 			}
 			table_handle = current_handle;
-			if (handle.NumArgs() == 8u
-			        ? WorkgroupAxis(key) == UINT32_MAX && !UsesOnlyImageDescriptors(*read) :
-			    std::ranges::any_of(read->Uses(), [](const Use& use) {
+			// Samples of the same texture share the (deduplicated) descriptor reads; each image
+			// handle gets its own plan over them. A read with any other user (a pixel shader that
+			// turns the depth field, dword 4, into an array layer) stays a real load of the table.
+			if (handle.NumArgs() == 8u) {
+				plan.kept[dword] = WorkgroupAxis(key) == UINT32_MAX && !UsesOnlyImageDescriptors(*read);
+			} else if (std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
 					       return consumer.user->GetOpcode() != ValueOpcode::StoreBufferU32;
@@ -2213,9 +2225,15 @@ private:
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
 		                   [&](const IndirectDescriptorPlan& plan) {
-			return plan.reads[0] != nullptr &&
-			       std::find(plan.memory.begin(), plan.memory.begin() + plan.handle->NumArgs(), index) !=
-			           plan.memory.begin() + plan.handle->NumArgs();
+			if (plan.reads[0] == nullptr) {
+				return false;
+			}
+			for (uint32_t dword = 0; dword < plan.handle->NumArgs(); dword++) {
+				if (plan.memory[dword] == index && !plan.kept[dword]) {
+					return true;
+				}
+			}
+			return false;
 		});
 	}
 
