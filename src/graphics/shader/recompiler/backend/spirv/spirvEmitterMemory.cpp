@@ -1,7 +1,6 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
@@ -40,15 +39,16 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
                                      uint32_t swizzle, uint32_t index_stride) {
 	const auto zero = ConstantU32(state, 0);
 	const auto one  = ConstantU32(state, 1);
-	const auto add = [&](uint32_t lhs, uint32_t rhs) {
-		return lhs == zero ? rhs : rhs == zero ? lhs
-		                                      : Binary(state, spv::OpIAdd, TypeU32(state), lhs, rhs);
+	const auto add  = [&](uint32_t lhs, uint32_t rhs) {
+		return lhs == zero   ? rhs
+		       : rhs == zero ? lhs
+		                     : Binary(state, spv::OpIAdd, TypeU32(state), lhs, rhs);
 	};
 	const auto mul = [&](uint32_t lhs, uint32_t rhs) {
 		return lhs == zero || rhs == zero ? zero
-		       : lhs == one              ? rhs
-		       : rhs == one              ? lhs
-		                                 : Binary(state, spv::OpIMul, TypeU32(state), lhs, rhs);
+		       : lhs == one               ? rhs
+		       : rhs == one               ? lhs
+		                                  : Binary(state, spv::OpIMul, TypeU32(state), lhs, rhs);
 	};
 	if (immediate != 0u) {
 		offset = add(offset, ConstantU32(state, immediate));
@@ -70,8 +70,9 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3u));
 		const auto msb = mul(add(mul(index_msb, stride), offset_msb), indices);
 		const auto lsb = add(Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index_lsb,
-		                            ConstantU32(state, 2u)), offset_lsb);
-		address = Select(state, TypeU32(state), swizzle, add(msb, lsb), address);
+		                            ConstantU32(state, 2u)),
+		                     offset_lsb);
+		address        = Select(state, TypeU32(state), swizzle, add(msb, lsb), address);
 	}
 	return {offset, add(address, soffset)};
 }
@@ -176,9 +177,10 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
 	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	// Different invocations can fault on distinct pages in the same bitset word.
+	// A load/OR/store loses one of those pages, preventing a complete retry.
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
+	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
@@ -271,8 +273,8 @@ uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
-void     StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
-                           uint32_t index, uint32_t data);
+void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
+                       uint32_t data);
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
@@ -300,9 +302,8 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
-	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend);
-	    });
+	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
+	    [&]() { return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend); });
 }
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
@@ -373,7 +374,7 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	}
 	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
 	                                output_component);
-	const auto source = Format::ResolveFormattedSource(info, selector);
+	const auto source   = Format::ResolveFormattedSource(info, selector);
 	if (source.kind == FormattedSourceKind::Invalid) {
 		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "buffer descriptor has reserved dst_sel");
@@ -581,8 +582,8 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 }
 
 template <typename Fn>
-uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
-                          const IR::MemoryInfo& mem, Fn&& operation) {
+uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		const auto index = DwordIndex(ctx, inst, mem);
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
@@ -594,13 +595,12 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 }
 
 template <typename Fn>
-uint32_t EmitAtomicUpdate(ValueEmitContext& ctx, const IR::Inst& inst,
-                          const IR::MemoryInfo& mem, Fn&& replacement) {
+uint32_t EmitAtomicUpdate(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          Fn&& replacement) {
 	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
-		return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-			return replacement(ctx.state, old, value);
-		});
+		return AtomicUpdate(ctx.state, pointer, mem.kind,
+		                    [&](uint32_t old) { return replacement(ctx.state, old, value); });
 	});
 }
 
@@ -939,7 +939,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		                        IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
 		    [&]() { return LoadBdaDword(ctx, address); });
 	}
-	return ConstructU32Composite(state, components, values);
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -992,12 +992,12 @@ uint32_t LoadBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compon
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
 	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto mem      = ctx.Memory(inst);
+		    const auto mem = ctx.Memory(inst);
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 			    return LoadIndirectBuffer(ctx, inst, components);
 		    }
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
-		    const auto info = Format::GetFormatInfo(
+		    const auto info     = Format::GetFormatInfo(
 		        mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
 		    if (info.type != Format::ComponentType::Unknown) {
 			    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info);
@@ -1026,8 +1026,8 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		const auto mem       = ctx.Memory(inst);
 		const auto resource  = PrepareMemoryResourceAccess(state, mem);
 		const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
-		const auto info = Format::GetFormatInfo(
-		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
+		const auto info = Format::GetFormatInfo(mem.formatted ? BufferFormat(ctx, mem)
+		                                                      : Prospero::BufferFormat::kInvalid);
 		if (info.type != Format::ComponentType::Unknown) {
 			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
 			return;
@@ -1106,6 +1106,33 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	state.builder.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), result,
 	                          state.bda_pointer_function, address);
 	return result;
+}
+
+void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code) {
+	constexpr auto record_word = BufferCache::CACHING_NUMPAGES / 8 / sizeof(uint32_t);
+	const auto     pointer     = FaultElementPointer(state, ConstantU32(state, record_word));
+	const auto     old         = state.builder.AllocateId();
+	// Only the winning invocation writes the payload. Queue completion, rather
+	// than another shader invocation, publishes those writes to the host.
+	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+	                          ConstantU32(state, 0), ConstantU32(state, 1), ConstantU32(state, 0));
+	const auto won = Binary(state, spv::OpIEqual, TypeBool(state), old, ConstantU32(state, 0));
+	EmitIfCondition(state, won, [&]() {
+		const auto store = [&](size_t offset, uint32_t value) {
+			state.builder.AddFunction(
+			    spv::OpStore,
+			    FaultElementPointer(state,
+			                        ConstantU32(state, record_word + offset / sizeof(uint32_t))),
+			    value);
+		};
+		store(offsetof(ShaderTrapRecord, shader_hash_low),
+		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash)));
+		store(offsetof(ShaderTrapRecord, shader_hash_high),
+		      ConstantU32(state, static_cast<uint32_t>(state.program.shader_hash >> 32)));
+		store(offsetof(ShaderTrapRecord, pc), pc);
+		store(offsetof(ShaderTrapRecord, code), code);
+	});
 }
 
 void DefineGetBdaPointer(EmitterState& state) {
