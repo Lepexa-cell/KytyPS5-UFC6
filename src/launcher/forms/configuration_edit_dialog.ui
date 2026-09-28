@@ -179,6 +179,12 @@
           <property name="text"><string>Auto-hide cursor</string></property>
          </widget>
         </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_bindless">
+          <property name="toolTip"><string>Sample heap-indexed textures through bindless descriptor arrays instead of enumerating them per draw.</string></property>
+          <property name="text"><string>Bindless textures (experimental)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

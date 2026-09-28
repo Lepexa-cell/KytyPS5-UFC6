@@ -271,6 +271,8 @@ uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
+void     StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
+                           uint32_t index, uint32_t data);
 
 uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend);
@@ -1350,8 +1352,14 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           const auto pointer = EmitMemoryElementPointer(state, access, element);
+		           if (access.memory_access == spv::MemoryAccessMaskNone) {
+			           return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+		           }
+		           const auto value = state.builder.AllocateId();
+		           state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                                     spv::MemoryAccessVolatileMask);
+		           return value;
 	           }));
 }
 
