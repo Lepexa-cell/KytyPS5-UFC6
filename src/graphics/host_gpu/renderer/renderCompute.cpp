@@ -656,8 +656,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
+	// shader bounds its threads by the counts it reads from the same memory.
+	const bool use_thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
@@ -668,12 +671,18 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	const auto             compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	input_info.dispatch_thread_dimensions   = use_thread_dimensions;
+	input_info.dispatch_dimensions_indirect = use_thread_dimensions;
+	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
 		LogSkippedDispatch(cs_regs, "indirect");
 		ResetBindings();
 		return;
+	}
+	if (use_thread_dimensions && m_indirect_groups == nullptr) {
+		m_indirect_groups = std::make_unique<IndirectDispatchGroups>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler());
 	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -694,6 +703,26 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+		vk::Buffer     indirect_buffer = args_buffer->Handle();
+		vk::DeviceSize indirect_offset = args_offset;
+		if (use_thread_dimensions) {
+			EXIT_IF(!args_buffer->HasDeviceAddress());
+			const std::array<uint32_t, 3> local_size {
+			    std::max(cs_regs.cs_regs.num_thread_x, 1u),
+			    std::max(cs_regs.cs_regs.num_thread_y, 1u),
+			    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+			const auto converted = m_indirect_groups->Convert(
+			    buffer.Handle(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
+			indirect_buffer = converted.groups_buffer;
+			indirect_offset = converted.groups_offset;
+			// The shader reads the thread counts through this device address (upstream's
+			// dispatch-thread words hold the address instead of the counts).
+			const auto dword = program.bindings.dispatch_thread_dword;
+			if (dword != ShaderRecompiler::IR::PushData::NoStart) {
+				bindings.shader_data[dword]      = static_cast<uint32_t>(converted.threads);
+				bindings.shader_data[dword + 1u] = static_cast<uint32_t>(converted.threads >> 32u);
+			}
+		}
 		RebindBuffers(bindings);
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -718,7 +747,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		        vk::PipelineStageFlagBits::eTransfer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();

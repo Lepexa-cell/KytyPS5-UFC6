@@ -21,8 +21,29 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 
 uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
 	if (kind == IR::StageInputKind::DispatchThreadCount) {
-		return EmitShaderDataDwordLoad(
-		    state, state.program.bindings.DispatchDimensionsDword() + component);
+		const auto dword = state.program.bindings.dispatch_thread_dword;
+		if (!DispatchDimensionsIndirect(state)) {
+			return EmitShaderDataDwordLoad(state, dword + component);
+		}
+		// The counts stay where the guest's indirect arguments are; the shader data holds
+		// their device address.
+		const auto u64     = TypeScalarU64(state);
+		const auto low     = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
+		const auto high    = Unary(state, spv::OpUConvert, u64,
+		                           EmitShaderDataDwordLoad(state, dword + 1u));
+		const auto base    = Binary(state, spv::OpBitwiseOr, u64, low,
+		                            Binary(state, spv::OpShiftLeftLogical, u64, high,
+		                                   state.builder.Constant(spv::OpConstant, u64, 32u, 0u)));
+		const auto address = Binary(state, spv::OpIAdd, u64, base,
+		                            state.builder.Constant(spv::OpConstant, u64,
+		                                                   component * 4u, 0u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		return value;
 	}
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
@@ -691,6 +712,9 @@ uint32_t EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst
 	const auto start = ctx.state.program.bindings.dispatch_thread_dword;
 	if (start == IR::PushData::NoStart || !inst.Arg(0).IsImmediate() || inst.Arg(0).U32() >= 3u) {
 		ctx.Fail(inst, "invalid dispatch thread extent");
+	}
+	if (DispatchDimensionsIndirect(ctx.state)) {
+		return EmitBuiltinU32(ctx.state, IR::StageInputKind::DispatchThreadCount, inst.Arg(0).U32());
 	}
 	return EmitShaderDataDwordLoad(ctx.state, start + inst.Arg(0).U32());
 }

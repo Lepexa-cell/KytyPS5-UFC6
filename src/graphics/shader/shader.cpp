@@ -581,12 +581,14 @@ static void ShaderGetStaticInputInfoPS(
 static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const HW::ShaderRegisters& /*sh*/,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
-	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
-	const auto host_subgroup_size         = info.host_subgroup_size;
-	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
-	info                                  = {};
-	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
-	info.host_subgroup_size               = host_subgroup_size;
+	const bool dispatch_thread_dimensions   = info.dispatch_thread_dimensions;
+	const bool dispatch_dimensions_indirect = info.dispatch_dimensions_indirect;
+	const auto host_subgroup_size           = info.host_subgroup_size;
+	const auto workgroup_counts             = std::to_array(info.workgroup_counts);
+	info                                    = {};
+	info.dispatch_thread_dimensions         = dispatch_thread_dimensions;
+	info.dispatch_dimensions_indirect       = dispatch_dimensions_indirect;
+	info.host_subgroup_size                 = host_subgroup_size;
 	std::ranges::copy(workgroup_counts, info.workgroup_counts);
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
 	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
@@ -699,6 +701,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
+	key.push_back(static_cast<uint32_t>(info.dispatch_dimensions_indirect));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
 		key.push_back(static_cast<uint32_t>(info.group_id[i]));

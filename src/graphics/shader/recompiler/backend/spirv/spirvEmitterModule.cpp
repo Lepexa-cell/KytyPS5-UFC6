@@ -187,6 +187,16 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
 }
 
+bool DispatchDimensionsIndirect(const EmitterState& state) {
+	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
+	       state.input_info.compute->dispatch_dimensions_indirect &&
+	       state.program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+}
+
+bool UsesPhysicalAddresses(const EmitterState& state) {
+	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
+}
+
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
@@ -786,7 +796,7 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (UsesPhysicalAddresses(state)) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -853,7 +863,7 @@ void DefineModule(EmitterState& state) {
 	if (float_controls) {
 		state.builder.RequireExtension("SPV_KHR_float_controls");
 	}
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
