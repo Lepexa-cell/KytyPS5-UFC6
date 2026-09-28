@@ -92,6 +92,8 @@ static void PrintUsage() {
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
+	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
+	         "                                       (hex hashes, as logged).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -431,6 +433,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--printf-output-file") {
 			options.config.printf_output_file = Common::PathFromUtf8(value);
+		} else if (arg == "--skip-shaders") {
+			options.config.skip_shader_hashes = value;
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
