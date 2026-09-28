@@ -110,7 +110,8 @@ bool UsesFlattenedSrt(const Program& program) {
 	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
 	       std::ranges::any_of(program.info.images, [&](const ImageResource& image) {
 		       return uses_mapping(image) || image.bindless;
-	       });
+	       }) ||
+	       std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {

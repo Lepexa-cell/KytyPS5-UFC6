@@ -32554,6 +32554,13 @@ TestCase ImageGatherExplicitLod() {
   }
   AppendEnd(&code);
 
+  // Mip 0 is all 1.0; mip 1 holds a distinct red value per texel.
+  auto mip1 = MakeRgbaImage(2, 2);
+  SetRgbaPixel(&mip1, 2, 0, 0, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 0, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 0, 1, 0x40800000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 1, 0x40a00000u, 0, 0, 0);
+
   TestCase test;
   test.name = "ImageGatherExplicitLod";
   test.code = std::move(code);

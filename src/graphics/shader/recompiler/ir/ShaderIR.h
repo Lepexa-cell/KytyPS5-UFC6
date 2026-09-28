@@ -172,6 +172,10 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// Selected per draw by a GPU-computed key from a guest sampler heap: the shader indexes the
+	// bindless sampler array with the region base and entry count at bindless_mapping_offset.
+	bool     bindless                = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -524,9 +528,18 @@ struct DescriptorSource {
 		bool operator==(const IndirectDescriptor& other) const = default;
 	};
 
+	// A sampler read from a sampler heap at a GPU-computed key: dwords 0-2 are the heap's V#
+	// (dword 3 is left 0), the S# records start table_offset bytes into it.
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+
+		bool operator==(const BindlessSampler& other) const = default;
+	};
+
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
 	std::optional<IndirectDescriptor> indirect_descriptor;
+	std::optional<BindlessSampler>    bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
