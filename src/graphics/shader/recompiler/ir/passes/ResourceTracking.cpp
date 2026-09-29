@@ -1300,8 +1300,16 @@ private:
 		return axis;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
+	// A record's byte offset: key * stride plus immediate additions. With key_mask, the shifted
+	// key may also be masked, (key << shift) & m with the low shift bits of m clear (glass PS:
+	// (key << 5) & 0x01ffffe0); that equals (key & (m >> shift)) << shift, and key_mask receives
+	// m >> shift (UINT32_MAX without a mask). Without it, a mask is rejected.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride,
+	                      uint32_t* key_mask = nullptr) const {
 		offset = 0;
+		if (key_mask != nullptr) {
+			*key_mask = UINT32_MAX;
+		}
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -1319,6 +1327,24 @@ private:
 				else if (ImmediateU32(inst->Arg(1), stride)) key = inst->Arg(0).Resolve();
 				else return false;
 				return stride != 0u && key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() == ValueOpcode::BitwiseAnd32 && key_mask != nullptr &&
+			    *key_mask == UINT32_MAX) {
+				// The mask must apply to the shift itself, not to a sum around it.
+				const uint32_t masked = ImmediateU32(inst->Arg(1), immediate)   ? 0u
+				                        : ImmediateU32(inst->Arg(0), immediate) ? 1u
+				                                                                : 2u;
+				const auto* shift = masked < 2u ? inst->Arg(masked).Resolve().TryInstruction()
+				                                : nullptr;
+				uint32_t    amount = 0;
+				if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+				    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), amount) ||
+				    amount >= 32u || (immediate & ((1u << amount) - 1u)) != 0u) {
+					return false;
+				}
+				*key_mask = immediate >> amount;
+				value     = inst->Arg(masked);
+				continue;
 			}
 			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
 				return false;
@@ -1872,8 +1898,11 @@ private:
 	bool MatchDescriptorTable(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan,
 	                          DescriptorSource& table_source, Value& key, uint32_t& table_offset,
-	                          uint32_t& table_stride) {
+	                          uint32_t& table_stride, uint32_t* key_mask = nullptr) {
 		Inst* table_handle = nullptr;
+		if (key_mask != nullptr) {
+			*key_mask = UINT32_MAX;
+		}
 		for (uint32_t dword = 0; dword < handle.NumArgs(); ++dword) {
 			auto* read = descriptor.dwords[dword].Resolve().TryInstruction();
 			if (read != nullptr && read->GetOpcode() == ValueOpcode::Phi) {
@@ -1895,6 +1924,7 @@ private:
 			Value    current_key;
 			uint32_t offset = 0;
 			uint32_t stride = 0;
+			uint32_t current_mask = UINT32_MAX;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                        ? ValueOpcode::GetAddressResource
@@ -1903,7 +1933,8 @@ private:
 			     read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride,
+			                      key_mask != nullptr ? &current_mask : nullptr) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return RejectIndirect(handle, __LINE__);
 			}
@@ -1912,7 +1943,9 @@ private:
 				key          = current_key;
 				table_offset = offset;
 				table_stride = stride;
+				if (key_mask != nullptr) *key_mask = current_mask;
 			} else if (table_stride != stride || !EquivalentValue(m_program, key, current_key) ||
+			           (key_mask != nullptr && current_mask != *key_mask) ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return RejectIndirect(handle, __LINE__);
 			}
@@ -1983,8 +2016,9 @@ private:
 		Value key;
 		uint32_t table_offset = 0;
 		uint32_t table_stride = 0;
+		uint32_t key_mask     = UINT32_MAX;
 		if (!MatchDescriptorTable(handle, descriptor, plan, table_source, key, table_offset,
-		                          table_stride)) return false;
+		                          table_stride, &key_mask)) return false;
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
@@ -2001,7 +2035,9 @@ private:
 				plan.reads.fill(nullptr);
 				return true;
 			}
-			if (m_program.bindless_images && table_source.dword_count == 4u) {
+			// The host enumerates unmasked keys; a masked key is looked up only at run time.
+			if ((m_program.bindless_images && table_source.dword_count == 4u) ||
+			    key_mask != UINT32_MAX) {
 				return false;
 			}
 			if (table_stride != 32u) {
@@ -2112,6 +2148,15 @@ private:
 		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
 		            image_source.dwords.begin() + 4u);
 		image_source.indirect_descriptor = indirect;
+		if (key_mask != UINT32_MAX) {
+			// The bindless lookup takes the key itself, so the mask the shader applies to the
+			// scaled key becomes an instruction on the key, just before the handle.
+			auto*      block = handle.Parent();
+			const auto where = std::ranges::find_if(
+			    block->Instructions(), [&](const Inst& inst) { return &inst == &handle; });
+			key = Value(&*block->PrependNewInst(where, ValueOpcode::BitwiseAnd32,
+			                                    {key, Value(key_mask)}));
+		}
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
 		plan.key = key;
