@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -22,6 +23,9 @@ struct SrtRuntime {
 	// run as uint atomics on the raw bits. On by default, as in the emulator; the emulator passes
 	// --no-float-image-atomics through here.
 	bool                      float_image_atomics        = true;
+	// Compute: the workgroup size; with workgroup_counts (zero when the host does not know them,
+	// as for an indirect dispatch) it bounds the invocation IDs in buffer write extents.
+	std::array<uint32_t, 3>   workgroup_size             = {};
 };
 
 enum class RuntimeValueType { Any, Integer };
