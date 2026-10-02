@@ -64,10 +64,13 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
-	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
-	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
-	// Submit() then returns once the tick is allocated; host waits on a timeline value may precede
-	// its signal operation. Enable before the first Submit().
+	// Dedicated GPU driver worker (Hama 60 FPS Suite, task 1): hands later submissions to a
+	// dedicated queue thread, which submits them in tick order, so vkQueueSubmit (and the
+	// queue lock that present also takes) leaves the guest command-processor thread. The guest
+	// thread keeps parsing PM4 packets and recording draws/dispatches while the worker feeds the
+	// Vulkan driver on another CPU core in parallel. Submit() then returns once the tick is
+	// allocated; host waits on a timeline value may precede its signal operation. Enable before
+	// the first Submit().
 	void EnableAsyncSubmit();
 	[[nodiscard]] bool AsyncSubmit() const noexcept { return m_async_submit; }
 

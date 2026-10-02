@@ -1038,23 +1038,30 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
 		EXIT_IF(prepared.buffers[i] == nullptr);
 	}
 	if (prepared.count != 0) {
-		// Guest descriptor bounds must survive allocation merging in the cache.
-		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
-		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		// Guest descriptor bounds must survive allocation merging in the cache. Frostbite rebinds
+		// identical buffers thousands of times per frame; skip the redundant driver call.
+		if (buffer.BindVertexBuffersCached(0, prepared.count, prepared.buffers.data(),
+		                                   prepared.offsets.data(), prepared.sizes.data())) {
+			vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
+			                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
+		}
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
+                             const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	if (buffer.BindIndexBufferCached(prepared.buffer, prepared.offset, prepared.type)) {
+		vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	}
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1214,7 +1221,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
-		CommitVertexBuffers(vk_buffer, vertex_bindings);
+		CommitVertexBuffers(buffer, vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
@@ -1233,7 +1240,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
-		CommitIndexBuffer(vk_buffer, index_binding);
+		CommitIndexBuffer(buffer, vk_buffer, index_binding);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);

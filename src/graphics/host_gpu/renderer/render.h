@@ -117,6 +117,15 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// Frostbite hot loop: skips redundant vkCmdBindVertexBuffers2 / vkCmdBindIndexBuffer
+	// when the same (buffers, offsets, sizes/type) is already bound on this command buffer.
+	// Vulkan bind state is per-command-buffer, so the cache is reset in Begin().
+	// Returns true when the caller must still emit the bind.
+	bool BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
+	                             const vk::Buffer* buffers, const vk::DeviceSize* offsets,
+	                             const vk::DeviceSize* sizes);
+	bool BindIndexBufferCached(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType index_type);
+
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -147,6 +156,25 @@ private:
 	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
+	// Current command buffer's vertex/index bind state. Counts are small (<= 32 slots),
+	// so a fixed array keeps the comparison branch-free of allocations.
+	struct CachedVertexBinding {
+		static constexpr uint32_t MaxBindings = 32;
+		uint32_t       first_binding = UINT32_MAX;
+		uint32_t       count         = 0;
+		vk::Buffer     buffers[MaxBindings] = {};
+		vk::DeviceSize offsets[MaxBindings] = {};
+		vk::DeviceSize sizes[MaxBindings]   = {};
+		bool           valid = false;
+	};
+	struct CachedIndexBinding {
+		vk::Buffer    buffer     = nullptr;
+		vk::DeviceSize offset     = 0;
+		vk::IndexType index_type = vk::IndexType::eUint16;
+		bool          valid      = false;
+	};
+	mutable CachedVertexBinding m_cached_vertex_binding;
+	mutable CachedIndexBinding  m_cached_index_binding;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

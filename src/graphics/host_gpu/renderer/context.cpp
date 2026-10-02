@@ -38,6 +38,52 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// New Vulkan command buffer => previous vkCmdBind* state is gone.
+	m_cached_vertex_binding = {};
+	m_cached_index_binding  = {};
+}
+
+bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
+                                            const vk::Buffer* buffers,
+                                            const vk::DeviceSize* offsets,
+                                            const vk::DeviceSize* sizes) {
+	auto& cached = m_cached_vertex_binding;
+	if (cached.valid && cached.first_binding == first_binding && cached.count == count &&
+	    count <= CachedVertexBinding::MaxBindings) {
+		bool same = true;
+		for (uint32_t i = 0; i < count; i++) {
+			if (cached.buffers[i] != buffers[i] || cached.offsets[i] != offsets[i] ||
+			    cached.sizes[i] != sizes[i]) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			return false;
+		}
+	}
+	cached.first_binding = first_binding;
+	cached.count         = count <= CachedVertexBinding::MaxBindings
+	                           ? count
+	                           : CachedVertexBinding::MaxBindings;
+	for (uint32_t i = 0; i < cached.count; i++) {
+		cached.buffers[i] = buffers[i];
+		cached.offsets[i] = offsets[i];
+		cached.sizes[i]   = sizes[i];
+	}
+	cached.valid = true;
+	return true;
+}
+
+bool CommandBuffer::BindIndexBufferCached(vk::Buffer buffer, vk::DeviceSize offset,
+                                          vk::IndexType index_type) {
+	auto& cached = m_cached_index_binding;
+	if (cached.valid && cached.buffer == buffer && cached.offset == offset &&
+	    cached.index_type == index_type) {
+		return false;
+	}
+	cached = {.buffer = buffer, .offset = offset, .index_type = index_type, .valid = true};
+	return true;
 }
 
 void CommandBuffer::End() const {

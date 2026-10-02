@@ -229,6 +229,9 @@ private:
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
+	// Descriptor set layouts and shader pipelines are already cached: descriptor layouts live in
+	// DescriptorHeap (one layout per hash), graphics pipelines in m_graphics_pipelines keyed by
+	// GraphicsPipelineKey and compute pipelines in m_compute_pipelines keyed by shader id.
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
