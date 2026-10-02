@@ -229,16 +229,6 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
-		// Log new image registration for debugging memory aliasing issues
-		static std::atomic<uint32_t> log_count{0};
-		if (log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
-			LOGF("TextureCache::InsertImage: id=%zu addr=0x%016" PRIx64 " size=0x%016" PRIx64 
-			     " format=%u type=%u tile=%u %ux%ux%u mips=%u\n",
-			     static_cast<size_t>(id.index), info.data.address, info.data.size,
-			     static_cast<uint32_t>(info.pixel_format), static_cast<uint32_t>(info.type),
-			     static_cast<uint32_t>(info.tile_mode), 
-			     info.extent.width, info.extent.height, info.extent.depth, info.levels);
-		}
 	}
 	return id;
 }
