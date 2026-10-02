@@ -195,7 +195,6 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
 		case Opcode::DS_MSKOR_B32:
-		case Opcode::DS_ADD_U64:
 		case Opcode::DS_WRXCHG_RTN_B32: return true;
 		default: return false;
 	}
