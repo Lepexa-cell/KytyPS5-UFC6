@@ -182,9 +182,6 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	// Fast address -> ImageId lookup for FindImageFromRange, avoiding a full page-table
-	// walk on every draw call (~16,000 per frame). Keyed by image data.address.
-	std::unordered_map<uint64_t, ImageId>             m_address_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
