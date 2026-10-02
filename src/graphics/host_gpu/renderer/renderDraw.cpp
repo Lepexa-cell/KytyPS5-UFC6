@@ -362,8 +362,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	// UFC hot loop: identical viewport/scissor pairs repeat across thousands of
+	// draws per frame; skip the driver call when the cached values match.
+	if (buffer.SetViewportWithCountCached(viewport_count, viewports.data())) {
+		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+	}
+	if (buffer.SetScissorWithCountCached(viewport_count, scissors.data())) {
+		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -389,16 +395,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
-	if (depth_bias_enable) {
-		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
-		const float guest_constant_factor =
-		    use_front ? poly_offset.front_offset : poly_offset.back_offset;
-		const float constant_factor = ConvertPolygonOffsetConstantFactor(
-		    guest_constant_factor, poly_offset, depth.desc.view_info.format);
-		const float slope_factor =
-		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+	// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
+	const float guest_constant_factor =
+	    use_front ? poly_offset.front_offset : poly_offset.back_offset;
+	const float constant_factor = depth_bias_enable
+	                                  ? ConvertPolygonOffsetConstantFactor(
+	                                        guest_constant_factor, poly_offset,
+	                                        depth.desc.view_info.format)
+	                                  : 0.0f;
+	const float slope_factor =
+	    depth_bias_enable
+	        ? (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f
+	        : 0.0f;
+	// Depth bias is disabled on almost every draw; cache enable+values together
+	// so the common (disabled, 0, 0, 0) case skips both driver calls.
+	if (buffer.SetDepthBiasCached(depth_bias_enable, constant_factor, poly_offset.clamp,
+	                              slope_factor)) {
+		vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+		if (depth_bias_enable) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		}
 	}
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
@@ -1253,7 +1269,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	// UFC issues long runs of draws on the same pipeline; skip the redundant bind.
+	if (buffer.BindPipelineCached(vk::PipelineBindPoint::eGraphics, pipeline.pipeline)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

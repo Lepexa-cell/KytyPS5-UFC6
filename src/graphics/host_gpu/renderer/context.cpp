@@ -38,9 +38,14 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	// New Vulkan command buffer => previous vkCmdBind* state is gone.
-	m_cached_vertex_binding = {};
-	m_cached_index_binding  = {};
+	// New Vulkan command buffer => previous vkCmdBind*/vkCmdSet* state is gone.
+	m_cached_vertex_binding  = {};
+	m_cached_index_binding   = {};
+	m_cached_viewport        = {};
+	m_cached_scissor         = {};
+	m_cached_depth_bias      = {};
+	m_cached_pipeline        = {};
+	m_cached_descriptor_sets = {};
 }
 
 bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
@@ -84,6 +89,160 @@ bool CommandBuffer::BindIndexBufferCached(vk::Buffer buffer, vk::DeviceSize offs
 	}
 	cached = {.buffer = buffer, .offset = offset, .index_type = index_type, .valid = true};
 	return true;
+}
+
+namespace {
+
+[[nodiscard]] bool ViewportsEqual(const vk::Viewport& a, const vk::Viewport& b) {
+	// Bit-exact compare: NaN payloads must not compare equal across draws.
+	return std::memcmp(&a, &b, sizeof(vk::Viewport)) == 0;
+}
+
+[[nodiscard]] bool ScissorsEqual(const vk::Rect2D& a, const vk::Rect2D& b) {
+	return std::memcmp(&a, &b, sizeof(vk::Rect2D)) == 0;
+}
+
+} // namespace
+
+bool CommandBuffer::SetViewportWithCountCached(uint32_t count,
+                                               const vk::Viewport* viewports) const {
+	auto& cached = m_cached_viewport;
+	if (cached.valid && cached.count == count && count <= MaxCachedViewports) {
+		bool same = true;
+		for (uint32_t i = 0; i < count; i++) {
+			if (!ViewportsEqual(cached.viewports[i], viewports[i])) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			return false;
+		}
+	}
+	cached.count = count <= MaxCachedViewports ? count : MaxCachedViewports;
+	for (uint32_t i = 0; i < cached.count; i++) {
+		cached.viewports[i] = viewports[i];
+	}
+	cached.valid = true;
+	return true;
+}
+
+bool CommandBuffer::SetScissorWithCountCached(uint32_t count,
+                                              const vk::Rect2D* scissors) const {
+	auto& cached = m_cached_scissor;
+	if (cached.valid && cached.count == count && count <= MaxCachedViewports) {
+		bool same = true;
+		for (uint32_t i = 0; i < count; i++) {
+			if (!ScissorsEqual(cached.scissors[i], scissors[i])) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			return false;
+		}
+	}
+	cached.count = count <= MaxCachedViewports ? count : MaxCachedViewports;
+	for (uint32_t i = 0; i < cached.count; i++) {
+		cached.scissors[i] = scissors[i];
+	}
+	cached.valid = true;
+	return true;
+}
+
+bool CommandBuffer::SetDepthBiasCached(bool enable, float constant_factor, float clamp,
+                                       float slope_factor) const {
+	auto& cached = m_cached_depth_bias;
+	if (cached.valid && cached.enable == enable &&
+	    std::memcmp(&cached.constant_factor, &constant_factor, sizeof(float)) == 0 &&
+	    std::memcmp(&cached.clamp, &clamp, sizeof(float)) == 0 &&
+	    std::memcmp(&cached.slope_factor, &slope_factor, sizeof(float)) == 0) {
+		return false;
+	}
+	cached.enable          = enable;
+	cached.constant_factor = constant_factor;
+	cached.clamp           = clamp;
+	cached.slope_factor    = slope_factor;
+	cached.valid           = true;
+	return true;
+}
+
+bool CommandBuffer::BindPipelineCached(vk::PipelineBindPoint bind_point,
+                                       vk::Pipeline pipeline) const {
+	auto& cached = m_cached_pipeline;
+	vk::Pipeline& slot =
+	    bind_point == vk::PipelineBindPoint::eGraphics ? cached.graphics_pipeline
+	                                                   : cached.compute_pipeline;
+	if (slot == pipeline) {
+		return false;
+	}
+	slot = pipeline;
+	return true;
+}
+
+bool CommandBuffer::BindDescriptorSetsCached(vk::PipelineBindPoint bind_point,
+                                             vk::PipelineLayout layout, uint32_t first_set,
+                                             const vk::DescriptorSet* sets,
+                                             uint32_t set_count) const {
+	// Only the (layout, set0) and (layout, set1) pairs CommitBindings emits are
+	// cached. A layout change invalidates both slots; push descriptors bypass
+	// vkCmdBindDescriptorSets entirely and invalidate via
+	// InvalidatePushDescriptorCache.
+	if (set_count == 0 || sets == nullptr) {
+		return false;
+	}
+	auto& binding = bind_point == vk::PipelineBindPoint::eGraphics
+	                      ? m_cached_descriptor_sets.graphics
+	                      : m_cached_descriptor_sets.compute;
+	if (binding.layout != layout) {
+		binding.layout  = layout;
+		binding.set0    = nullptr;
+		binding.set1    = nullptr;
+		binding.has_set0 = false;
+		binding.has_set1 = false;
+	}
+	bool same = true;
+	for (uint32_t i = 0; i < set_count; i++) {
+		const uint32_t set_index = first_set + i;
+		if (set_index == 0) {
+			if (!binding.has_set0 || binding.set0 != sets[i]) {
+				same = false;
+				break;
+			}
+		} else if (set_index == 1) {
+			if (!binding.has_set1 || binding.set1 != sets[i]) {
+				same = false;
+				break;
+			}
+		} else {
+			same = false;
+			break;
+		}
+	}
+	if (same) {
+		return false;
+	}
+	for (uint32_t i = 0; i < set_count; i++) {
+		const uint32_t set_index = first_set + i;
+		if (set_index == 0) {
+			binding.set0    = sets[i];
+			binding.has_set0 = true;
+		} else if (set_index == 1) {
+			binding.set1    = sets[i];
+			binding.has_set1 = true;
+		}
+	}
+	return true;
+}
+
+void CommandBuffer::InvalidatePushDescriptorCache(vk::PipelineBindPoint bind_point) const {
+	// Push descriptors have no set handle to compare, so any push on this bind
+	// point invalidates the cached set 0 for its layout.
+	auto& binding = bind_point == vk::PipelineBindPoint::eGraphics
+	                      ? m_cached_descriptor_sets.graphics
+	                      : m_cached_descriptor_sets.compute;
+	binding.set0    = nullptr;
+	binding.has_set0 = false;
 }
 
 void CommandBuffer::End() const {
