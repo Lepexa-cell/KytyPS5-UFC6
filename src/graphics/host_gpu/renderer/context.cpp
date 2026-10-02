@@ -44,7 +44,6 @@ void CommandBuffer::Begin() {
 	m_cached_viewport        = {};
 	m_cached_scissor         = {};
 	m_cached_depth_bias      = {};
-	m_cached_pipeline        = {};
 }
 
 bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
@@ -163,19 +162,6 @@ bool CommandBuffer::SetDepthBiasCached(bool enable, float constant_factor, float
 	cached.clamp           = clamp;
 	cached.slope_factor    = slope_factor;
 	cached.valid           = true;
-	return true;
-}
-
-bool CommandBuffer::BindPipelineCached(vk::PipelineBindPoint bind_point,
-                                       vk::Pipeline pipeline) const {
-	auto& cached = m_cached_pipeline;
-	vk::Pipeline& slot =
-	    bind_point == vk::PipelineBindPoint::eGraphics ? cached.graphics_pipeline
-	                                                   : cached.compute_pipeline;
-	if (slot == pipeline) {
-		return false;
-	}
-	slot = pipeline;
 	return true;
 }
 

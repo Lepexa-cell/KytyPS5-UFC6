@@ -1,12 +1,20 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/common.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/timeline.h"
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -18,6 +26,17 @@ namespace Libs::Graphics {
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
+
+// Keep the hot GPU threads on the performance cores: first 12 logical threads
+// (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
+void PinThreadToPerformanceCores() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(0x0FFF));
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#else
+	(void)0;
+#endif
+}
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
@@ -542,6 +561,7 @@ void CommandScheduler::EnableAsyncSubmit() {
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
+	PinThreadToPerformanceCores();
 	for (;;) {
 		SubmitJob job;
 		{

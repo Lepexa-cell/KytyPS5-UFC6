@@ -620,10 +620,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			// ordering while allowing the queue to execute asynchronously.
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
-		// Back-to-back dispatches often share the compute pipeline; skip the redundant bind.
-		if (buffer.BindPipelineCached(vk::PipelineBindPoint::eCompute, pipeline.pipeline)) {
-			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-		}
+		// The pipeline is bound unconditionally: internal meta-clear, image-clear and
+		// warmup work can rebind pipeline state behind any cache, so a skipped bind
+		// would execute the dispatch with a stale pipeline (GPU page fault on CS 6).
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
@@ -724,9 +724,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
 		        vk::PipelineStageFlagBits::eTransfer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
-		if (buffer.BindPipelineCached(vk::PipelineBindPoint::eCompute, pipeline.pipeline)) {
-			vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-		}
+		// The pipeline is bound unconditionally: internal image-clear work can
+		// rebind pipeline state behind any cache, so a skipped bind would execute
+		// the indirect dispatch with a stale pipeline (GPU page fault on CS 6).
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);

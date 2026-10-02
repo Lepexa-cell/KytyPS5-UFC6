@@ -94,11 +94,21 @@ static float ConvertPolygonOffsetConstantFactor(float guest_factor, const HW::Po
 		return guest_factor;
 	}
 
+	// Fixed-point guest bias (e.g. D24) cannot be represented 1:1 by the
+	// floating-point host attachment (D32_SFLOAT). Without a rescale the same
+	// integer bias is a smaller NDC offset, which shows up as shadow acne
+	// (speckle on the octagon canvas).
 	int host_depth_bits = 0;
 	switch (host_depth_format) {
 		case vk::Format::eD16Unorm:
 		case vk::Format::eD16UnormS8Uint: host_depth_bits = 16; break;
 		case vk::Format::eD24UnormS8Uint: host_depth_bits = 24; break;
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+			// Fixed-point guest bias on a 32-bit float host attachment: keep the
+			// guest intent with a 2x base rescale for the D24 -> float mapping.
+			// Dropping it would leave the shadow acne behind.
+			return guest_factor * 2.0f;
 		default:
 			// A fixed-point guest bias cannot be represented exactly by a floating-point host
 			// attachment without VK_EXT_depth_bias_control.
@@ -1269,10 +1279,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	// UFC issues long runs of draws on the same pipeline; skip the redundant bind.
-	if (buffer.BindPipelineCached(vk::PipelineBindPoint::eGraphics, pipeline.pipeline)) {
-		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	}
+	// The pipeline is bound unconditionally: internal clears/warmup can rebind
+	// pipeline state behind any cache, so a skipped bind would draw with a stale
+	// pipeline (GPU page fault).
+	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}

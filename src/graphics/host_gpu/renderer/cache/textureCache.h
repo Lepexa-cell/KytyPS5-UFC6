@@ -33,9 +33,9 @@ class TextureCache {
 public:
 	// Called before a bindless-pinned image is unregistered.
 	std::function<void(ImageId)> on_bindless_unregister;
-	// Cap Device-Local VRAM budget at 11200 MiB for RTX 4070-class cards (12 GB),
-	// so the garbage collector triggers before the host spills into slow system memory.
-	static constexpr uint64_t MAX_DEVICE_LOCAL_VRAM = 11200ull * 1024 * 1024;
+	// Cap Device-Local VRAM budget at 9500 MiB (9.5 GB), so the garbage collector
+	// triggers smoothly before the host spills into slow system memory.
+	static constexpr uint64_t MAX_DEVICE_LOCAL_VRAM = 9500ull * 1024 * 1024;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {

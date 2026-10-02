@@ -126,15 +126,16 @@ public:
 	                             const vk::DeviceSize* sizes);
 	bool BindIndexBufferCached(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType index_type);
 
-	// UFC hot draw loop: skip redundant vkCmdSetViewport/Scissor/DepthBias and
-	// vkCmdBindPipeline when the state already matches. Caches are
+	// UFC hot draw loop: skip redundant vkCmdSetViewport/Scissor/DepthBias
+	// when the state already matches. Caches are
 	// per-command-buffer and reset in Begin().
 	// Returns true when the caller must still emit the Vulkan call.
 	bool SetViewportWithCountCached(uint32_t count, const vk::Viewport* viewports) const;
 	bool SetScissorWithCountCached(uint32_t count, const vk::Rect2D* scissors) const;
 	bool SetDepthBiasCached(bool enable, float constant_factor, float clamp,
 	                        float slope_factor) const;
-	bool BindPipelineCached(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const;
+	// NOTE: pipelines are bound unconditionally (meta-clear/image-clear/warmup
+	// rebind state behind any cache), so there is no BindPipelineCached.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -202,19 +203,11 @@ private:
 		float slope_factor    = 0.0f;
 		bool  valid           = false;
 	};
-	// Last bound pipelines per bind point. Draws and dispatches re-bind the
-	// same pipeline dozens of times in a row; an exact handle compare skips
-	// the redundant vkCmdBindPipeline.
-	struct CachedPipelineState {
-		vk::Pipeline graphics_pipeline = nullptr;
-		vk::Pipeline compute_pipeline  = nullptr;
-	};
 	mutable CachedVertexBinding m_cached_vertex_binding;
 	mutable CachedIndexBinding  m_cached_index_binding;
 	mutable CachedViewportState m_cached_viewport;
 	mutable CachedScissorState  m_cached_scissor;
 	mutable CachedDepthBiasState m_cached_depth_bias;
-	mutable CachedPipelineState m_cached_pipeline;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

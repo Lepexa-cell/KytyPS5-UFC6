@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -21,6 +22,13 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -34,6 +42,21 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Keep the hot GPU threads on the performance cores: first 12 logical threads
+// (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
+void PinThreadToPerformanceCores() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(0x0FFF));
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#else
+	(void)0;
+#endif
+}
+
+} // namespace
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
@@ -643,6 +666,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	PinThreadToPerformanceCores();
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
