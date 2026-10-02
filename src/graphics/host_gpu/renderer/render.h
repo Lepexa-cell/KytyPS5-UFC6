@@ -126,19 +126,15 @@ public:
 	                             const vk::DeviceSize* sizes);
 	bool BindIndexBufferCached(vk::Buffer buffer, vk::DeviceSize offset, vk::IndexType index_type);
 
-	// UFC hot draw loop: skip redundant vkCmdSetViewport/Scissor/DepthBias,
-	// vkCmdBindPipeline and vkCmdBindDescriptorSets when the state already
-	// matches. Caches are per-command-buffer and reset in Begin().
+	// UFC hot draw loop: skip redundant vkCmdSetViewport/Scissor/DepthBias and
+	// vkCmdBindPipeline when the state already matches. Caches are
+	// per-command-buffer and reset in Begin().
 	// Returns true when the caller must still emit the Vulkan call.
 	bool SetViewportWithCountCached(uint32_t count, const vk::Viewport* viewports) const;
 	bool SetScissorWithCountCached(uint32_t count, const vk::Rect2D* scissors) const;
 	bool SetDepthBiasCached(bool enable, float constant_factor, float clamp,
 	                        float slope_factor) const;
 	bool BindPipelineCached(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const;
-	bool BindDescriptorSetsCached(vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
-	                              uint32_t first_set, const vk::DescriptorSet* sets,
-	                              uint32_t set_count) const;
-	void InvalidatePushDescriptorCache(vk::PipelineBindPoint bind_point) const;
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
@@ -213,28 +209,12 @@ private:
 		vk::Pipeline graphics_pipeline = nullptr;
 		vk::Pipeline compute_pipeline  = nullptr;
 	};
-	// Last bound descriptor sets per bind point. Set 0 is freshly allocated by
-	// DescriptorHeap::Commit on almost every draw so its handle rarely repeats
-	// (the layout compare still guards correctness); set 1 is the global
-	// bindless set and hits the cache on every bindless draw.
-	struct CachedDescriptorSetBinding {
-		vk::PipelineLayout layout  = nullptr;
-		vk::DescriptorSet  set0    = nullptr;
-		vk::DescriptorSet  set1    = nullptr;
-		bool               has_set0 = false;
-		bool               has_set1 = false;
-	};
-	struct CachedDescriptorSetState {
-		CachedDescriptorSetBinding graphics;
-		CachedDescriptorSetBinding compute;
-	};
 	mutable CachedVertexBinding m_cached_vertex_binding;
 	mutable CachedIndexBinding  m_cached_index_binding;
 	mutable CachedViewportState m_cached_viewport;
 	mutable CachedScissorState  m_cached_scissor;
 	mutable CachedDepthBiasState m_cached_depth_bias;
 	mutable CachedPipelineState m_cached_pipeline;
-	mutable CachedDescriptorSetState m_cached_descriptor_sets;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

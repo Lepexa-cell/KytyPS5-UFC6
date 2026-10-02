@@ -45,7 +45,6 @@ void CommandBuffer::Begin() {
 	m_cached_scissor         = {};
 	m_cached_depth_bias      = {};
 	m_cached_pipeline        = {};
-	m_cached_descriptor_sets = {};
 }
 
 bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
@@ -178,71 +177,6 @@ bool CommandBuffer::BindPipelineCached(vk::PipelineBindPoint bind_point,
 	}
 	slot = pipeline;
 	return true;
-}
-
-bool CommandBuffer::BindDescriptorSetsCached(vk::PipelineBindPoint bind_point,
-                                             vk::PipelineLayout layout, uint32_t first_set,
-                                             const vk::DescriptorSet* sets,
-                                             uint32_t set_count) const {
-	// Only the (layout, set0) and (layout, set1) pairs CommitBindings emits are
-	// cached. A layout change invalidates both slots; push descriptors bypass
-	// vkCmdBindDescriptorSets entirely and invalidate via
-	// InvalidatePushDescriptorCache.
-	if (set_count == 0 || sets == nullptr) {
-		return false;
-	}
-	auto& binding = bind_point == vk::PipelineBindPoint::eGraphics
-	                      ? m_cached_descriptor_sets.graphics
-	                      : m_cached_descriptor_sets.compute;
-	if (binding.layout != layout) {
-		binding.layout  = layout;
-		binding.set0    = nullptr;
-		binding.set1    = nullptr;
-		binding.has_set0 = false;
-		binding.has_set1 = false;
-	}
-	bool same = true;
-	for (uint32_t i = 0; i < set_count; i++) {
-		const uint32_t set_index = first_set + i;
-		if (set_index == 0) {
-			if (!binding.has_set0 || binding.set0 != sets[i]) {
-				same = false;
-				break;
-			}
-		} else if (set_index == 1) {
-			if (!binding.has_set1 || binding.set1 != sets[i]) {
-				same = false;
-				break;
-			}
-		} else {
-			same = false;
-			break;
-		}
-	}
-	if (same) {
-		return false;
-	}
-	for (uint32_t i = 0; i < set_count; i++) {
-		const uint32_t set_index = first_set + i;
-		if (set_index == 0) {
-			binding.set0    = sets[i];
-			binding.has_set0 = true;
-		} else if (set_index == 1) {
-			binding.set1    = sets[i];
-			binding.has_set1 = true;
-		}
-	}
-	return true;
-}
-
-void CommandBuffer::InvalidatePushDescriptorCache(vk::PipelineBindPoint bind_point) const {
-	// Push descriptors have no set handle to compare, so any push on this bind
-	// point invalidates the cached set 0 for its layout.
-	auto& binding = bind_point == vk::PipelineBindPoint::eGraphics
-	                      ? m_cached_descriptor_sets.graphics
-	                      : m_cached_descriptor_sets.compute;
-	binding.set0    = nullptr;
-	binding.has_set0 = false;
 }
 
 void CommandBuffer::End() const {

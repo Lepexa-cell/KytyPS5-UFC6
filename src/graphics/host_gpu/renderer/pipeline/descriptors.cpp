@@ -1772,7 +1772,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
-			buffer.InvalidatePushDescriptorCache(pipeline_bind_point);
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
@@ -1781,21 +1780,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_context.GetGraphics().device.updateDescriptorSets(
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 			    nullptr);
-			if (buffer.BindDescriptorSetsCached(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                                    &set, 1)) {
-				vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1,
-				                             &set, 0, nullptr);
-			}
+			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1,
+			                             &set, 0, nullptr);
 		}
 	}
 	if (pipeline.uses_bindless) {
 		const auto set = m_context.GetGraphics().bindless_set;
 		EXIT_IF(set == nullptr);
-		if (buffer.BindDescriptorSetsCached(pipeline_bind_point, pipeline.pipeline_layout, 1, &set,
-		                                    1)) {
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set,
-			                             0, nullptr);
-		}
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set,
+		                             0, nullptr);
 	}
 }
 
