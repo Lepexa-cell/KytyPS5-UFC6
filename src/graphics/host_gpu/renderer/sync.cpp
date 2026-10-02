@@ -13,6 +13,7 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -50,7 +51,20 @@ uint64_t ReadReferenceClock() {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
-	return value;
+	static std::atomic<uint64_t> last_value{0};
+	uint64_t                     prev = last_value.load(std::memory_order_relaxed);
+	uint64_t                     current = value;
+	// Ensure strictly monotonic output: if the clock read would go backwards or stall,
+	// return prev+1 instead so RELEASE_MEM/COPY_DATA emit only ascending timestamps.
+	while (true) {
+		if (current <= prev) {
+			current = prev + 1;
+		}
+		if (last_value.compare_exchange_weak(prev, current, std::memory_order_acq_rel,
+		                                     std::memory_order_relaxed)) {
+			return current;
+		}
+	}
 }
 
 enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };

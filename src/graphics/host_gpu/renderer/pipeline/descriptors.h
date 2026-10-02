@@ -12,10 +12,12 @@
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <vector>
+#include <algorithm>
 
 namespace Libs::Graphics {
 
@@ -67,8 +69,14 @@ template <typename T>
 	static_assert(std::is_trivially_copyable_v<T>);
 	static_assert(sizeof(T) % sizeof(uint32_t) == 0);
 	T result {};
-	EXIT_IF(value.dword_count < sizeof(result) / sizeof(uint32_t));
-	std::memcpy(&result, value.dwords.data(), sizeof(result));
+	const auto max_dwords = sizeof(result) / sizeof(uint32_t);
+	const auto copy_dwords = std::min<uint32_t>(value.dword_count, max_dwords);
+	if (copy_dwords < max_dwords) {
+		LOGF("DecodeNativeDescriptor: truncated descriptor (have %" PRIu32
+		     ", need %zu dwords); returning zero-initialized value\n",
+		     value.dword_count, static_cast<size_t>(max_dwords));
+	}
+	std::memcpy(&result, value.dwords.data(), copy_dwords * sizeof(uint32_t));
 	return result;
 }
 

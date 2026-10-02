@@ -120,12 +120,13 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
-	// windows; a window that does not fit drains the ring before it is mapped.
-	const auto capacity = m_download_buffer.Size();
-	bool       any      = false;
-	for (uint64_t offset = 0; offset < size; offset += capacity) {
-		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	const auto chunk_limit = m_download_buffer.Size();
+	bool       any          = false;
+	uint64_t   chunk_base   = 0;
+	while (chunk_base < size) {
+		const auto chunk_size = std::min(chunk_limit, size - chunk_base);
+		any |= DownloadBufferWindow(buffer, vaddr + chunk_base, chunk_size);
+		chunk_base += chunk_size;
 	}
 	return any;
 }
@@ -242,7 +243,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 256 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));

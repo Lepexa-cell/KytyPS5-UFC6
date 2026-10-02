@@ -10,10 +10,15 @@ void TestRayTracingDispatchDetection() {
       Check(last.family == D::Family::MIMG &&
                 (last.opcode_id == 0xe6u || last.opcode_id == 0xe7u),
             "decoder continued past the first BVH instruction");
+      // BVH compute shaders are stubbed (S_ENDPGM) rather than skipped,
+      // so translation proceeds and produces valid SPIR-V.
       const auto result = ShaderRecompiler::TranslateProgram(
           code, MakeCompileOptions(ShaderType::Compute));
-      Check(result.skip_dispatch && result.program.blocks.empty() && result.cfg_dump.empty(),
-            "BVH compute shader reached IR translation");
+      Check(!result.unsupported, "BVH compute shader was marked unsupported");
+      const auto compiled = RecompileForTest(code,
+                                               MakeCompileOptions(ShaderType::Compute));
+      Check(!compiled.spirv.empty(), "BVH compute shader did not compile after stubbing");
+      CheckSpirvBinaryValidates(compiled.spirv);
     }
   };
   const auto check = [&](std::initializer_list<uint32_t> code, bool expected,
@@ -22,16 +27,16 @@ void TestRayTracingDispatchDetection() {
   };
 
   check({0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "captured contiguous BVH instruction did not skip dispatch");
+        "captured contiguous BVH instruction not detected");
   check({0xf1989f07u, 0x00071001u, 0x3d3e3c15u, 0x38095851u, 0x00003a39u,
          EncodeSopp(0x01)}, true,
-        "captured NSA BVH instruction did not skip dispatch");
+        "captured NSA BVH instruction not detected");
   check({0xf19c9f01u, 0x00081014u, EncodeSopp(0x01)}, true,
-        "RDNA2 BVH64 instruction did not skip dispatch");
+        "RDNA2 BVH64 instruction not detected");
   check({0xbe8e210eu, 0xf1989f01u, 0x00081014u, EncodeSopp(0x01)}, true,
         "unsupported SWAPPC before BVH prevented dispatch detection");
   check({0xf1989f01u, 0x00081014u, 0xc0000000u, EncodeSopp(0x01)}, true,
-        "unknown instruction after BVH prevented dispatch skipping");
+        "unknown instruction after BVH prevented dispatch stubbing");
 
   for (uint32_t opcode : {0xe6u, 0xe7u}) {
     for (uint32_t nsa = 0; nsa < 4; ++nsa) {
@@ -78,8 +83,8 @@ void TestRayTracingDispatchDetection() {
   Check(!reused.has_bvh, "decoder retained stale BVH metadata");
   for (const auto stage : {ShaderType::Compute, ShaderType::Vertex, ShaderType::Pixel}) {
     const auto options = MakeCompileOptions(stage);
-    Check(!ShaderRecompiler::TranslateProgram(ordinary_code, options).skip_dispatch,
-          "BVH-shaped literal marked an ordinary shader for skipping");
+    Check(!ShaderRecompiler::TranslateProgram(ordinary_code, options).unsupported,
+          "BVH-shaped literal marked an ordinary shader as unsupported");
     const auto compiled = RecompileForTest(ordinary_code, options);
     Check(!compiled.spirv.empty(), "ordinary shader did not compile");
     CheckSpirvBinaryValidates(compiled.spirv);

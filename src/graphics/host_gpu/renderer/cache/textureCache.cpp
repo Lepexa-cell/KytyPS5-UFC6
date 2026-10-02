@@ -155,7 +155,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+		    static_cast<int64_t>(std::min<uint64_t>(
+		        std::min(m_graphics.GetTotalMemoryBudget(), MAX_DEVICE_LOCAL_VRAM), INT64_MAX));
 		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
 		m_pressure_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
@@ -247,6 +248,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	image.registered = true;
 	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
+	m_address_cache.try_emplace(image.info.data.address, id);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -280,6 +282,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	m_address_cache.erase(image.info.data.address);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1378,6 +1381,27 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		return {};
 	}
 	std::scoped_lock lock {m_lock};
+	// Fast path: check the address cache first to avoid walking the page table on every
+	// draw call (~16,000 per frame). If the cache misses or the image has been re-registered
+	// with different backing, fall through to the full region scan.
+	ImageId         selected {};
+	const auto      cached = m_address_cache.find(address);
+	if (cached != m_address_cache.end()) {
+		if (const auto* owner = m_slot_images.try_get(cached->second);
+		    owner != nullptr && owner->registered &&
+		    owner->info.data.address == address && owner->info.data.size >= size) {
+			selected = cached->second;
+			if (ensure_valid && selected) {
+				const auto resolver = m_slot_images.try_get(selected);
+				if (resolver != nullptr && resolver->depth_id) {
+					selected = resolver->depth_id;
+				}
+			}
+			if (selected) {
+				return selected;
+			}
+		}
+	}
 	ImageIds         matches;
 	// Only an image that starts at the address qualifies, and it covers that byte: one page to
 	// query instead of every page of the range (a multi-megabyte texel buffer on every draw).
@@ -1394,7 +1418,6 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		}
 		matches.push_back(id);
 	}
-	ImageId selected {};
 	if (matches.size() == 1) {
 		selected = matches.front();
 	} else {
@@ -1678,6 +1701,19 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
+	// Invalidate the fast address cache for any images whose backing storage overlaps
+	// the invalidated range, so the next lookup re-resolves through the page table.
+	auto it = m_address_cache.begin();
+	while (it != m_address_cache.end()) {
+		const auto image_address = it->first;
+		const auto* image = m_slot_images.try_get(it->second);
+		if (image == nullptr || !image->registered ||
+		    !(image_address + image->info.data.size > address && image_address < address + size)) {
+			++it;
+		} else {
+			it = m_address_cache.erase(it);
+		}
+	}
 }
 
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {

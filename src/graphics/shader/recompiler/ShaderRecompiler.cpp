@@ -548,18 +548,33 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
-	// Temporary workaround for games that compile ray-tracing shaders before
-	// the player can select a mode without ray tracing.
+	// Ray-tracing shaders are not implemented. Instead of skipping the dispatch entirely,
+	// rewrite the terminal BVH instruction to S_ENDPGM (implicit miss, hit=false) so the
+	// shader translates faithfully to SPIR-V and dispatches execute without crashing callers.
 	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
 			const auto& bvh = decoded.instructions.back();
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
-			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
+			    "Warning: ray tracing is not implemented; stubbing BVH intersection "
+			    "instructions out as a miss (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
 			    options.shader_hash, bvh.pc, bvh.opcode_id));
 		}
-		return {.skip_dispatch = true};
+		auto& bvh = decoded.instructions.back();
+		bvh.opcode    = Decoder::Opcode::S_ENDPGM;
+		bvh.opcode_id = 0;
+		bvh.family    = Decoder::Family::SOPP;
+		bvh.src_count = 0;
+		bvh.word_count = 1;
+		// Clear operand fields that S_ENDPGM does not use.
+		bvh.dst        = {};
+		bvh.dst2       = {};
+		bvh.src0       = {};
+		bvh.src1       = {};
+		bvh.src2       = {};
+		bvh.src3       = {};
+		bvh.offset     = 0;
+		decoded.has_bvh = false;
 	}
 	// KYTY_DUMP_SHADER_HASHES="hash,hash,...": dump these shaders' code too (into
 	// KYTY_DUMP_GAVE_UP), for shaders that compile but are skipped later.
@@ -772,7 +787,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
-	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);

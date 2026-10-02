@@ -33,6 +33,9 @@ class TextureCache {
 public:
 	// Called before a bindless-pinned image is unregistered.
 	std::function<void(ImageId)> on_bindless_unregister;
+	// Cap Device-Local VRAM budget at 11200 MiB for RTX 4070-class cards (12 GB),
+	// so the garbage collector triggers before the host spills into slow system memory.
+	static constexpr uint64_t MAX_DEVICE_LOCAL_VRAM = 11200ull * 1024 * 1024;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -179,6 +182,9 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Fast address -> ImageId lookup for FindImageFromRange, avoiding a full page-table
+	// walk on every draw call (~16,000 per frame). Keyed by image data.address.
+	std::unordered_map<uint64_t, ImageId>             m_address_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

@@ -503,7 +503,6 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
-		bool                                        skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -584,9 +583,6 @@ struct PipelineCache::ProgramCache {
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -698,11 +694,6 @@ struct PipelineCache::ProgramCache {
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
 		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch = true;
-			return {};
-		}
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
