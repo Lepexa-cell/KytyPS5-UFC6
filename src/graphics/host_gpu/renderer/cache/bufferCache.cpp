@@ -407,15 +407,17 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			}
 		}
 
-		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
+		// Scope the download to the faulted pages: a 512 KB window pulled unrelated
+		// GPU-dirty bytes into every point read and forced a full Submit+Wait drain
+		// (~30 ms a fault). Page granularity keeps false-sharing local.
 		const auto         buffer_begin = buffer.CpuAddress();
 		const auto         buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+		const auto window_begin = std::max(page_begin, buffer_begin);
+		const auto window_end = std::min(page_end, buffer_end);
 
 		Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		if (window_end > window_begin &&
+		    DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			// Must be CurrentTick(): DownloadBufferMemory queues its copy-out command into
 			// whatever recording is currently open, so that recording has to actually be
 			// submitted and complete before the staging buffer it wrote into can be read back.
