@@ -133,6 +133,15 @@ private:
 	void                      TrackImageDownload(ImageId id, Image& image);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
+	// L1 MRU for FindImage: consecutive draws rebind the same textures. The probe
+	// revalidates the cached slot (generation, registration, SameBacking) under the
+	// texture lock and runs the touch/materialize/video-out tail, so uploads,
+	// barriers and GC accounting stay fully honest.
+	bool FindImageMruHit(const ImageDesc& desc, bool exact_format,
+	                     uint32_t metadata_base_layer, ImageId& result);
+	void UpdateFindImageMru(const ImageDesc& desc, bool exact_format, ImageId result,
+	                        uint32_t view_base_level, uint32_t view_base_layer,
+	                        const Image& image);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.

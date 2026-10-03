@@ -553,13 +553,18 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 }
 
 void CommandScheduler::EnableAsyncSubmit() {
-	// The owner enables it while constructing, before any other thread can submit.
+	// Two-thread model entry point: the owner enables it while constructing,
+	// before any other thread can submit. From here on the translator thread only
+	// records/closes command buffers and enqueues SubmitJobs; the submit worker
+	// thread owns every blocking driver call (vkQueueSubmit, queue-mutex waits).
 	EXIT_IF(m_async_submit);
 	m_async_submit  = true;
 	m_submit_thread = std::jthread([this](std::stop_token stop) { SubmitThread(stop); });
 }
 
 void CommandScheduler::SubmitThread(std::stop_token stop) {
+	// Driver worker: P-core affinity + highest priority so the 16k-draw UFC 5
+	// standup never starves the RTX 4070 while CPU5 keeps translating PM4.
 	KYTY_PROFILER_THREAD("GpuQueueSubmit");
 	PinThreadToPerformanceCores();
 	for (;;) {
@@ -567,19 +572,27 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 		{
 			std::unique_lock lock(m_submit_mutex);
 			// A stop request still submits the queued jobs: their ticks may already be waited on.
+			// Shutdown() waits every tick before requesting the stop, so the queue must be empty
+			// by then -- every barrier, upload and EOP write already recorded still reaches the
+			// driver in tick order. The condition-variable notify in StopSubmitThread wakes us.
 			if (!m_submit_available.wait(lock, stop, [this] { return !m_submit_jobs.empty(); })) {
 				return;
 			}
 			job = m_submit_jobs.front();
 			m_submit_jobs.pop_front();
 		}
+		// Heavy driver call happens here, off the translator thread: queue-locked
+		// vkQueueSubmit + timeline signal + present-side semaphore handoff.
 		QueueSubmit(job);
 	}
 }
 
 void CommandScheduler::StopSubmitThread() {
+	// Ordered teardown: stop flag + notify wakes the worker, join waits for the in-flight
+	// vkQueueSubmit to return, then the empty-queue check proves no tick was dropped.
 	if (m_submit_thread.joinable()) {
 		m_submit_thread.request_stop();
+		m_submit_available.notify_all();
 		m_submit_thread.join();
 	}
 	std::lock_guard lock(m_submit_mutex);

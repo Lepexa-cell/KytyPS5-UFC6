@@ -64,13 +64,17 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
-	// Dedicated GPU driver worker (Hama 60 FPS Suite, task 1): hands later submissions to a
-	// dedicated queue thread, which submits them in tick order, so vkQueueSubmit (and the
-	// queue lock that present also takes) leaves the guest command-processor thread. The guest
-	// thread keeps parsing PM4 packets and recording draws/dispatches while the worker feeds the
-	// Vulkan driver on another CPU core in parallel. Submit() then returns once the tick is
-	// allocated; host waits on a timeline value may precede its signal operation. Enable before
-	// the first Submit().
+	// Two-thread driver model (Producer-Consumer): the CommandProcessor thread parses
+	// PM4, records draws/dispatches and closes Vulkan command buffers without blocking
+	// on the driver, while a dedicated submit worker (std::jthread m_submit_thread)
+	// drains the queue and issues the heavy driver calls (vkQueueSubmit under the
+	// queue lock, timeline signalling, present-side semaphore sync). The worker is
+	// pinned to the P-core mask with THREAD_PRIORITY_HIGHEST so 16k-draw Frostbite
+	// frames keep the RTX 4070 fed while CPU5 keeps translating. Submit() returns once
+	// the tick is allocated; host waits on a timeline value may precede its signal
+	// operation. Enable before the first Submit(). Safe shutdown: the destructor runs
+	// Shutdown(), which drains pending work, sets the jthread stop flag, notifies the
+	// condition variable and joins the worker -- no barrier, upload or tick is lost.
 	void EnableAsyncSubmit();
 	[[nodiscard]] bool AsyncSubmit() const noexcept { return m_async_submit; }
 

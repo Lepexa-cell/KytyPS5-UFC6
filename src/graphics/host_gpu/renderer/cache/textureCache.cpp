@@ -1283,6 +1283,107 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+namespace {
+// L1 MRU storage for TextureCache::FindImage: the octagon standup rebinds the same
+// fighter, crowd and arena textures on consecutive draws. A hit skips only the
+// page-table walk and overlap resolution; the slot is revalidated under the texture
+// lock and the touch/materialize/video-out tail runs exactly as on a miss.
+struct FindImageMru {
+	const TextureCache* owner           = nullptr;
+	ImageId             id {};
+	bool                exact_format    = false;
+	TextureCache::BindingType binding_type = TextureCache::BindingType::Texture;
+	uint64_t            address         = 0;
+	uint64_t            size            = 0;
+	uint32_t            width           = 0;
+	uint32_t            height          = 0;
+	uint32_t            depth           = 0;
+	uint32_t            levels          = 0;
+	uint32_t            layers          = 0;
+	uint32_t            samples         = 0;
+	uint32_t            bytes_per_block = 0;
+	Prospero::TileMode  tile_mode       = Prospero::TileMode::kLinear;
+	vk::Format          pixel_format    = vk::Format::eUndefined;
+	Prospero::ImageType image_type      = Prospero::ImageType::kColor2D;
+};
+thread_local FindImageMru g_find_image_mru;
+} // namespace
+
+bool TextureCache::FindImageMruHit(const ImageDesc& desc, bool exact_format,
+                                   uint32_t metadata_base_layer, ImageId& result) {
+	const auto& mru = g_find_image_mru;
+	if (mru.owner != this || !mru.id || mru.exact_format != exact_format ||
+	    mru.binding_type != desc.type || mru.address != desc.info.data.address || mru.size != desc.info.data.size ||
+	    mru.width != desc.info.extent.width || mru.height != desc.info.extent.height ||
+	    mru.depth != desc.info.extent.depth || mru.levels != desc.info.resources.levels ||
+	    mru.layers != desc.info.resources.layers || mru.samples != desc.info.samples ||
+	    mru.bytes_per_block != desc.info.bytes_per_block || mru.tile_mode != desc.info.tile_mode ||
+	    mru.pixel_format != desc.info.pixel_format || mru.image_type != desc.info.type) {
+		return false;
+	}
+	std::unique_lock lock {m_lock};
+	auto* cached = m_slot_images.try_get(mru.id);
+	if (cached == nullptr || !cached->registered || cached->depth_id ||
+	    !SameBacking(cached->info, desc.info, exact_format) ||
+	    cached->info.resources < desc.info.resources ||
+	    (exact_format && cached->info.pixel_format != desc.info.pixel_format)) {
+		g_find_image_mru.owner = nullptr;
+		g_find_image_mru.id    = {};
+		return false;
+	}
+	cached->tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(*cached);
+	result = mru.id;
+	lock.unlock();
+	// Same tail as the miss path below: DCC/Cmask clear resolution and the compressed
+	// video-out contract. No barrier, upload or refresh is skipped.
+	MaterializeColorClear(result, desc, metadata_base_layer);
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		std::scoped_lock check_lock {m_lock};
+		const auto& image         = m_slot_images[result];
+		const bool  guest_dirty   = image.IsBufferModified() || image.IsCpuDirty();
+		const bool  native_current =
+		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+		if (!native_current) {
+			EXIT("TextureCache: compressed video-out read requires clean native GPU contents\n");
+		}
+	}
+	return true;
+}
+
+void TextureCache::UpdateFindImageMru(const ImageDesc& desc, bool exact_format, ImageId result,
+                                      uint32_t view_base_level, uint32_t view_base_layer,
+                                      const Image& image) {
+	if (!result || desc.view_info.base_level != view_base_level ||
+	    desc.view_info.base_layer != view_base_layer) {
+		// Overlap resolution rewrote the view: not a pure backing hit, leave the MRU alone.
+		return;
+	}
+	if (!SameBacking(image.info, desc.info, exact_format) ||
+	    image.info.resources < desc.info.resources ||
+	    (exact_format && image.info.pixel_format != desc.info.pixel_format)) {
+		return;
+	}
+	auto& mru           = g_find_image_mru;
+	mru.owner           = this;
+	mru.id              = result;
+	mru.exact_format    = exact_format;
+	mru.binding_type    = desc.type;
+	mru.address         = desc.info.data.address;
+	mru.size            = desc.info.data.size;
+	mru.width           = desc.info.extent.width;
+	mru.height          = desc.info.extent.height;
+	mru.depth           = desc.info.extent.depth;
+	mru.levels          = desc.info.resources.levels;
+	mru.layers          = desc.info.resources.layers;
+	mru.samples         = desc.info.samples;
+	mru.bytes_per_block = desc.info.bytes_per_block;
+	mru.tile_mode       = desc.info.tile_mode;
+	mru.pixel_format    = desc.info.pixel_format;
+	mru.image_type      = desc.info.type;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
@@ -1294,8 +1395,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		return GetNullImage(desc);
 	}
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	const auto view_base_level     = desc.view_info.base_level;
 
 	ImageId result {};
+	if (FindImageMruHit(desc, exact_format, metadata_base_layer, result)) {
+		return result;
+	}
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
@@ -1350,6 +1455,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		UpdateFindImageMru(desc, exact_format, result, view_base_level, metadata_base_layer,
+		                   image);
 	}
 	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
