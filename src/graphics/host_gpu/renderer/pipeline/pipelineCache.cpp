@@ -70,7 +70,7 @@ namespace {
 struct PipelineMruSlot {
 	const PipelineCache* owner = nullptr;
 	PipelineCache::Pipeline* pipeline = nullptr;
-	GraphicsPipelineKey key {};
+	PipelineCache::GraphicsPipelineKey key {};
 	std::size_t key_hash = 0;
 	bool key_valid = false;
 	uint64_t epoch = 0;
