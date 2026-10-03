@@ -110,6 +110,22 @@ public:
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	void NoteFrame(uint64_t frame) noexcept {
+		if (m_offset == 0) {
+			return;
+		}
+		if (m_last_used_frame == frame) {
+			return;
+		}
+		m_last_used_frame = frame;
+		if (++m_idle_frames > 2) {
+			// Idle for more than two presented frames: the GPU has retired the
+			// uploads, so the ring can be reused from the start.
+			m_offset               = 0;
+			m_current_watch_cursor = 0;
+			m_idle_frames          = 0;
+		}
+	}
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -128,6 +144,10 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	// Frames since this ring was last written. A staging ring idle for more than two
+	// presented frames is rewound so its device memory can be reclaimed.
+	uint64_t              m_idle_frames = 0;
+	uint64_t              m_last_used_frame = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;

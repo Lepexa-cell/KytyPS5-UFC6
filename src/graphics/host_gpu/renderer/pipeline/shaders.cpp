@@ -439,6 +439,12 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	build.multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
 	build.multisampling.rasterizationSamples = vulkan_sample_count(static_params.samples);
 	build.multisampling.minSampleShading     = 1.0f;
+	// Alpha-to-coverage is a no-op on a single-sample target and forces the driver down the
+	// multisample path (the hair and beard passes of UFC). Keep the guest alpha test instead.
+	build.multisampling.alphaToCoverageEnable =
+	    static_params.samples > 1 && ps_input_info != nullptr && ps_input_info->ps_pixel_kill_enable
+	        ? VK_TRUE
+	        : VK_FALSE;
 
 	auto& color_blend_attachment = build.color_blend;
 	for (uint32_t i = 0; i < rendering.color_count; i++) {

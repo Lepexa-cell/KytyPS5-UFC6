@@ -258,14 +258,21 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		return;
 	}
 	constexpr int64_t GiB              = 1024ll * 1024 * 1024;
-	constexpr int64_t target_threshold = 8 * GiB;
+	// Hard ceiling for the active buffer cache and its staging rings. A 12 GB card starts
+	// paging into host RAM once device memory passes ~9 GB, which is what throttled UFC on
+	// the RTX 4070; 8.5 GB leaves headroom for the texture cache and the driver.
+	constexpr int64_t kBufferMemoryCeiling = 8500ll * 1024 * 1024;
+	constexpr int64_t target_threshold     = kBufferMemoryCeiling;
 	const auto        budget =
 	    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
 	const auto threshold = std::min(budget, target_threshold);
 	const auto expected  = std::min(budget - 6 * threshold / 10, budget - GiB);
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
-	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
-	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	m_trigger_gc_memory  = static_cast<uint64_t>(std::min<int64_t>(
+	    std::max<int64_t>(expected, GiB), kBufferMemoryCeiling));
+	m_critical_gc_memory = static_cast<uint64_t>(std::min<int64_t>(
+	    std::max<int64_t>(critical, 2 * GiB), kBufferMemoryCeiling));
+	m_memory_ceiling     = static_cast<uint64_t>(kBufferMemoryCeiling);
 }
 
 BufferCache::~BufferCache() {
@@ -1017,6 +1024,12 @@ void BufferCache::RunGarbageCollector() {
 	static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
 	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	// Past the working-set ceiling the collector always runs, and aggressively: that is
+	// the point where a 12 GB card would otherwise start paging device memory to host RAM.
+	if (m_total_used_memory >= m_memory_ceiling) {
+		m_trigger_gc_memory  = m_memory_ceiling;
+		m_critical_gc_memory = m_memory_ceiling;
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;

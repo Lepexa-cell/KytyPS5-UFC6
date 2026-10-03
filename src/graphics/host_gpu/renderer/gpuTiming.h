@@ -24,13 +24,15 @@ void AfterSlow(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint
 enum Kind : uint32_t { Draw = 1, Dispatch = 2 };
 
 inline void Before(RenderContext& context, CommandBuffer& buffer) {
-	if (Detail::g_active.load(std::memory_order_relaxed)) {
+	// Release builds without a profiling window never touch the query pool: the atomic
+	// stays false and vkCmdWriteTimestamp is not recorded on the draw path.
+	if (Detail::g_active.load(std::memory_order_relaxed)) [[unlikely]] {
 		Detail::BeforeSlow(context, buffer);
 	}
 }
 
 inline void After(RenderContext& context, CommandBuffer& buffer, uint64_t key, uint32_t kind) {
-	if (Detail::g_active.load(std::memory_order_relaxed)) {
+	if (Detail::g_active.load(std::memory_order_relaxed)) [[unlikely]] {
 		Detail::AfterSlow(context, buffer, key, kind);
 	}
 }

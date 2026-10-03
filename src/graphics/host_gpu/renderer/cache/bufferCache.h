@@ -113,7 +113,12 @@ public:
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
 	// Bumped once per presented frame (GPU thread) so per-frame read-sync stamps expire.
-	void NextFrame() noexcept { ++m_frame_counter; }
+	void NextFrame() noexcept {
+		++m_frame_counter;
+		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		m_staging_buffer.NoteFrame(frame);
+		m_stream_buffer.NoteFrame(frame);
+	}
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -184,6 +189,9 @@ private:
 	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	// Hard working set of the buffer cache plus its staging rings. The collector treats
+	// anything past it as critical so the driver never spills device memory to host RAM.
+	uint64_t m_memory_ceiling = 8500ull * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
 	// Per-frame id for read-sync dedup: bumped once per presented frame so repeated
 	// read-only binds of the same buffer within a frame skip the tracker walk.

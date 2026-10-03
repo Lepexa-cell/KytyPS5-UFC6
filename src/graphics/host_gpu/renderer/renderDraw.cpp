@@ -368,6 +368,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			viewport.y      = guest.yoffset - guest.yscale;
 			viewport.width  = guest.xscale * 2.0f;
 			viewport.height = guest.yscale * 2.0f;
+			// TAA jitter is the fractional part of the guest offset above. It is
+			// forwarded unchanged: rounding it collapses the pattern and the
+			// octagon floor grid shimmers.
 		}
 		viewport.minDepth =
 		    guest.zoffset - (ctx.GetClipControl().dx_clip_space ? 0.0f : guest.zscale);

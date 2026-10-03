@@ -288,6 +288,8 @@ void StreamBuffer::Commit() {
 	}
 
 	m_offset += m_mapped_size;
+	m_idle_frames     = 0;
+	m_last_used_frame = Graphics().presented_frames.load(std::memory_order_relaxed);
 	const auto tick = Scheduler().CurrentTick();
 	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick) {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;

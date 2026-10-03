@@ -1538,6 +1538,9 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
+		// One atomic per subgroup, no barrier and no spin. A device-scope barrier here
+		// deadlocks fragment invocations (GDS append in ea0aceac518ec52d hung the frame),
+		// and the atomic itself already publishes the counter through the GDS SSBO.
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
 		                          value, EmitMemoryElementPointer(state, access, index),
 		                          ConstantU32(state, mem.kind == IR::ResourceKind::Gds
