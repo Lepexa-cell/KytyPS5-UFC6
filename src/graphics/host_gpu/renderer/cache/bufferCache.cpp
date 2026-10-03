@@ -616,13 +616,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	// Fast path (Frostbite 16k draws/frame): batch CPU-modification checks at submission
-	// level. When the CPU-dirty epoch has not moved since the previous draw, no CPU write
-	// landed in between, so a read-only sync has nothing to upload — skip ForEachUploadRange
-	// (page-table/region walk + callback) entirely. Written bindings always run the walk so
-	// their GPU-written marking is published.
-	const bool skip_cpu_sync = TrySkipSubmissionCpuSync(is_written);
-	if (!skip_cpu_sync) {
+	{
 		KYTY_PROFILER_BLOCK("Sync::Tracker");
 		m_memory_tracker.ForEachUploadRange(
 		    vaddr, size, is_written,

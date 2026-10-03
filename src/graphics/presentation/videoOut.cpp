@@ -1209,7 +1209,7 @@ bool FlipQueue::IsDone(VideoOutConfig& cfg, int index) {
 	// Keep up to 2 frames in flight: only the flip still queued for this buffer blocks.
 	const size_t pending = std::count_if(m_requests.begin(), m_requests.end(), matches) +
 	                       std::count_if(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
-	return pending <= 1;
+	return pending == 0;
 }
 
 bool FlipQueue::Flip(uint32_t micros) {

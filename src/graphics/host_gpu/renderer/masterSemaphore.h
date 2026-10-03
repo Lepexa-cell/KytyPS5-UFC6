@@ -27,12 +27,11 @@ public:
 	// completion without ever entering vkWaitSemaphores. Lets frame pacing
 	// keep up to 2 frames in flight instead of spin/sleep-blocking the
 	// guest command thread on the previous GPU frame.
-	void Poll() { Refresh(); }
 	[[nodiscard]] bool IsReady(uint64_t tick) {
 		if (IsFree(tick)) {
 			return true;
 		}
-		Poll();
+		Refresh();
 		return IsFree(tick);
 	}
 	[[nodiscard]] uint64_t NextTick() noexcept {
