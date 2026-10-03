@@ -34,7 +34,9 @@
 #include <mutex>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -62,6 +64,30 @@ struct WatchedReread {
 
 std::mutex                 g_watched_reread_mutex;
 std::vector<WatchedReread> g_watched_rereads;
+
+// CommitBindings L1: arena/mesh batches re-commit byte-identical descriptor
+// contents for many consecutive draws. The fingerprint below covers exactly
+// what updateDescriptorSets consumes for set 0 (runtime/program identity,
+// buffer handles/offsets/ranges, image views/layouts, GDS handle,
+// flattened-SRT/shader-data/bindless-patch contents); on a hit we skip
+// rebuilding VkWriteDescriptorSet arrays and skip updateDescriptorSets,
+// then bind the cached set unconditionally (Golden Rule 4). Barriers, GDS,
+// bindless transitions, push constants and set-1 binds are never skipped:
+// only the set-0 write/update is bypassed. Like CommitBindings itself, the
+// slot is used from the single GPU thread; thread_local only avoids sharing
+// last-used state across threads.
+struct DescriptorMruSlot {
+	const RenderExecutor* owner = nullptr;
+	vk::DescriptorSetLayout layout = nullptr;
+	vk::DescriptorSet set = nullptr;
+	uint64_t fingerprint = 0;
+	bool valid = false;
+};
+
+uint64_t DescriptorFingerprint(uint64_t seed, uint64_t value) {
+	seed ^= value + 0x9e3779b97f4a7c15ull + (seed << 12u) + (seed >> 4u);
+	return seed;
+}
 
 void LogWords(const uint32_t* words, size_t count) {
 	for (size_t row = 0; row < count; row += 8) {
@@ -1551,6 +1577,90 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
+	// Descriptor-prep fast path. Recomputing the fingerprint walks the same
+	// prepared-bindings inputs that the write loop below consumes
+	// (program/binding identity, buffer handles+offsets+ranges, image
+	// views/layouts, GDS handle, flattened-SRT/shader-data/bindless contents),
+	// so a hit provably means write_count and the rebuilt
+	// VkWriteDescriptorSet stream would be identical. A hit then skips only:
+	// building that stream (CPU vector traffic) and the updateDescriptorSets
+	// call. It never skips barriers/GDS/bindless transitions, push constants,
+	// or any vkCmdBindDescriptorSets (Golden Rule 4). Push descriptors bypass
+	// the path (no reusable set); samplers/BDA/fault handles are program
+	// constants folded into the runtime/program-identity words, and upload
+	// (flattened-SRT/shader-data) handles are covered by content words.
+	static thread_local DescriptorMruSlot desc_mru;
+	const bool can_use_mru = !pipeline.uses_push_descriptors;
+	uint64_t fingerprint = static_cast<uint64_t>(pipeline_bind_point) + 0x9e3779b97f4a7c15ull;
+	fingerprint = DescriptorFingerprint(
+	    fingerprint, reinterpret_cast<uint64_t>(pipeline.descriptor_set_layout));
+	for (const auto* prepared: prepared_bindings) {
+		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
+		const auto& program = *prepared->runtime->program;
+		fingerprint = DescriptorFingerprint(
+		    fingerprint, reinterpret_cast<uint64_t>(prepared->runtime));
+		fingerprint = DescriptorFingerprint(fingerprint,
+		                                    static_cast<uint64_t>(program.bindings.descriptors.size()));
+		fingerprint = DescriptorFingerprint(fingerprint,
+		                                    static_cast<uint64_t>(prepared->buffers.size()));
+		fingerprint = DescriptorFingerprint(fingerprint,
+		                                    static_cast<uint64_t>(prepared->images.size()));
+		fingerprint = DescriptorFingerprint(fingerprint,
+		                                    static_cast<uint64_t>(prepared->shader_data.size()));
+		fingerprint = DescriptorFingerprint(fingerprint,
+		                                    static_cast<uint64_t>(prepared->samplers.size()));
+		fingerprint = DescriptorFingerprint(
+		    fingerprint, reinterpret_cast<uint64_t>(prepared->gds.buffer));
+		for (const auto& word: prepared->shader_data) {
+			fingerprint = DescriptorFingerprint(fingerprint, word);
+		}
+		// Sampler handles are per-program constants resolved from snapshot
+		// words, but folding set-0 sampler handles in is cheap and keeps the
+		// fingerprint honest if the sampler cache ever changes policy.
+		for (const auto sampler: prepared->samplers) {
+			fingerprint = DescriptorFingerprint(
+			    fingerprint,
+			    reinterpret_cast<uint64_t>(static_cast<VkSampler>(sampler)));
+		}
+		for (const auto& view: prepared->buffers) {
+			fingerprint = DescriptorFingerprint(
+			    fingerprint, reinterpret_cast<uint64_t>(view.buffer));
+			uint64_t words[2] = {};
+			static_assert(sizeof(view.offset) == sizeof(uint64_t));
+			static_assert(sizeof(view.range) == sizeof(uint64_t));
+			std::memcpy(words, &view.offset, sizeof(view.offset));
+			std::memcpy(words + 1, &view.range, sizeof(view.range));
+			fingerprint = DescriptorFingerprint(fingerprint, words[0]);
+			fingerprint = DescriptorFingerprint(fingerprint, words[1]);
+		}
+		for (const auto& binding: prepared->images) {
+			fingerprint = DescriptorFingerprint(
+			    fingerprint, reinterpret_cast<uint64_t>(
+			                     static_cast<VkImageView>(binding.image_view)));
+			fingerprint = DescriptorFingerprint(
+			    fingerprint, static_cast<uint64_t>(binding.layout));
+			for (const auto mip: binding.mip_views) {
+				fingerprint = DescriptorFingerprint(
+				    fingerprint,
+				    reinterpret_cast<uint64_t>(static_cast<VkImageView>(mip)));
+			}
+		}
+		// flattened_srt/shader_data_buffer/gds are host-uploaded buffers whose
+		// handles+offsets change per NativeUpload even for identical contents,
+		// so fingerprint their contents, not the volatile upload handles.
+		for (const auto& dword: prepared->flattened_srt.data) {
+			fingerprint = DescriptorFingerprint(fingerprint, dword);
+		}
+		for (const auto& patch: prepared->bindless_patches) {
+			fingerprint = DescriptorFingerprint(fingerprint, patch[0]);
+			fingerprint = DescriptorFingerprint(fingerprint, patch[1]);
+			fingerprint = DescriptorFingerprint(fingerprint, patch[2]);
+		}
+	}
+	const bool desc_mru_hit =
+	    can_use_mru && desc_mru.valid && desc_mru.owner == this &&
+	    desc_mru.layout == pipeline.descriptor_set_layout && desc_mru.set != nullptr &&
+	    desc_mru.fingerprint == fingerprint;
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
@@ -1567,10 +1677,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
-	m_descriptor_writes.clear();
+	if (!desc_mru_hit) {
+		m_descriptor_writes.clear();
+		m_descriptor_writes.reserve(write_count);
+	}
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
-	m_descriptor_writes.reserve(write_count);
+
+	// NOTE: the barrier/transition work below (GDS barrier, bindless read-only
+	// transitions, set-0 image transitions) always runs, even on a descriptor
+	// MRU hit: the fingerprint keys on contents, but image layouts and
+	// generations can change underneath identical contents (streaming, GC).
+	// The fast path only skips the VkWriteDescriptorSet rebuild + update.
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->runtime->program;
@@ -1680,7 +1798,20 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);
-		for (const auto& binding: program.bindings.descriptors) {
+		if (desc_mru_hit) {
+			// Hit: the checks above still validate occurrences/layouts, but
+			// the VkWriteDescriptorSet stream and the m_descriptor_* scratch
+			// arrays are not rebuilt (they keep this call's barrier inputs).
+			for (const auto& binding: program.bindings.descriptors) {
+				if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
+				    ShaderRecompiler::IR::ImageResourceClass::None) {
+					for (const auto resource: binding.resources) {
+						m_image_occurrences.at(resource)++;
+					}
+				}
+			}
+		} else {
+			for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
 			write.dstBinding     = ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind);
 			write.descriptorType = NativeDescriptorType(binding.kind);
@@ -1743,7 +1874,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				write.pImageInfo = m_descriptor_images.data() + image_start;
 			}
 			m_descriptor_writes.push_back(write);
-		}
+			}
+		} // !desc_mru_hit
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			const auto expected =
 			    descriptors.images[i].mip_views.empty()
@@ -1766,20 +1898,37 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		                        push_data.dwords.data());
 	}
 
-	if (!m_descriptor_writes.empty()) {
+	// write_count > 0 exactly when at least one binding needs set 0 (see the
+	// counting loop); the tail must run even on a hit whose m_descriptor_writes
+	// was intentionally left stale from an older miss.
+	if (write_count != 0) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
+			EXIT_IF(desc_mru_hit);
 			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
+			// Fast path: contents identical to the cached commit, so reuse the
+			// already-written set. Skips only the write-stream rebuild (done
+			// above) and updateDescriptorSets; the bind stays unconditional.
+			vk::DescriptorSet set = nullptr;
+			if (desc_mru_hit) {
+				set = desc_mru.set;
+			} else {
+				set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+				for (auto& write: m_descriptor_writes) {
+					write.dstSet = set;
+				}
+				m_context.GetGraphics().device.updateDescriptorSets(
+				    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+				    nullptr);
+				desc_mru.owner       = this;
+				desc_mru.layout      = pipeline.descriptor_set_layout;
+				desc_mru.set         = set;
+				desc_mru.fingerprint = fingerprint;
+				desc_mru.valid       = true;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1,
 			                             &set, 0, nullptr);
 		}

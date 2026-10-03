@@ -57,6 +57,34 @@ bool ShaderFailureNonFatal() {
 
 namespace {
 
+// L1 MRU: draw batches reuse one pipeline for many consecutive draws. A hit returns
+// the cached Pipeline* without touching the global map/mutex. The hit path
+// compares the full GraphicsPipelineKey directly (no hash); the XXH3/hash is
+// only computed on the miss path for the map lookup. A miss takes the normal
+// path and refreshes the slot. Pipeline objects are owned by the global map
+// for process lifetime (never freed until destruction), so a cached raw
+// pointer stays valid on this thread; destruction invalidates the slot via
+// the global epoch. VkCmdBindPipeline stays unconditional at call sites.
+// Note: like the map itself, the cache is used from the single GPU thread; the
+// thread_local slot only avoids sharing the last-used state across threads.
+struct PipelineMruSlot {
+	const PipelineCache* owner = nullptr;
+	PipelineCache::Pipeline* pipeline = nullptr;
+	GraphicsPipelineKey key {};
+	std::size_t key_hash = 0;
+	bool key_valid = false;
+	uint64_t epoch = 0;
+};
+
+uint64_t& PipelineMruEpoch() {
+	static uint64_t epoch = 0;
+	return epoch;
+}
+
+void InvalidatePipelineMru() {
+	++PipelineMruEpoch();
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -812,6 +840,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	InvalidatePipelineMru();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -1302,11 +1331,28 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 		return nullptr;
 	};
+	// L1 MRU fast path: on a full-key hit return the live object without hashing
+	// or locking. Pending pipelines are never cached as ready: fall through so
+	// FinishPending/defer logic below runs exactly as before. The hash is only
+	// computed on the miss path (the map lookup needs it); hits compare the key
+	// directly.
+	static thread_local PipelineMruSlot mru;
+	if (mru.key_valid && mru.owner == this && mru.epoch == PipelineMruEpoch() &&
+	    mru.pipeline != nullptr && mru.key == key && mru.pipeline->pending == nullptr) {
+		return mru.pipeline;
+	}
+	const std::size_t lookup_hash = GraphicsPipelineKeyHash {}(key);
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		auto& found = *iter->second;
 		if (found.pending && !FinishPending(found)) {
 			return defer();
 		}
+		mru.owner     = this;
+		mru.pipeline  = &found;
+		mru.key       = key;
+		mru.key_hash  = lookup_hash;
+		mru.key_valid = true;
+		mru.epoch     = PipelineMruEpoch();
 		return &found;
 	}
 
@@ -1341,6 +1387,15 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 			return defer();
 		}
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
+		// Fresh ready pipeline: publish it in the L1 slot so the next identical
+		// draw hits without hashing or locking. Copy the key back out of the map
+		// (the local was moved into emplace above).
+		mru.owner     = this;
+		mru.pipeline  = &pipeline;
+		mru.key       = iter->first;
+		mru.key_hash  = GraphicsPipelineKeyHash {}(iter->first);
+		mru.key_valid = true;
+		mru.epoch     = PipelineMruEpoch();
 		return &pipeline;
 	}
 	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
@@ -1352,6 +1407,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
+	mru.owner     = this;
+	mru.pipeline  = iter->second.get();
+	mru.key       = iter->first;
+	mru.key_hash  = GraphicsPipelineKeyHash {}(iter->first);
+	mru.key_valid = true;
+	mru.epoch     = PipelineMruEpoch();
 	return iter->second.get();
 }
 
