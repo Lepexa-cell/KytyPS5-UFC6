@@ -1288,6 +1288,9 @@ namespace {
 // fighter, crowd and arena textures on consecutive draws. A hit skips only the
 // page-table walk and overlap resolution; the slot is revalidated under the texture
 // lock and the touch/materialize/video-out tail runs exactly as on a miss.
+// Direct-mapped 256-entry L1: a single MRU thrashes between the Albedo / Normal /
+// Roughness binds of one material inside a single draw (0% hit rate), so each
+// 4 KiB page hashes to its own slot and co-resident maps stop evicting each other.
 struct FindImageMru {
 	const TextureCache* owner           = nullptr;
 	ImageId             id {};
@@ -1306,12 +1309,18 @@ struct FindImageMru {
 	vk::Format          pixel_format    = vk::Format::eUndefined;
 	Prospero::ImageType image_type      = Prospero::ImageType::kColor2D;
 };
-thread_local FindImageMru g_find_image_mru;
+constexpr size_t kFindImageMruSlots = 256;
+constexpr size_t kFindImageMruMask  = kFindImageMruSlots - 1;
+thread_local FindImageMru g_image_cache[kFindImageMruSlots];
+[[nodiscard]] inline size_t FindImageMruSlot(uint64_t address) noexcept {
+	return (static_cast<size_t>(address >> 12) & kFindImageMruMask);
+}
 } // namespace
 
 bool TextureCache::FindImageMruHit(const ImageDesc& desc, bool exact_format,
                                    uint32_t metadata_base_layer, ImageId& result) {
-	const auto& mru = g_find_image_mru;
+	const size_t  slot = FindImageMruSlot(desc.info.data.address);
+	const auto& mru = g_image_cache[slot];
 	if (mru.owner != this || !mru.id || mru.exact_format != exact_format ||
 	    mru.binding_type != desc.type || mru.address != desc.info.data.address || mru.size != desc.info.data.size ||
 	    mru.width != desc.info.extent.width || mru.height != desc.info.extent.height ||
@@ -1327,8 +1336,8 @@ bool TextureCache::FindImageMruHit(const ImageDesc& desc, bool exact_format,
 	    !SameBacking(cached->info, desc.info, exact_format) ||
 	    cached->info.resources < desc.info.resources ||
 	    (exact_format && cached->info.pixel_format != desc.info.pixel_format)) {
-		g_find_image_mru.owner = nullptr;
-		g_find_image_mru.id    = {};
+		g_image_cache[slot].owner = nullptr;
+		g_image_cache[slot].id    = {};
 		return false;
 	}
 	cached->tick_accessed_last = m_scheduler.CurrentTick();
@@ -1365,7 +1374,7 @@ void TextureCache::UpdateFindImageMru(const ImageDesc& desc, bool exact_format, 
 	    (exact_format && image.info.pixel_format != desc.info.pixel_format)) {
 		return;
 	}
-	auto& mru           = g_find_image_mru;
+	auto& mru           = g_image_cache[FindImageMruSlot(desc.info.data.address)];
 	mru.owner           = this;
 	mru.id              = result;
 	mru.exact_format    = exact_format;

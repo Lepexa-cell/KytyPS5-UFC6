@@ -623,8 +623,21 @@ void Swapchain::Create() {
 	}
 	if (std::find(surface.present_modes.begin(), surface.present_modes.end(),
 	              create_info.presentMode) == surface.present_modes.end()) {
-		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
-		create_info.presentMode = vk::PresentModeKHR::eFifo;
+		// Prefer a tear-free low-latency fallback before hard VSync: Mailbox first,
+		// then FifoRelaxed (late frames tear instead of stalling a full 16.6 ms
+		// quantum), Fifo only as the guaranteed last resort.
+		constexpr vk::PresentModeKHR fallbacks[] = {vk::PresentModeKHR::eMailbox,
+		                                            vk::PresentModeKHR::eFifoRelaxed,
+		                                            vk::PresentModeKHR::eFifo};
+		for (const auto mode: fallbacks) {
+			if (std::find(surface.present_modes.begin(), surface.present_modes.end(), mode) !=
+			    surface.present_modes.end()) {
+				LOGF("warning: requested present mode is unavailable; falling back to %s\n",
+				     vk::to_string(mode).c_str());
+				create_info.presentMode = mode;
+				break;
+			}
+		}
 	}
 	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
