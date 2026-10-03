@@ -154,6 +154,105 @@ if (NOT TARGET FFmpeg::ffmpeg)
 	else()
 		set(ARCHITECTURE x86_64)
 	endif()
+	# Pre-fetch the FFmpeg prebuilt archive with retries and a fallback release.
+	# The ffmpeg-core submodule downloads the same URL with a single file(DOWNLOAD)
+	# attempt, so any transient HTTP failure (curl code 22 from
+	# release-assets.githubusercontent.com) aborts the whole configure step.
+	# The canonical host stays KytyPS5/ext-ffmpeg-core: neither Inori/Kyty nor
+	# Senaxx/KytyPS5 publish these ffmpeg-*.zip assets, so switching the host
+	# would turn a transient failure into a permanent 404. The fallback below is
+	# therefore the previous known-good ext-ffmpeg-core release tag, not another
+	# host. A successful pre-fetch (hash-verified against that release's
+	# SHA256SUMS, i.e. the EXPECTED_HASH equivalent) makes the submodule skip its
+	# own download: the submodule keys both the zip path and the extract dir off
+	# its own HEAD, so fallback content intentionally lands under the pinned
+	# name; headers and libs stay consistent because both come from the same
+	# verified zip. A failed pre-fetch only warns and leaves the submodule
+	# behaviour unchanged.
+	if(WIN32 AND NOT MINGW)
+		set(KYTY_FFMPEG_OS_PART "ffmpeg-windows")
+	elseif(APPLE)
+		set(KYTY_FFMPEG_OS_PART "ffmpeg-macos")
+	elseif(UNIX)
+		set(KYTY_FFMPEG_OS_PART "ffmpeg-linux")
+	elseif(MINGW)
+		set(KYTY_FFMPEG_OS_PART "ffmpeg-mingw")
+	endif()
+	if(ARCHITECTURE STREQUAL "x86_64")
+		set(KYTY_FFMPEG_ARCH_PART "x64.zip")
+	elseif(ARCHITECTURE STREQUAL "arm64")
+		set(KYTY_FFMPEG_ARCH_PART "arm64.zip")
+	else() # macOS universal
+		set(KYTY_FFMPEG_ARCH_PART "universal.zip")
+	endif()
+	set(KYTY_FFMPEG_NAME "${KYTY_FFMPEG_OS_PART}-${KYTY_FFMPEG_ARCH_PART}")
+	execute_process(COMMAND git rev-parse --short=12 HEAD
+		WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-core"
+		OUTPUT_VARIABLE KYTY_FFMPEG_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+	if(NOT KYTY_FFMPEG_SHA MATCHES "^[0-9a-f]+$")
+		set(KYTY_FFMPEG_SHA "9ac4cfd195f1")
+	endif()
+	# Previous known-good ffmpeg-core release, used only if the pinned one 404s.
+	set(KYTY_FFMPEG_FALLBACK_SHA "666183f682cb")
+	set(KYTY_FFMPEG_BASE_URL "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download")
+	set(KYTY_FFMPEG_ZIP "${CMAKE_BINARY_DIR}/externals/${KYTY_FFMPEG_SHA}-${KYTY_FFMPEG_NAME}")
+	if(NOT FFMPEG_PREBUILT_DIR AND NOT EXISTS "${KYTY_FFMPEG_ZIP}")
+		file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/externals")
+		set(KYTY_FFMPEG_URLS
+			"${KYTY_FFMPEG_BASE_URL}/${KYTY_FFMPEG_SHA}/${KYTY_FFMPEG_NAME}"
+			"${KYTY_FFMPEG_BASE_URL}/${KYTY_FFMPEG_FALLBACK_SHA}/${KYTY_FFMPEG_NAME}")
+		set(KYTY_FFMPEG_USED_SHA "")
+		foreach(KYTY_FFMPEG_URL IN LISTS KYTY_FFMPEG_URLS)
+			if(KYTY_FFMPEG_USED_SHA)
+				break()
+			endif()
+			message(STATUS "Downloading FFmpeg libraries (${KYTY_FFMPEG_URL})...")
+			foreach(KYTY_FFMPEG_ATTEMPT RANGE 1 5)
+				file(DOWNLOAD "${KYTY_FFMPEG_URL}" "${KYTY_FFMPEG_ZIP}"
+					SHOW_PROGRESS TIMEOUT 300 STATUS KYTY_FFMPEG_STATUS)
+				list(GET KYTY_FFMPEG_STATUS 0 KYTY_FFMPEG_CODE)
+				if(KYTY_FFMPEG_CODE EQUAL 0)
+					if(KYTY_FFMPEG_URL MATCHES "/([^/]+)/[^/]+$")
+						set(KYTY_FFMPEG_USED_SHA "${CMAKE_MATCH_1}")
+					endif()
+					break()
+				endif()
+				file(REMOVE "${KYTY_FFMPEG_ZIP}")
+				if(KYTY_FFMPEG_ATTEMPT LESS 5)
+					message(STATUS "FFmpeg download attempt ${KYTY_FFMPEG_ATTEMPT} failed (${KYTY_FFMPEG_STATUS}), retrying...")
+					execute_process(COMMAND ${CMAKE_COMMAND} -E sleep 5)
+				else()
+					message(STATUS "FFmpeg download failed (${KYTY_FFMPEG_STATUS}), trying next URL...")
+				endif()
+			endforeach()
+		endforeach()
+		if(KYTY_FFMPEG_USED_SHA)
+			set(KYTY_FFMPEG_SUMS_FILE "${CMAKE_BINARY_DIR}/externals/${KYTY_FFMPEG_USED_SHA}-SHA256SUMS")
+			if(NOT EXISTS "${KYTY_FFMPEG_SUMS_FILE}")
+				file(DOWNLOAD "${KYTY_FFMPEG_BASE_URL}/${KYTY_FFMPEG_USED_SHA}/SHA256SUMS"
+					"${KYTY_FFMPEG_SUMS_FILE}" TIMEOUT 120 STATUS KYTY_FFMPEG_SUMS_STATUS)
+				list(GET KYTY_FFMPEG_SUMS_STATUS 0 KYTY_FFMPEG_SUMS_CODE)
+				if(NOT KYTY_FFMPEG_SUMS_CODE EQUAL 0)
+					file(REMOVE "${KYTY_FFMPEG_SUMS_FILE}")
+				endif()
+			endif()
+			if(EXISTS "${KYTY_FFMPEG_SUMS_FILE}")
+				file(STRINGS "${KYTY_FFMPEG_SUMS_FILE}" KYTY_FFMPEG_SUM_LINE REGEX "${KYTY_FFMPEG_NAME}$")
+				string(REGEX MATCH "^[0-9a-fA-F]+" KYTY_FFMPEG_EXPECTED "${KYTY_FFMPEG_SUM_LINE}")
+				if(KYTY_FFMPEG_EXPECTED)
+					file(SHA256 "${KYTY_FFMPEG_ZIP}" KYTY_FFMPEG_ACTUAL)
+					if(NOT KYTY_FFMPEG_ACTUAL STREQUAL KYTY_FFMPEG_EXPECTED)
+						file(REMOVE "${KYTY_FFMPEG_ZIP}")
+						set(KYTY_FFMPEG_USED_SHA "")
+						message(WARNING "FFmpeg archive hash mismatch, removed it; ffmpeg-core will retry the download")
+					endif()
+				endif()
+			endif()
+		endif()
+		if(NOT KYTY_FFMPEG_USED_SHA AND NOT EXISTS "${KYTY_FFMPEG_ZIP}")
+			message(WARNING "FFmpeg pre-fetch failed; falling back to the ffmpeg-core submodule download")
+		endif()
+	endif()
 	add_subdirectory(ffmpeg-core)
 	add_library(FFmpeg::ffmpeg ALIAS ffmpeg)
 endif()
