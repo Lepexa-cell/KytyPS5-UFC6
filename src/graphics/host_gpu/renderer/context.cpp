@@ -51,8 +51,32 @@ bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t cou
                                             const vk::DeviceSize* offsets,
                                             const vk::DeviceSize* sizes) {
 	auto& cached = m_cached_vertex_binding;
-	if (cached.valid && cached.first_binding == first_binding && cached.count == count &&
-	    count <= CachedVertexBinding::MaxBindings) {
+	// Almost every UFC draw binds 1..4 slots. Compare only those, then fall through
+	// to the generic loop for the rare wider vertex setup (still capped at 32).
+	if (count <= 4 && cached.valid && cached.first_binding == first_binding &&
+	    cached.count == count) {
+		bool same = true;
+		if (count >= 1 && (cached.buffers[0] != buffers[0] || cached.offsets[0] != offsets[0] ||
+		                   cached.sizes[0] != sizes[0])) {
+			same = false;
+		} else if (count >= 2 &&
+		           (cached.buffers[1] != buffers[1] || cached.offsets[1] != offsets[1] ||
+		            cached.sizes[1] != sizes[1])) {
+			same = false;
+		} else if (count >= 3 &&
+		           (cached.buffers[2] != buffers[2] || cached.offsets[2] != offsets[2] ||
+		            cached.sizes[2] != sizes[2])) {
+			same = false;
+		} else if (count >= 4 &&
+		           (cached.buffers[3] != buffers[3] || cached.offsets[3] != offsets[3] ||
+		            cached.sizes[3] != sizes[3])) {
+			same = false;
+		}
+		if (same) {
+			return false;
+		}
+	} else if (cached.valid && cached.first_binding == first_binding && cached.count == count &&
+	           count <= CachedVertexBinding::MaxBindings) {
 		bool same = true;
 		for (uint32_t i = 0; i < count; i++) {
 			if (cached.buffers[i] != buffers[i] || cached.offsets[i] != offsets[i] ||

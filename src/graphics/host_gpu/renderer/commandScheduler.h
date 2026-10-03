@@ -46,10 +46,12 @@ public:
 	// (non-blocking: Submit() + BeginNext(), same as CompleteReleaseMemWrite) every
 	// KYTY_DRAW_FLUSH_INTERVAL draws to keep the queue fed instead. Submitting while the GPU is
 	// still executing earlier work is always legal (vkQueueSubmit never waits on prior submissions
-	// completing), so this never blocks the CPU. Defaults to 16, validated against real gameplay --
+	// completing), so this never blocks the CPU. Defaults to 2048 so a ~16k-draw UFC frame
+	// overlaps CPU recording with GPU execution without a submit per few dozen draws --
 	// override via KYTY_DRAW_FLUSH_INTERVAL (0 disables) if a different workload needs retuning:
 	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
-	// exists to remove.
+	// exists to remove. An open dynamic rendering scope is closed by End() before the chunk is
+	// queued and reopened by the next draw; a pending compute barrier is flushed into the chunk.
 	void           CompleteDraw();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});

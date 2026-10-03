@@ -997,6 +997,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 
+		// Hot PM4 opcodes (UFC 5 records tens of thousands of these per frame). A direct
+		// call avoids the function-pointer load/indirect branch of the 256-entry table.
+		// The table still owns every other opcode, and the predicated-skip path above
+		// already consumed packets that must not run.
+		switch (opcode) {
+			case Pm4::IT_SET_CONTEXT_REG: handler = CpOpSetContextReg; break;
+			case Pm4::IT_SET_SH_REG: handler = CpOpSetShaderReg; break;
+			case Pm4::IT_SET_UCONFIG_REG: handler = CpOpSetUconfigReg; break;
+			case Pm4::IT_DRAW_INDEX_AUTO: handler = CpOpDrawIndexAuto; break;
+			case Pm4::IT_DRAW_INDEX_2: handler = CpOpDrawIndex; break;
+			default: break;
+		}
+
 		if (handler == nullptr) {
 			const auto offset = total_dw - remaining_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32

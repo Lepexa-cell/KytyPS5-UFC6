@@ -54,14 +54,16 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 // KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
-// Frostbite UFC 5/6: increased from 16 to 32 draws per submission to reduce vkQueueSubmit overhead.
-// With 16000 draws per frame, 16 meant 1000 submissions; 32 brings it to ~500, cutting CPU time in half
-// while keeping GPU fed. Validated against UFC title screen rendering.
+// Mid-frame progressive submit: UFC 5 records ~16k draws into one buffer (~50 ms of CPU)
+// while the GPU sits idle. Closing and queueing a chunk every 2048 draws (Submit + BeginNext,
+// no Wait) lets the RTX 4070 execute the first chunk while the CPU records the next. 32 was
+// ~500 submits/frame and drowned the overlap in vkQueueSubmit overhead. 0 disables.
+// End() closes any open dynamic rendering scope before the chunk is queued.
 uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
-			return 32u;  // Increased from 16 for Frostbite workloads
+			return 2048u;
 		}
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();
@@ -245,6 +247,10 @@ void CommandScheduler::CompleteDraw() {
 		return;
 	}
 	CheckActive();
+	// Draws leave vkCmdBeginRendering open across calls. End() (via Flush -> Submit) closes
+	// that scope before the buffer is queued, and the next draw reopens it on the new buffer.
+	// A coalesced compute barrier is recorded by Flush() itself, so it stays in this chunk.
+	// Non-blocking: the closed buffer goes to the async submit worker; the CPU does not wait.
 	Flush();
 }
 
