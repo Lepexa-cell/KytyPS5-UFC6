@@ -2407,6 +2407,17 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 			}
 		}
 		if (handled) {
+			// Fast path for the hottest packet (0x28 SET_CONTEXT_REG): a burst
+			// fully inside the contiguous SPI_PS_INPUT_CNTL_0..31 range is a
+			// single block copy instead of N indirect dispatches.
+			constexpr uint32_t kPsInputFirst = Pm4::SPI_PS_INPUT_CNTL_0;
+			constexpr uint32_t kPsInputLast  = Pm4::SPI_PS_INPUT_CNTL_31;
+			if (num_values != 0 && cmd_offset >= kPsInputFirst &&
+			    cmd_offset + num_values - 1u <= kPsInputLast) {
+				cp.GetCtx().SetPsInputSettingsRange(cmd_offset - kPsInputFirst, buffer + 1,
+				                                     num_values);
+				return num_values + 1u;
+			}
 			for (uint32_t i = 0; i < num_values; i++) {
 				g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)](cp, cmd_offset + i,
 				                                                             buffer[1 + i]);

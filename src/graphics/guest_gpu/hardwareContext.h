@@ -5,6 +5,9 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <cstddef>
+#include <cstring>
+
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -883,6 +886,14 @@ public:
 		m_sh_regs.ps_interpolator_settings[id] = value;
 		// m_sh_regs.ps_input_num                 = ((id + 1) > m_sh_regs.ps_input_num ? (id + 1) :
 		// m_sh_regs.ps_input_num);
+	}
+
+	// Bulk memcpy path for SET_CONTEXT_REG bursts over SPI_PS_INPUT_CNTL_*.
+	// The 32 interpolator dwords are contiguous, so a multi-register packet
+	// copies once instead of paying per-register dispatch overhead.
+	void SetPsInputSettingsRange(uint32_t first, const uint32_t* values, uint32_t count) {
+		std::memcpy(&m_sh_regs.ps_interpolator_settings[first], values,
+		            static_cast<size_t>(count) * sizeof(uint32_t));
 	}
 
 	void SetShaderZFormat(uint32_t value) { m_sh_regs.shader_z_format = value; }

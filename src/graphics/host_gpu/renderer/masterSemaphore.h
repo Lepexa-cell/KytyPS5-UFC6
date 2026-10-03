@@ -20,7 +20,10 @@ public:
 		return m_current_tick.load(std::memory_order_acquire);
 	}
 	[[nodiscard]] uint64_t KnownGpuTick() const noexcept {
-		return m_gpu_tick.load(std::memory_order_acquire);
+		// Hot poll at ~16k calls/frame: relaxed load avoids acquire-barrier
+		// bus traffic on the fast path. Staleness is harmless — Refresh()
+		// (acquire/CAS) rechecks before any real wait decision.
+		return m_gpu_tick.load(std::memory_order_relaxed);
 	}
 	[[nodiscard]] bool     IsFree(uint64_t tick) const noexcept { return KnownGpuTick() >= tick; }
 	// Non-blocking poll: refresh the cached timeline value once and report

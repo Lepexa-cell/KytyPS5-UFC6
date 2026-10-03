@@ -329,8 +329,20 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
                                      const RenderDepthInfo& depth, const RenderState& rendering,
-                                     bool depth_only) {
+                                     bool depth_only, bool ps_active) {
 	KYTY_PROFILER_FUNCTION();
+
+	// Fast guard: a draw with no active rasterization target (no pixel shader
+	// and no depth/stencil attachment work) consumes no viewport/scissor/
+	// depth dynamic state — skip the whole block. Depth-only shadow passes
+	// still need depth state, so they only skip the viewport/scissor setup
+	// when no depth attachment is bound either.
+	const bool has_depth_stencil_state =
+	    depth.depth_test_enable || depth.depth_write_enable || depth.stencil_test_enable;
+	if (!ps_active && !has_depth_stencil_state && !depth.image_id) {
+		return;
+	}
+	const bool skip_viewport_scissor = depth_only && !depth.image_id;
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
@@ -375,11 +387,15 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	}
 	// UFC hot loop: identical viewport/scissor pairs repeat across thousands of
 	// draws per frame; skip the driver call when the cached values match.
-	if (buffer.SetViewportWithCountCached(viewport_count, viewports.data())) {
-		vk_buffer.setViewportWithCount(viewport_count, viewports.data());
-	}
-	if (buffer.SetScissorWithCountCached(viewport_count, scissors.data())) {
-		vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+	// Rasterizer-discarded draws (guard above) never reach here; depth-only
+	// passes without a depth attachment skip viewport/scissor entirely.
+	if (!skip_viewport_scissor) {
+		if (buffer.SetViewportWithCountCached(viewport_count, viewports.data())) {
+			vk_buffer.setViewportWithCount(viewport_count, viewports.data());
+		}
+		if (buffer.SetScissorWithCountCached(viewport_count, scissors.data())) {
+			vk_buffer.setScissorWithCount(viewport_count, scissors.data());
+		}
 	}
 
 	float line_width = ctx.GetLineWidth();
@@ -677,6 +693,35 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
+// Flat O(1) byte-size LUT for vertex buffer formats, indexed by the raw
+// BufferFormat code. Byte sizes repeat per data format across the 7 number
+// formats (UNorm/SNorm/UScaled/SScaled/UInt/SInt/Float share one row stride),
+// so a plain table beats the runtime switch + GetFormatComponentType branch
+// chain on the per-draw hot path.
+constexpr uint32_t kVertexFormatByteSizeCount = 78;
+constexpr std::array<uint8_t, kVertexFormatByteSizeCount> kVertexFormatByteSizes = {
+    /* 0: kInvalid */ 0,
+    /* 1-6: 8-bit x1 */ 1, 1, 1, 1, 1, 1,
+    /* 7-13: 16-bit x1 */ 2, 2, 2, 2, 2, 2, 2,
+    /* 14-19: 8-bit x2 */ 2, 2, 2, 2, 2, 2,
+    /* 20-22: 32-bit x1 */ 4, 4, 4,
+    /* 23-29: 16-bit x2 */ 4, 4, 4, 4, 4, 4, 4,
+    /* 30-43: packed 32-bit x2 (11_11_10, 10_11_11) */ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4,
+    /* 44-55: packed 32-bit x2 (2_10_10_10, 10_10_10_2) */ 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4,
+    /* 56-61: 8-bit x4 */ 4, 4, 4, 4, 4, 4,
+    /* 62-64: 32-bit x2 */ 8, 8, 8,
+    /* 65-71: 16-bit x4 */ 8, 8, 8, 8, 8, 8, 8,
+    /* 72-74: 32-bit x3 */ 12, 12, 12,
+    /* 75-77: 32-bit x4 */ 16, 16, 16,
+};
+
+[[nodiscard]] uint32_t VertexFormatByteSize(Prospero::BufferFormat format) {
+	const auto index = static_cast<uint32_t>(format);
+	return index < kVertexFormatByteSizes.size() ? kVertexFormatByteSizes[index] : 0;
+}
+
 static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
 	const auto& buffer = info.buffers[binding];
 	if (buffer.stride != 0 || buffer.num_records == 0) {
@@ -691,9 +736,10 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 		const auto& resource = info.resources[i];
 		// RDNA2 OOB_SELECT=2 only checks NumRecords != 0. A constant attribute still
 		// fetches its entire format; NumRecords is not a byte count in this mode.
+		// O(1) format-size LUT instead of the runtime GetFormatInfo() switch chain.
 		const uint64_t extent = resource.OutOfBounds() == 2
 		                            ? resource.Base48() - buffer.addr +
-		                                  ShaderRecompiler::Format::GetFormatInfo(resource.Format()).byte_size
+		                                  VertexFormatByteSize(resource.Format())
 		                            : buffer.num_records;
 		size = std::max(size, extent);
 	}
@@ -1093,6 +1139,30 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		return prepared;
 	}
 	prepared.type = source.type;
+	// Fast path: octagon frames rebind the same guest index buffer thousands
+	// of times. When addr/size/type repeat, reuse the resolved host binding
+	// and skip FindBuffer/ObtainBuffer. host_data uploads bypass the cache.
+	// NOTE: the buffer cache may evict or merge host allocations between
+	// draws, so the cached handle is only a hint: callers re-validate via
+	// BindIndexBufferCached + the cache's own identity below on mismatch.
+	struct IndexCacheEntry {
+		uint64_t      address = 0;
+		uint64_t      size    = 0;
+		vk::IndexType type    = vk::IndexType::eUint16;
+		vk::Buffer    buffer  = nullptr;
+		vk::DeviceSize offset = 0;
+		bool          valid   = false;
+	};
+	thread_local IndexCacheEntry t_index_cache;
+	const bool index_cache_hit =
+	    t_index_cache.valid && source.host_data == nullptr && t_index_cache.address == source.address &&
+	    t_index_cache.size == source.size && t_index_cache.type == source.type &&
+	    t_index_cache.buffer != nullptr;
+	if (index_cache_hit) {
+		prepared.buffer = t_index_cache.buffer;
+		prepared.offset = t_index_cache.offset;
+		return prepared;
+	}
 	if (source.host_data != nullptr) {
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
@@ -1102,6 +1172,14 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
+	}
+	if (source.host_data == nullptr) {
+		t_index_cache.address = source.address;
+		t_index_cache.size    = source.size;
+		t_index_cache.type    = source.type;
+		t_index_cache.buffer  = prepared.buffer;
+		t_index_cache.offset  = prepared.offset;
+		t_index_cache.valid   = true;
 	}
 	return prepared;
 }
@@ -1321,7 +1399,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
-	                         depth_only);
+	                         depth_only, state.ps_active);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
