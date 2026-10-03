@@ -112,6 +112,8 @@ public:
 	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
+	// Bumped once per presented frame (GPU thread) so per-frame read-sync stamps expire.
+	void NextFrame() noexcept { ++m_frame_counter; }
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
@@ -187,7 +189,6 @@ private:
 	// read-only binds of the same buffer within a frame skip the tracker walk.
 	// GPU thread only.
 	uint64_t m_frame_counter = 1;
-	void     NextFrame() noexcept { ++m_frame_counter; }
 	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
 	// stretch without presents still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
