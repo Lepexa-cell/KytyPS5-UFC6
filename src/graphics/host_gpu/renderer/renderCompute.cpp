@@ -446,7 +446,6 @@ void RenderExecutor::FlushPendingComputeBarrier() {
 		auto& current = scheduler.Current();
 		ShaderAccessBarrier(current.Handle(),
 		                    vk::PipelineStageFlagBits::eComputeShader);
-		current.MarkBarrierEmitted();
 	}
 	m_pending_compute_writes.clear();
 }
