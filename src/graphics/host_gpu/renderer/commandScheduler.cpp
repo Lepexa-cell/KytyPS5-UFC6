@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -202,6 +203,7 @@ void CommandScheduler::BeginRendering(const RenderState& state) {
 
 void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
+		Context().GetRenderExecutor().FlushPendingComputeBarrier();
 		Current().EndRendering();
 	}
 }
@@ -247,12 +249,14 @@ void CommandScheduler::CompleteDraw() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	Context().GetRenderExecutor().FlushPendingComputeBarrier();
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
 	KYTY_PROFILER_FUNCTION();
+	Context().GetRenderExecutor().FlushPendingComputeBarrier();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
@@ -261,6 +265,7 @@ void CommandScheduler::FlushAndWait() {
 void CommandScheduler::Finish() {
 	KYTY_PROFILER_FUNCTION();
 	CheckActive();
+	Context().GetRenderExecutor().FlushPendingComputeBarrier();
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
@@ -504,6 +509,19 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		std::lock_guard lock(m_submit_mutex);
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
+		if (m_submit_head >= m_submit_jobs.size()) {
+			// Fully drained: restart at 0 and reuse capacity (no free).
+			m_submit_jobs.clear();
+			m_submit_head = 0;
+		} else if (m_submit_head > 256 && m_submit_head * 2 >= m_submit_jobs.size()) {
+			// Periodically compact the consumed prefix so the vector does
+			// not grow unboundedly when the producer outruns the consumer.
+			m_submit_jobs.erase(
+			    m_submit_jobs.begin(),
+			    m_submit_jobs.begin() +
+			        static_cast<std::vector<SubmitJob>::difference_type>(m_submit_head));
+			m_submit_head = 0;
+		}
 		m_submit_jobs.push_back(job);
 	}
 	m_submit_available.notify_one();
@@ -575,11 +593,17 @@ void CommandScheduler::SubmitThread(std::stop_token stop) {
 			// Shutdown() waits every tick before requesting the stop, so the queue must be empty
 			// by then -- every barrier, upload and EOP write already recorded still reaches the
 			// driver in tick order. The condition-variable notify in StopSubmitThread wakes us.
-			if (!m_submit_available.wait(lock, stop, [this] { return !m_submit_jobs.empty(); })) {
+			if (!m_submit_available.wait(lock, stop, [this] {
+				    return m_submit_head < m_submit_jobs.size();
+			    })) {
 				return;
 			}
-			job = m_submit_jobs.front();
-			m_submit_jobs.pop_front();
+			job = m_submit_jobs[m_submit_head++];
+			if (m_submit_head >= m_submit_jobs.size()) {
+				// Fully drained: restart at 0 and reuse capacity (no free).
+				m_submit_jobs.clear();
+				m_submit_head = 0;
+			}
 		}
 		// Heavy driver call happens here, off the translator thread: queue-locked
 		// vkQueueSubmit + timeline signal + present-side semaphore handoff.
@@ -596,7 +620,7 @@ void CommandScheduler::StopSubmitThread() {
 		m_submit_thread.join();
 	}
 	std::lock_guard lock(m_submit_mutex);
-	EXIT_IF(!m_submit_jobs.empty());
+	EXIT_IF(m_submit_head < m_submit_jobs.size());
 }
 
 void CommandScheduler::BeginNext() {

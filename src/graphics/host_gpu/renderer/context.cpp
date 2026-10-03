@@ -105,6 +105,12 @@ namespace {
 bool CommandBuffer::SetViewportWithCountCached(uint32_t count,
                                                const vk::Viewport* viewports) const {
 	auto& cached = m_cached_viewport;
+	// O(1) fast path: octagon frames repeat the same single viewport/scissor,
+	// so compare index 0 first before the generic loop below.
+	if (cached.valid && cached.count == 1 && count == 1 &&
+	    ViewportsEqual(cached.viewports[0], viewports[0])) {
+		return false;
+	}
 	if (cached.valid && cached.count == count && count <= MaxCachedViewports) {
 		bool same = true;
 		for (uint32_t i = 0; i < count; i++) {
@@ -128,6 +134,11 @@ bool CommandBuffer::SetViewportWithCountCached(uint32_t count,
 bool CommandBuffer::SetScissorWithCountCached(uint32_t count,
                                               const vk::Rect2D* scissors) const {
 	auto& cached = m_cached_scissor;
+	// O(1) fast path: same single scissor repeats across draws.
+	if (cached.valid && cached.count == 1 && count == 1 &&
+	    ScissorsEqual(cached.scissors[0], scissors[0])) {
+		return false;
+	}
 	if (cached.valid && cached.count == count && count <= MaxCachedViewports) {
 		bool same = true;
 		for (uint32_t i = 0; i < count; i++) {

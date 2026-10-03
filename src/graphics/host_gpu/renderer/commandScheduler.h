@@ -7,7 +7,6 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 
 #include <queue>
@@ -159,7 +158,11 @@ private:
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
 	bool                         m_async_submit         = false;
-	std::deque<SubmitJob>        m_submit_jobs;
+	// Submit queue with recycled storage: m_submit_jobs is a vector used as a
+	// FIFO via m_submit_head; when fully drained it is cleared (not freed),
+	// so per-frame vkQueueSubmit traffic after warmup performs no allocations.
+	std::vector<SubmitJob>       m_submit_jobs;
+	size_t                       m_submit_head = 0;
 	std::mutex                   m_submit_mutex;
 	std::condition_variable_any  m_submit_available;
 	std::jthread                 m_submit_thread;

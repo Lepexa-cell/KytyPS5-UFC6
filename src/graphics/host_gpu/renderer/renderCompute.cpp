@@ -110,6 +110,10 @@ DispatchRecoveryPolicy& RecoveryPolicy() {
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
+[[nodiscard]] bool ComputeBufferRangesOverlap(uint64_t begin_a, uint64_t end_a, uint64_t begin_b,
+                                              uint64_t end_b) {
+	return begin_a < end_b && begin_b < end_a;
+}
 class DispatchBufferRecovery {
 public:
 	DispatchBufferRecovery(RenderContext& context, const PreparedBindings& bindings,
@@ -392,6 +396,67 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+void RenderExecutor::ComputeBarrierWrote(std::span<const PreparedBindings::BufferSource> buffers) {
+	for (const auto& source: buffers) {
+		if (source.size == 0 || source.address == 0) {
+			continue;
+		}
+		m_pending_compute_writes.push_back(
+		    {source.address, source.address + source.size});
+	}
+}
+
+void RenderExecutor::ComputeBarrierRead(std::span<const PreparedBindings::BufferSource> buffers,
+                                        std::span<const TextureBinding> images) {
+	// A read-after-write on overlapping guest memory needs the pending writes
+	// to be visible first. Non-overlapping dispatches (independent resources)
+	// keep the single coalesced barrier pending instead of paying one per
+	// dispatch. Image bindings are guest-memory backed too; conservatively
+	// flush when any image is bound.
+	(void)images;
+	if (m_pending_compute_writes.empty()) {
+		return;
+	}
+	for (const auto& source: buffers) {
+		if (source.size == 0 || source.address == 0) {
+			continue;
+		}
+		const uint64_t begin = source.address;
+		const uint64_t end   = source.address + source.size;
+		for (const auto& pending: m_pending_compute_writes) {
+			if (ComputeBufferRangesOverlap(begin, end, pending.begin, pending.end)) {
+				FlushPendingComputeBarrier();
+				return;
+			}
+		}
+	}
+	if (!images.empty()) {
+		FlushPendingComputeBarrier();
+	}
+}
+
+void RenderExecutor::FlushPendingComputeBarrier() {
+	if (m_pending_compute_writes.empty()) {
+		return;
+	}
+	// The callers hold the render mutex and record on the current buffer, so
+	// this is the single pending compute-write barrier for the open buffer.
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (scheduler.Active()) {
+		auto& current = scheduler.Current();
+		ShaderAccessBarrier(current.Handle(),
+		                    vk::PipelineStageFlagBits::eComputeShader);
+		current.MarkBarrierEmitted();
+	}
+	m_pending_compute_writes.clear();
+}
+
+void RenderExecutor::InvalidatePendingComputeBarrier() {
+	// A global barrier (RELEASE_MEM) or a submit boundary already orders all
+	// prior writes, so the coalesced compute barrier is redundant.
+	m_pending_compute_writes.clear();
+}
+
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
@@ -615,6 +680,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 		                }) ||
 		    has_storage_writes;
+		// Coalesce barriers between consecutive dispatches: a dispatch that
+		// reads only memory no pending writer touched skips its pre-barrier
+		// (the pending post-barrier of the earlier writer still covers any
+		// real RAW edge once flushed). Overlap flushes below.
+		ComputeBarrierRead(bindings.buffer_sources, bindings.images);
 		if (has_storage_writes) {
 			// A host fence used to serialize every dispatch. Preserve its read-before-write
 			// ordering while allowing the queue to execute asynchronously.
@@ -632,7 +702,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		// Coalesced: consecutive non-overlapping dispatches share one barrier.
+		// A writer records its ranges; a later overlapping reader (or any draw/
+		// flush below) emits the single pending barrier.
+		if (has_storage_writes) {
+			ComputeBarrierWrote(bindings.buffer_sources);
+		}
+		if (m_pending_compute_writes.size() > 512) {
+			FlushPendingComputeBarrier();
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }
@@ -706,6 +784,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
 		const auto vk_buffer = buffer.Handle();
+		ComputeBarrierRead(bindings.buffer_sources, bindings.images);
 		const bool has_storage_writes =
 		    HasShaderBufferWrites(input_info.stage) ||
 		    std::any_of(
@@ -732,7 +811,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
-		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		if (has_storage_writes) {
+			ComputeBarrierWrote(bindings.buffer_sources);
+		}
+		if (m_pending_compute_writes.size() > 512) {
+			FlushPendingComputeBarrier();
+		}
 	} while (recovery.Retry());
 	ResetBindings();
 }

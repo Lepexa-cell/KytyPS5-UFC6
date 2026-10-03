@@ -237,6 +237,15 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// Compute barrier coalescing: consecutive dispatches that do not touch
+	// overlapping guest memory skip the redundant post-dispatch barrier; the
+	// pending access range is flushed before the next overlapping dispatch,
+	// any draw, or submit flush.
+	void ComputeBarrierWrote(std::span<const PreparedBindings::BufferSource> buffers);
+	void ComputeBarrierRead(std::span<const PreparedBindings::BufferSource> buffers,
+	                        std::span<const TextureBinding> images);
+	void FlushPendingComputeBarrier();
+	void InvalidatePendingComputeBarrier();
 
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
@@ -283,6 +292,14 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// Compute barrier coalescing: guest ranges written by dispatches whose
+	// post-barrier is still pending. Cleared when the barrier is emitted or
+	// when an external global barrier (RELEASE_MEM) supersedes it.
+	struct ComputeBarrierRange {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+	};
+	std::vector<ComputeBarrierRange> m_pending_compute_writes;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
 

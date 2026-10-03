@@ -1634,6 +1634,10 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 void CommandProcessor::EmitGlobalBarrier() {
 	Common::LockGuard lock(m_renderer.GetMutex());
 
+	// A global RELEASE_MEM barrier orders every prior compute write, so a
+	// still-pending coalesced compute barrier is redundant: drop it instead
+	// of emitting two barriers back-to-back.
+	m_renderer.GetRenderExecutor().InvalidatePendingComputeBarrier();
 	vk::MemoryBarrier2 barrier {};
 	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;

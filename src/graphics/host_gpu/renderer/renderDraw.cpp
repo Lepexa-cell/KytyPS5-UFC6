@@ -328,7 +328,8 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const ShaderVertexInputInfo& vs_input_info,
-                                     const RenderDepthInfo& depth, const RenderState& rendering) {
+                                     const RenderDepthInfo& depth, const RenderState& rendering,
+                                     bool depth_only) {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto& ctx = buffer.GetRegisters();
@@ -393,9 +394,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		line_width = 1.0f;
 	}
 	vk_buffer.setLineWidth(line_width);
-	const auto&      blend = ctx.GetBlendColor();
-	const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-	vk_buffer.setBlendConstants(blend_constants.data());
+	if (!depth_only) {
+		// Depth-only shadow passes write no color: blend constants are
+		// unused by the pipeline (and blending is statically disabled),
+		// so skip the driver call on the 4 shadow cascades.
+		const auto&      blend = ctx.GetBlendColor();
+		const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
+		vk_buffer.setBlendConstants(blend_constants.data());
+	}
 	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
 	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
@@ -701,7 +707,46 @@ struct VertexBufferRange {
 	std::pair<Buffer*, uint64_t> binding;
 
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
+
+	[[nodiscard]] bool operator<(const VertexBufferRange& other) const {
+		return base_address < other.base_address;
+	}
 };
+
+static void SortVertexBufferRanges(VertexBufferRange* ranges, uint32_t count) {
+	// Hot path: AcquireVertexBuffers runs per draw (~16k/frame) with only 1-4
+	// ranges, so a generic std::sort with iterators/lambda is pure overhead.
+	// Inline compare+swap network: 1 compare for 2, 3 for 3, 5 for 4 entries.
+	auto swap_if = [&](uint32_t a, uint32_t b) {
+		if (ranges[b] < ranges[a]) {
+			const auto tmp = ranges[a];
+			ranges[a]       = ranges[b];
+			ranges[b]       = tmp;
+		}
+	};
+	switch (count) {
+		case 0:
+		case 1: return;
+		case 2: swap_if(0, 1); return;
+		case 3:
+			swap_if(0, 1);
+			swap_if(1, 2);
+			swap_if(0, 1);
+			return;
+		case 4:
+			swap_if(0, 1);
+			swap_if(2, 3);
+			swap_if(0, 2);
+			swap_if(1, 3);
+			swap_if(1, 2);
+			return;
+		default: break;
+	}
+	std::sort(ranges, ranges + count,
+	          [](const VertexBufferRange& left, const VertexBufferRange& right) {
+		          return left < right;
+	          });
+}
 
 struct PreparedVertexBuffers {
 	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
@@ -735,10 +780,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		ranges[range_count++] = {vertex.addr, vertex.addr + size};
 	}
 
-	std::sort(ranges.begin(), ranges.begin() + range_count,
-	          [](const VertexBufferRange& left, const VertexBufferRange& right) {
-		          return left.base_address < right.base_address;
-	          });
+	SortVertexBufferRanges(ranges.data(), range_count);
 
 	// Merge overlapping or touching ranges before acquiring host buffers.
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
@@ -1151,6 +1193,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
 	                                     bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
+	// A draw observes every prior compute write, so the single coalesced
+	// compute barrier (if any) is emitted once here instead of once per
+	// dispatch. Non-compute work between dispatches funnels through this path.
+	FlushPendingComputeBarrier();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
@@ -1197,6 +1243,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
+	// Depth-only shadow cascade fast path: no color targets and no active pixel
+	// shader. Only vertex position + depth state are consumed, so skip the
+	// pixel-stage material/texture descriptor binding and the color-blend
+	// setup below (static pipeline state already disables blending).
+	const bool depth_only = state.color_count == 0 && !state.ps_active;
 	if (state.ps_active) {
 		if (!bindings.pixel) bindings.pixel.emplace();
 		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
@@ -1269,7 +1320,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(buffer, vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
+	                         depth_only);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
