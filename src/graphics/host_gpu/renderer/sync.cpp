@@ -46,8 +46,30 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 uint64_t ReadReferenceClock() {
 	const auto host_frequency = LibKernel::KernelGetTscFrequency();
 	const auto host_ticks     = LibKernel::KernelReadTsc();
+	// Anchor the guest-visible clock to the first observed host tick so the first
+	// timestamp the game ever sees starts near zero. An absolute host-tick base
+	// (time since host boot) would make the first delta look like hours and trip
+	// Frostbite DRS into its emergency throttle. Elapsed ticks are scaled to the
+	// 100 MHz PS5 graphics reference clock below; both RELEASE_MEM (data_sel == 3,
+	// IT_RELEASE_MEM opcode 0x49) and COPY_DATA reference-clock reads
+	// (IT_COPY_DATA opcode 0x40, src_sel 9/18) share this generator, and the
+	// atomic CAS loop at the end keeps it strictly monotonic.
+	static std::atomic<uint64_t> base_ticks {0};
+	static std::atomic<bool>     base_set {false};
+	uint64_t base = base_ticks.load(std::memory_order_relaxed);
+	if (!base_set.load(std::memory_order_acquire)) {
+		uint64_t expected = 0;
+		if (base_ticks.compare_exchange_strong(expected, host_ticks, std::memory_order_acq_rel,
+		                                         std::memory_order_relaxed)) {
+			base = host_ticks;
+			base_set.store(true, std::memory_order_release);
+		} else {
+			base = expected;
+		}
+	}
+	const uint64_t elapsed_ticks = host_ticks >= base ? host_ticks - base : 0;
 	uint64_t   value          = 0;
-	if (!ScaleReferenceClock(host_ticks, host_frequency, value)) {
+	if (!ScaleReferenceClock(elapsed_ticks, host_frequency, value)) {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}

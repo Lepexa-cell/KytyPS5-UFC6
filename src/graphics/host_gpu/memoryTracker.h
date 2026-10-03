@@ -27,6 +27,16 @@ inline const bool g_tracker_skip_clean =
 inline const bool g_tracker_bitmap =
     std::getenv("KYTY_TRACKER_BITMAP") == nullptr || std::getenv("KYTY_TRACKER_BITMAP")[0] == '1';
 
+class MemoryTracker;
+
+struct TrackerRegionMru {
+	const MemoryTracker* owner    = nullptr;
+	uint64_t             instance = 0;
+	uint64_t             base     = ~uint64_t(0);
+	RegionManager*       manager  = nullptr;
+};
+inline thread_local TrackerRegionMru s_region_mru;
+
 class MemoryTracker final {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
@@ -155,6 +165,16 @@ private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
 
+	// MRU cache for Iterate(): the last single-region lookup on this thread (see
+	// TrackerRegionMru at namespace scope). Regions are never destroyed and their
+	// base address is immutable, so an (owner, base) match keeps the cached
+	// manager valid without an atomic index load. The per-tracker instance id
+	// (never reused) guards against owner-pointer ABA after a tracker is
+	// destroyed. A hit skips only the lookup; the per-range callback (and any
+	// upload it drives) runs exactly as on a miss, so CPU->GPU synchronization
+	// stays fully honest.
+	inline static std::atomic<uint64_t> s_mru_instances {1};
+
 	void CheckNotInUploadCallback() const noexcept {
 		if (s_upload_owner == this) {
 			EXIT("memory tracker re-entered from upload callback\n");
@@ -169,6 +189,35 @@ private:
 		uint64_t       remaining    = size;
 		uint64_t       index        = vaddr / TRACKER_REGION_SIZE;
 		uint64_t       offset       = vaddr % TRACKER_REGION_SIZE;
+		// MRU fast path: consecutive draws of one fighter usually stay inside a single
+		// 4 MiB region. A hit skips only the atomic index load; the callback below runs
+		// exactly as on a miss, so uploads are never skipped.
+		if (!create && size != 0 && size <= TRACKER_REGION_SIZE - offset) {
+			auto& mru = s_region_mru;
+			if (mru.owner == this && mru.instance == m_mru_instance && mru.manager != nullptr &&
+			    mru.base == index * TRACKER_REGION_SIZE) {
+				if constexpr (returns_bool) {
+					return func(mru.manager, offset, size);
+				} else {
+					func(mru.manager, offset, size);
+					return false;
+				}
+			}
+			if (auto* fresh = m_regions[index].load(std::memory_order_acquire);
+			    fresh != nullptr) {
+				mru.owner    = this;
+				mru.instance = m_mru_instance;
+				mru.base     = index * TRACKER_REGION_SIZE;
+				mru.manager  = fresh;
+				if constexpr (returns_bool) {
+					return func(fresh, offset, size);
+				} else {
+					func(fresh, offset, size);
+					return false;
+				}
+			}
+			return false;
+		}
 		while (remaining != 0) {
 			const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
 			auto*      manager = m_regions[index].load(std::memory_order_acquire);
@@ -201,6 +250,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	const uint64_t                                 m_mru_instance;
 };
 
 } // namespace Libs::Graphics

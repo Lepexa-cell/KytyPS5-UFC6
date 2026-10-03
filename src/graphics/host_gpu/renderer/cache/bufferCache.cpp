@@ -438,14 +438,39 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
+	// L1 MRU: consecutive draws usually rediscover the same buffer. A hit skips only
+	// the page-table lookup; the cached id is revalidated (slot generation + bounds),
+	// and the caller's SynchronizeBuffer/upload still runs, so sync stays fully honest.
+	struct BufferMru {
+		const BufferCache* owner = nullptr;
+		BufferId           id {};
+		uint64_t           begin = 0;
+		uint64_t           end   = 0;
+	};
+	static thread_local BufferMru mru;
+	if (mru.owner == this && mru.id && size <= mru.end - mru.begin && vaddr >= mru.begin &&
+	    vaddr <= mru.end - size && !IsBufferInvalid(mru.id) &&
+	    m_slot_buffers[mru.id].IsInBounds(vaddr, size)) {
+		return mru.id;
+	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
+			mru.owner = this;
+			mru.id    = *owner;
+			mru.begin = buffer.CpuAddress();
+			mru.end   = mru.begin + buffer.Size();
 			return *owner;
 		}
 	}
-	return CreateBuffer(vaddr, size);
+	const auto id     = CreateBuffer(vaddr, size);
+	auto&      buffer = m_slot_buffers[id];
+	mru.owner         = this;
+	mru.id            = id;
+	mru.begin         = buffer.CpuAddress();
+	mru.end           = mru.begin + buffer.Size();
+	return id;
 }
 
 BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {

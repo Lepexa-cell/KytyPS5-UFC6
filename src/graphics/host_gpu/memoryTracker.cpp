@@ -7,7 +7,9 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
+MemoryTracker::MemoryTracker(PageManager& page_manager)
+    : m_page_manager(page_manager),
+      m_mru_instance(s_mru_instances.fetch_add(1, std::memory_order_relaxed)) {
 	m_regions           = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 	m_present_regions   = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
 	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
