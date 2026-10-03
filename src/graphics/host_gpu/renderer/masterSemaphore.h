@@ -23,6 +23,18 @@ public:
 		return m_gpu_tick.load(std::memory_order_acquire);
 	}
 	[[nodiscard]] bool     IsFree(uint64_t tick) const noexcept { return KnownGpuTick() >= tick; }
+	// Non-blocking poll: refresh the cached timeline value once and report
+	// completion without ever entering vkWaitSemaphores. Lets frame pacing
+	// keep up to 2 frames in flight instead of spin/sleep-blocking the
+	// guest command thread on the previous GPU frame.
+	void Poll() { Refresh(); }
+	[[nodiscard]] bool IsReady(uint64_t tick) {
+		if (IsFree(tick)) {
+			return true;
+		}
+		Poll();
+		return IsFree(tick);
+	}
 	[[nodiscard]] uint64_t NextTick() noexcept {
 		return m_current_tick.fetch_add(1, std::memory_order_release);
 	}

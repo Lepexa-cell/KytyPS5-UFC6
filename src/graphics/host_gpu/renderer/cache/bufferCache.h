@@ -138,6 +138,18 @@ private:
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
 	void MarkGpuWritten(uint64_t vaddr, uint64_t size);
+	// Submission-level fast path: CPU epoch at the last per-draw sync. When it has not
+	// moved, no CPU write landed since the previous draw, so read-only Obtain/Synchronize
+	// paths can skip the tracker walk entirely (16k draws/frame * region walk = 51ms).
+	// Written bindings still run the walk: their GPU-dirty marking must be published.
+	[[nodiscard]] bool TrySkipSubmissionCpuSync(bool is_written) noexcept {
+		const uint64_t epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+		if (is_written || epoch != m_submission_cpu_epoch) {
+			m_submission_cpu_epoch = epoch;
+			return false;
+		}
+		return true;
+	}
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -183,6 +195,8 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Last CPU-dirty epoch observed by the per-draw sync fast path above.
+	uint64_t m_submission_cpu_epoch = 0;
 	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
 	// stretch without presents still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;

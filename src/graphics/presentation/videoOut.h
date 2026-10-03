@@ -39,6 +39,9 @@ public:
 	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
+	// Non-blocking variant: true when the target buffer has no pending flip left,
+	// so the guest thread can keep up to 2 frames in flight instead of blocking.
+	[[nodiscard]] bool IsFlipDone(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 

@@ -112,6 +112,9 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint64_t args_addr, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
+	// Non-blocking frame pacing: flush the recorded work, then only wait when more
+	// than 2 frames are still in flight (checked via timeline poll, never a spin/sleep).
+	void WaitFlipDoneNonBlocking(uint32_t video_out_handle, uint32_t display_buffer_index);
 	void TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }

@@ -79,6 +79,10 @@ public:
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// Non-blocking variant: single timeline poll, never enters vkWaitSemaphores.
+	// Used by frame pacing so the guest thread checks progress instead of
+	// spin/sleep-blocking on the previous GPU frame.
+	[[nodiscard]] bool IsReady(uint64_t tick) { return GetMasterSemaphore().IsReady(tick); }
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }

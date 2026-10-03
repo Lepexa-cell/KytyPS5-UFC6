@@ -1382,9 +1382,21 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	BufferFlush();
+	WaitFlipDoneNonBlocking(video_out_handle, display_buffer_index);
+}
 
-	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-	                                      static_cast<int>(display_buffer_index));
+void CommandProcessor::WaitFlipDoneNonBlocking(uint32_t video_out_handle,
+                                               uint32_t display_buffer_index) {
+	// Pacing for Frostbite's 12 FPS guard (60/5 divider while frames take >66ms):
+	// keep up to 2 frames in flight. A single timeline poll + queue-depth check
+	// replaces the blocking condvar/spin wait; only a genuinely full queue blocks.
+	auto& video_out = m_renderer.GetVideoOut();
+	if (video_out.IsFlipDone(static_cast<int>(video_out_handle),
+	                         static_cast<int>(display_buffer_index))) {
+		return;
+	}
+	video_out.WaitFlipDone(static_cast<int>(video_out_handle),
+	                       static_cast<int>(display_buffer_index));
 }
 
 template <typename T>

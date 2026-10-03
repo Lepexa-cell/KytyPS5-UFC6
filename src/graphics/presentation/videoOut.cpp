@@ -213,6 +213,9 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
+	// Non-blocking check backing VideoOutDriver::IsFlipDone: reports completion via a
+	// single mutex-protected queue scan, never waits on a condvar.
+	bool IsDone(VideoOutConfig& cfg, int index);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
@@ -1198,6 +1201,17 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
+bool FlipQueue::IsDone(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	auto              matches = [&cfg, index](const auto& r) {
+		return r.cfg == &cfg && r.index == index;
+	};
+	// Keep up to 2 frames in flight: only the flip still queued for this buffer blocks.
+	const size_t pending = std::count_if(m_requests.begin(), m_requests.end(), matches) +
+	                       std::count_if(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	return pending <= 1;
+}
+
 bool FlipQueue::Flip(uint32_t micros) {
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
@@ -1636,6 +1650,15 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
 	m_impl->GetFlipQueue().Wait(*ctx, index);
+}
+
+bool VideoOutDriver::IsFlipDone(int handle, int index) {
+	auto* ctx = m_impl->Get(handle);
+	EXIT_IF(ctx == nullptr);
+	if (!IsValidBufferIndex(index)) {
+		return true;
+	}
+	return m_impl->GetFlipQueue().IsDone(*ctx, index);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
