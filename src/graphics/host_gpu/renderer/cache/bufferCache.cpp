@@ -633,6 +633,17 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
+	// Per-frame read dedup: static arena/crowd buffers are bound hundreds of times per
+	// frame with no CPU writes between binds. A completed read sync in this frame stays
+	// valid until the presented-frame id advances, so skip the tracker walk — but only
+	// for the exact same [vaddr, size): a subrange of a larger buffer may cover bytes
+	// the first sync never walked. Writes and texel-image syncs always take the full
+	// path; a CPU write in between invalidates the stamp below via IsRegionCpuModified.
+	if (!is_written && !is_texel_buffer && buffer.last_synced_frame == m_frame_counter &&
+	    buffer.last_synced_vaddr == vaddr && buffer.last_synced_size == size &&
+	    !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		return false;
+	}
 	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
 	// times the tracker walk only with KYTY_SYNC_STATS=1.
 	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
@@ -687,6 +698,11 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (is_texel_buffer && !is_written) {
 		KYTY_PROFILER_BLOCK("Sync::TexelImage");
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
+	}
+	if (!is_written && !is_texel_buffer) {
+		buffer.last_synced_frame = m_frame_counter;
+		buffer.last_synced_vaddr = vaddr;
+		buffer.last_synced_size  = size;
 	}
 	return false;
 }

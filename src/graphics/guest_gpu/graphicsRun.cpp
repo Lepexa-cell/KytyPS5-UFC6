@@ -1740,6 +1740,8 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
+	// New presented frame: read-sync stamps from the previous frame expire.
+	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
 
@@ -1759,6 +1761,8 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
+	// New presented frame: read-sync stamps from the previous frame expire.
+	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
 
@@ -1784,6 +1788,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
+	// New presented frame: read-sync stamps from the previous frame expire.
+	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
 

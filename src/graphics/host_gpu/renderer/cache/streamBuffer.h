@@ -73,6 +73,12 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Last presented-frame id whose read sync this buffer completed. Lets repeated
+	// read-only binds of static geometry within one frame skip the tracker walk.
+	// The stamp is range-exact: only an identical [vaddr, size) reread may skip.
+	uint64_t last_synced_frame = 0;
+	uint64_t last_synced_vaddr = 0;
+	uint64_t last_synced_size  = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

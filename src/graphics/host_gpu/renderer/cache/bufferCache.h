@@ -183,6 +183,11 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// Per-frame id for read-sync dedup: bumped once per presented frame so repeated
+	// read-only binds of the same buffer within a frame skip the tracker walk.
+	// GPU thread only.
+	uint64_t m_frame_counter = 1;
+	void     NextFrame() noexcept { ++m_frame_counter; }
 	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
 	// stretch without presents still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;
