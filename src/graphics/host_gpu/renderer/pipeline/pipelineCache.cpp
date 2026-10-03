@@ -67,23 +67,12 @@ namespace {
 // the global epoch. VkCmdBindPipeline stays unconditional at call sites.
 // Note: like the map itself, the cache is used from the single GPU thread; the
 // thread_local slot only avoids sharing the last-used state across threads.
-struct PipelineMruSlot {
-	const PipelineCache* owner = nullptr;
-	PipelineCache::Pipeline* pipeline = nullptr;
-	PipelineCache::GraphicsPipelineKey key {};
-	std::size_t key_hash = 0;
-	bool key_valid = false;
-	uint64_t epoch = 0;
-};
+// PipelineMruSlot is declared inside TryGetGraphicsPipeline (member function)
+// because GraphicsPipelineKey is private to PipelineCache.
 
-uint64_t& PipelineMruEpoch() {
-	static uint64_t epoch = 0;
-	return epoch;
-}
-
-void InvalidatePipelineMru() {
-	++PipelineMruEpoch();
-}
+static std::atomic<uint64_t> s_pipeline_mru_epoch{0};
+inline uint64_t PipelineMruEpoch() { return s_pipeline_mru_epoch.load(std::memory_order_relaxed); }
+inline void InvalidatePipelineMru() { s_pipeline_mru_epoch.fetch_add(1, std::memory_order_relaxed); }
 
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
@@ -1335,7 +1324,16 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	// or locking. Pending pipelines are never cached as ready: fall through so
 	// FinishPending/defer logic below runs exactly as before. The hash is only
 	// computed on the miss path (the map lookup needs it); hits compare the key
-	// directly.
+	// directly. PipelineMruSlot is declared here (inside the member function)
+	// because GraphicsPipelineKey is private to PipelineCache.
+	struct PipelineMruSlot {
+		const PipelineCache* owner = nullptr;
+		PipelineCache::Pipeline* pipeline = nullptr;
+		GraphicsPipelineKey key {};
+		std::size_t key_hash = 0;
+		bool key_valid = false;
+		uint64_t epoch = 0;
+	};
 	static thread_local PipelineMruSlot mru;
 	if (mru.key_valid && mru.owner == this && mru.epoch == PipelineMruEpoch() &&
 	    mru.pipeline != nullptr && mru.key == key && mru.pipeline->pending == nullptr) {

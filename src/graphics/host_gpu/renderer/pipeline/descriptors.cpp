@@ -1593,7 +1593,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	const bool can_use_mru = !pipeline.uses_push_descriptors;
 	uint64_t fingerprint = static_cast<uint64_t>(pipeline_bind_point) + 0x9e3779b97f4a7c15ull;
 	fingerprint = DescriptorFingerprint(
-	    fingerprint, static_cast<uint64_t>(VkDescriptorSetLayout(pipeline.descriptor_set_layout)));
+	    fingerprint, reinterpret_cast<uint64_t>(static_cast<VkDescriptorSetLayout>(pipeline.descriptor_set_layout)));
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
@@ -1648,7 +1648,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// flattened_srt is a host-uploaded buffer: fingerprint its three
 		// DescriptorBufferInfo fields (VkBuffer handle, offset, range) instead
 		// of its .data (vk::DescriptorBufferInfo has no .data member).
-		fingerprint = DescriptorFingerprint(fingerprint, static_cast<uint64_t>(VkBuffer(prepared->flattened_srt.buffer)));
+		fingerprint = DescriptorFingerprint(fingerprint, reinterpret_cast<uint64_t>(static_cast<VkBuffer>(prepared->flattened_srt.buffer)));
 		fingerprint = DescriptorFingerprint(fingerprint, static_cast<uint64_t>(prepared->flattened_srt.offset));
 		fingerprint = DescriptorFingerprint(fingerprint, static_cast<uint64_t>(prepared->flattened_srt.range));
 		for (const auto& patch: prepared->bindless_patches) {
