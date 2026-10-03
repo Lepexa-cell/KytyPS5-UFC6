@@ -289,6 +289,13 @@ BufferCache::~BufferCache() {
 	m_buffers.clear();
 }
 
+void BufferCache::NextFrame() noexcept {
+	++m_frame_counter;
+	const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+	m_staging_buffer.NoteFrame(frame);
+	m_stream_buffer.NoteFrame(frame);
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");

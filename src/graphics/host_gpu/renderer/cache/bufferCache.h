@@ -113,12 +113,7 @@ public:
 	// downloading what the GPU wrote there (drains the GPU).
 	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
 	// Bumped once per presented frame (GPU thread) so per-frame read-sync stamps expire.
-	void NextFrame() noexcept {
-		++m_frame_counter;
-		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
-		m_staging_buffer.NoteFrame(frame);
-		m_stream_buffer.NoteFrame(frame);
-	}
+	void NextFrame() noexcept;
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
