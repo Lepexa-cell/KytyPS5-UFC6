@@ -481,7 +481,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	}
 	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
 	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
-	IR::ValidateProgram(program, true);
+	if (IR::IrValidationEnabled()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
