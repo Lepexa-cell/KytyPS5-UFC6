@@ -58,6 +58,9 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// Graphics queue (queue 0). Frame telemetry lives there; compute queues
+	// do not present. GPU thread only.
+	[[nodiscard]] CommandProcessor& GraphicsProcessor();
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;

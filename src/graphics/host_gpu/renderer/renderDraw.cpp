@@ -1518,7 +1518,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
+	const uint64_t bindings_prepare_us = CommandProcessor::TelemetryNowUs();
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawBindings(
+		    CommandProcessor::TelemetryNowUs() - bindings_prepare_us);
+	}
 	// Zero-area scissor cull: geometry is 100% clipped, so skip buffer,
 	// pipeline and command-buffer work entirely. Memory-writing draws cannot
 	// be skipped: others may read what they write.
@@ -1540,8 +1545,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
+	uint64_t              vertex_us = 0;
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+		const uint64_t vertex_acquire_us = CommandProcessor::TelemetryNowUs();
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		// Index-buffer fast path: hundreds of crowd draws reuse one guest
 		// buffer. Reuse only on exact addr/size/type with the same host
@@ -1580,6 +1587,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				m_draw_index_cache.valid = false;
 			}
 		}
+		vertex_us += CommandProcessor::TelemetryNowUs() - vertex_acquire_us;
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1592,10 +1600,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// on the full key without hashing or locking, so no caller-side pipeline
 	// cache is kept here (its key would duplicate GraphicsPipelineKey and
 	// risk stale reuse). vkCmdBindPipeline stays unconditional below.
+	const uint64_t pipe_start_us = CommandProcessor::TelemetryNowUs();
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs, may_defer);
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawPipe(
+		    CommandProcessor::TelemetryNowUs() - pipe_start_us);
+	}
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
@@ -1611,12 +1624,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto vk_buffer = buffer.Handle();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
+		const uint64_t vertex_commit_us = CommandProcessor::TelemetryNowUs();
 		CommitVertexBuffers(buffer, vk_buffer, vertex_bindings);
+		vertex_us += CommandProcessor::TelemetryNowUs() - vertex_commit_us;
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
+	const uint64_t bindings_commit_us = CommandProcessor::TelemetryNowUs();
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawBindings(
+		    CommandProcessor::TelemetryNowUs() - bindings_commit_us);
+	}
 	if (mesh_active) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
@@ -1630,7 +1650,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
 	} else {
+		const uint64_t index_commit_us = CommandProcessor::TelemetryNowUs();
 		CommitIndexBuffer(buffer, vk_buffer, index_binding);
+		vertex_us += CommandProcessor::TelemetryNowUs() - index_commit_us;
+	}
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawVertex(vertex_us);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering,
@@ -1652,10 +1677,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	GpuTiming::Before(m_context, buffer);
+	const uint64_t emit_start_us = CommandProcessor::TelemetryNowUs();
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	}
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawEmit(
+		    CommandProcessor::TelemetryNowUs() - emit_start_us);
 	}
 	GpuTiming::After(m_context, buffer,
 	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash

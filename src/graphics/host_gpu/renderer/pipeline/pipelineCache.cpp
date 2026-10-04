@@ -825,14 +825,13 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
-		// i5-14400F: 6 P-cores / 12 threads. HTM suite: compile driver
-		// pipelines on the fast P-cores in parallel instead of a 2-worker
-		// trickle. Half the logical CPUs, clamped to [4, 8], so shader
-		// compilation scales with the machine instead of serializing the
-		// first UFC 5 run behind one or two workers.
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 4u, 8u);
+		// i5-14400F: 6 P-cores / 12 threads. HTM suite pins pipeline
+		// compilation to a fixed 8 workers so the first UFC run does not
+		// serialize behind hardware_concurrency()/2 (which lands below 8
+		// when the process affinity mask is narrower than the package).
+		const auto threads = 8u;
 		m_compiler         = std::make_unique<PipelineCompiler>(threads);
-		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
+		PipelineCacheLog("Vulkan pipelines: compiled on 8 worker threads (wait {} ms)",
 		                 g_pipeline_wait.count());
 	}
 }

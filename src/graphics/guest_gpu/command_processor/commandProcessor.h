@@ -179,7 +179,15 @@ public:
 		uint64_t draw_record_us = 0;
 		uint64_t gpu_wait_us = 0;
 		uint64_t flip_wait_us = 0;
+		// DrawRecord breakdown (microseconds). Subsets of draw_record_us:
+		// descriptor/texture binding, vertex/index acquisition, pipeline
+		// lookup, and the vkCmdDraw* emit itself.
+		uint64_t draw_bindings_us = 0;
+		uint64_t draw_vertex_us = 0;
+		uint64_t draw_pipe_us = 0;
+		uint64_t draw_emit_us = 0;
 		uint32_t draws = 0;
+		uint32_t flushes = 0;
 	};
 	[[nodiscard]] static inline uint64_t TelemetryNowUs() noexcept {
 		return Common::Timer::QueryPerformanceCounter() * 1000000ull /
@@ -189,7 +197,12 @@ public:
 	void TelemetryAddDrawRecord(uint64_t us) noexcept;
 	void TelemetryAddGpuWait(uint64_t us) noexcept;
 	void TelemetryAddFlipWait(uint64_t us) noexcept;
+	void TelemetryAddDrawBindings(uint64_t us) noexcept;
+	void TelemetryAddDrawVertex(uint64_t us) noexcept;
+	void TelemetryAddDrawPipe(uint64_t us) noexcept;
+	void TelemetryAddDrawEmit(uint64_t us) noexcept;
 	void TelemetryCountDraw() noexcept;
+	void TelemetryCountFlush() noexcept;
 	void TelemetryEndFrame();
 
 private:

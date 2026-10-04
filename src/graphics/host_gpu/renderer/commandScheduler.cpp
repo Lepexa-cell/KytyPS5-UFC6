@@ -232,6 +232,11 @@ bool CommandScheduler::IsRendering() const {
 void CommandScheduler::Flush() {
 	SubmitInfo submit;
 	Flush(submit);
+	// Actual submissions only: the graphics command processor records the
+	// presented frame. Compute queues and the async submit worker do not.
+	if (GuestGpu::IsGpuThread() && Active()) {
+		Context().GetGpu().GraphicsProcessor().TelemetryCountFlush();
+	}
 }
 
 void CommandScheduler::CompleteReleaseMemWrite() {

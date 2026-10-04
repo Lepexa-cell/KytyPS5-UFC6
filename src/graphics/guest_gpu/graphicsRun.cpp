@@ -370,6 +370,11 @@ int GuestGpu::GetFrameNum() const {
 	return m_done_num;
 }
 
+CommandProcessor& GuestGpu::GraphicsProcessor() {
+	EXIT_IF(m_gfx_cp == nullptr);
+	return *m_gfx_cp;
+}
+
 CommandProcessor& GuestGpu::GetProcessor(uint32_t queue_id) {
 	EXIT_IF(queue_id >= QueueCount);
 	if (queue_id == 0) {
@@ -457,8 +462,28 @@ void CommandProcessor::TelemetryAddFlipWait(uint64_t us) noexcept {
 	m_telemetry.flip_wait_us += us;
 }
 
+void CommandProcessor::TelemetryAddDrawBindings(uint64_t us) noexcept {
+	m_telemetry.draw_bindings_us += us;
+}
+
+void CommandProcessor::TelemetryAddDrawVertex(uint64_t us) noexcept {
+	m_telemetry.draw_vertex_us += us;
+}
+
+void CommandProcessor::TelemetryAddDrawPipe(uint64_t us) noexcept {
+	m_telemetry.draw_pipe_us += us;
+}
+
+void CommandProcessor::TelemetryAddDrawEmit(uint64_t us) noexcept {
+	m_telemetry.draw_emit_us += us;
+}
+
 void CommandProcessor::TelemetryCountDraw() noexcept {
 	m_telemetry.draws++;
+}
+
+void CommandProcessor::TelemetryCountFlush() noexcept {
+	m_telemetry.flushes++;
 }
 
 void CommandProcessor::TelemetryEndFrame() {
@@ -480,7 +505,12 @@ void CommandProcessor::TelemetryEndFrame() {
 	sums.draw_record_us += m_telemetry.draw_record_us;
 	sums.gpu_wait_us += m_telemetry.gpu_wait_us;
 	sums.flip_wait_us += m_telemetry.flip_wait_us;
+	sums.draw_bindings_us += m_telemetry.draw_bindings_us;
+	sums.draw_vertex_us += m_telemetry.draw_vertex_us;
+	sums.draw_pipe_us += m_telemetry.draw_pipe_us;
+	sums.draw_emit_us += m_telemetry.draw_emit_us;
 	sums.draws += m_telemetry.draws;
+	sums.flushes += m_telemetry.flushes;
 	static uint64_t total_sum_us = 0;
 	total_sum_us += total_us;
 
@@ -488,18 +518,16 @@ void CommandProcessor::TelemetryEndFrame() {
 		constexpr double kFrames = 60.0;
 		const double total_ms = static_cast<double>(total_sum_us) / 1000.0 / kFrames;
 		const double draw_ms = static_cast<double>(sums.draw_record_us) / 1000.0 / kFrames;
+		const double bind_ms = static_cast<double>(sums.draw_bindings_us) / 1000.0 / kFrames;
+		const double vtx_ms = static_cast<double>(sums.draw_vertex_us) / 1000.0 / kFrames;
+		const double pipe_ms = static_cast<double>(sums.draw_pipe_us) / 1000.0 / kFrames;
+		const double emit_ms = static_cast<double>(sums.draw_emit_us) / 1000.0 / kFrames;
 		const double pm4_ms = static_cast<double>(sums.pm4_us) / 1000.0 / kFrames;
-		const double accounted_ms =
-		    (static_cast<double>(sums.pm4_us) + static_cast<double>(sums.draw_record_us) +
-		     static_cast<double>(sums.gpu_wait_us) + static_cast<double>(sums.flip_wait_us)) /
-		    1000.0 / kFrames;
-		const double mem_sync_ms = total_ms >= accounted_ms ? total_ms - accounted_ms : 0.0;
-		const double gpu_wait_ms = static_cast<double>(sums.gpu_wait_us) / 1000.0 / kFrames;
-		const double flip_wait_ms = static_cast<double>(sums.flip_wait_us) / 1000.0 / kFrames;
 		const uint32_t draws = sums.draws / 60u;
-		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms | PM4: %.2f ms | "
-		     "MemSync: %.2f ms | GpuWait: %.2f ms | FlipWait: %.2f ms | Draws: %u\n",
-		     total_ms, draw_ms, pm4_ms, mem_sync_ms, gpu_wait_ms, flip_wait_ms, draws);
+		const uint32_t flushes = sums.flushes / 60u;
+		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (Bind: %.2f ms, Vtx: %.2f ms, "
+		     "Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | Flushes: %u | Draws: %u\n",
+		     total_ms, draw_ms, bind_ms, vtx_ms, pipe_ms, emit_ms, pm4_ms, flushes, draws);
 		sums = {};
 		total_sum_us = 0;
 	}
