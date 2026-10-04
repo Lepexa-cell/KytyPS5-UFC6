@@ -14,7 +14,11 @@
 #include "loader/symbolDatabase.h"
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <memory>
 #endif
 
