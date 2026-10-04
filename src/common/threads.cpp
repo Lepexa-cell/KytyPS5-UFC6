@@ -22,16 +22,15 @@
 #include <string>
 #include <thread>
 
-#ifdef KYTY_WIN_CS
-#include <windows.h> // IWYU pragma: keep
-#else
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS && !defined(KYTY_WIN_CS)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h> // IWYU pragma: keep
 #endif
-#endif
+
+#ifdef KYTY_WIN_CS
+#include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
