@@ -711,6 +711,33 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
+// UFC crowd fast path (see DrawIndexFastCache in renderDraw.h): consecutive
+// crowd/stadium draws share one guest index buffer. Valid only while the
+// BufferCache owner still covers the range and neither the CPU nor the GPU
+// has modified it since (ForEachUploadRange invariant): a CPU write, a GPU
+// write, or an evict/merge in between forces the slow path so the upload
+// refreshes honestly.
+[[nodiscard]] static bool MatchDrawIndexFastCache(const DrawIndexFastCache& cached,
+                                                  const DrawIndexBufferSource& source,
+                                                  BufferCache& buffer_cache) {
+	if (!cached.valid || cached.buffer == nullptr || source.host_data != nullptr ||
+	    source.size == 0 || cached.address != source.address || cached.size != source.size ||
+	    cached.type != source.type) {
+		return false;
+	}
+	// Owner check: eviction/merge since the last draw invalidates the hint.
+	const BufferId owner = buffer_cache.FindBuffer(source.address, source.size);
+	if (!owner || buffer_cache.GetBuffer(owner).Handle() != cached.buffer) {
+		return false;
+	}
+	// Upload honesty: a CPU or GPU write since the last draw needs a real ObtainBuffer.
+	if (buffer_cache.IsRegionCpuModified(source.address, source.size) ||
+	    buffer_cache.IsRegionGpuModified(source.address, source.size)) {
+		return false;
+	}
+	return true;
+}
+
 // Flat O(1) byte-size LUT for vertex buffer formats, indexed by the raw
 // BufferFormat code. Byte sizes repeat per data format across the 7 number
 // formats (UNorm/SNorm/UScaled/SScaled/UInt/SInt/Float share one row stride),
@@ -1397,6 +1424,32 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+[[nodiscard]] static bool DrawScissorIsEmpty(const CommandBuffer& buffer,
+                                       const ShaderVertexInputInfo& vs_input_info,
+                                       vk::Extent2D framebuffer_extent) {
+	// Zero-area scissor cull: the scissor test discards 100% of fragments.
+	// Checked per viewport slot only when the shader can emit a viewport
+	// index, otherwise slot 0 (mirrors SetGraphicsDynamicParams), and clamped
+	// to the framebuffer exactly like the emit path does.
+	const auto& ctx = buffer.GetRegisters();
+	const auto& vp  = ctx.GetScreenViewport();
+	const auto& outputs = vs_input_info.stage.program->info.outputs;
+	const bool  indexed_viewports =
+	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
+		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
+	    });
+	const uint32_t slot_count =
+	    indexed_viewports ? static_cast<uint32_t>(std::size(HW::ScreenViewport {}.viewports)) : 1u;
+	for (uint32_t i = 0; i < slot_count; i++) {
+		const auto scissor = calc_final_scissor(vp, ctx.GetScanModeControl(),
+		                                        framebuffer_extent, i);
+		if (scissor.right > scissor.left && scissor.bottom > scissor.top) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1445,6 +1498,46 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	// A draw that writes no memory may be skipped while its new pipeline compiles in the
+	// background; its render targets are not touched. One that writes buffers or storage images
+	// waits for the pipeline, as others may read what it writes.
+	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
+		return HasShaderBufferWrites(runtime) ||
+		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+			       return image.written &&
+			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		       });
+	};
+	// Zero-area scissor cull: the scissor test discards 100% of fragments, so
+	// skip the draw without emitting anything into the command buffer. Runs
+	// after render-target discovery (framebuffer extent) but before any Vk
+	// descriptor/vertex/index/pipeline work. Only for draws that write no
+	// buffers or storage images: such writes must still happen even when no
+	// fragment survives. vkCmdBindPipeline / vkCmdBindDescriptorSets stay
+	// unconditional on the surviving path below.
+	bool draw_writes_memory = state.ps_active && writes_memory(state.ps_input_info.stage);
+	for (const auto& stage: vertex_stages) {
+		draw_writes_memory = draw_writes_memory || writes_memory(stage.stage);
+	}
+	if (!mesh_active && !draw_writes_memory) {
+		vk::Extent2D scissor_extent {std::numeric_limits<uint32_t>::max(),
+		                             std::numeric_limits<uint32_t>::max()};
+		if (state.color_count != 0) {
+			scissor_extent = state.color_info[0].Extent();
+			for (uint32_t i = 1; i < state.color_count; i++) {
+				const auto extent = state.color_info[i].Extent();
+				scissor_extent.width  = std::min(scissor_extent.width, extent.width);
+				scissor_extent.height = std::min(scissor_extent.height, extent.height);
+			}
+		} else if (state.depth_info.image_id) {
+			scissor_extent = {state.depth_info.desc.info.extent.width,
+			                  state.depth_info.desc.info.extent.height};
+		}
+		if (scissor_extent.width != 0 && scissor_extent.height != 0 &&
+		    DrawScissorIsEmpty(buffer, state.vertex_info[0], scissor_extent)) {
+			return;
+		}
+	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1470,21 +1563,43 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
-		index_binding   = PrepareIndexBuffer(buffer, index_source);
+		// Crowd/stadium fast path: consecutive draws share one guest index
+		// buffer. On an addr/size/format repeat with unchanged guest contents
+		// and the same cache owner, reuse the prepared binding and skip
+		// PrepareIndexBuffer/ObtainBuffer entirely. The hit still goes through
+		// CommitIndexBuffer below, whose BindIndexBufferCached check keeps the
+		// actual vkCmdBindIndexBuffer emission correct.
+		auto& index_cache = m_context.GetBufferCache();
+		if (MatchDrawIndexFastCache(m_draw_index_cache, index_source, index_cache)) {
+			index_binding.buffer = m_draw_index_cache.buffer;
+			index_binding.offset = m_draw_index_cache.offset;
+			index_binding.type   = m_draw_index_cache.type;
+		} else {
+			index_binding = PrepareIndexBuffer(buffer, index_source);
+			if (index_source.host_data == nullptr && index_source.size != 0 &&
+			    index_binding.buffer != nullptr) {
+				m_draw_index_cache.address = index_source.address;
+				m_draw_index_cache.size    = index_source.size;
+				m_draw_index_cache.type    = index_source.type;
+				m_draw_index_cache.buffer  = index_binding.buffer;
+				m_draw_index_cache.offset  = index_binding.offset;
+				m_draw_index_cache.valid   = true;
+			} else {
+				m_draw_index_cache.valid = false;
+			}
+		}
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
 	// A draw that writes no memory may be skipped while its new pipeline compiles in the
 	// background; its render targets are not touched. One that writes buffers or storage images
-	// waits for the pipeline, as others may read what it writes.
-	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
-		return HasShaderBufferWrites(runtime) ||
-		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
-			       return image.written &&
-			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
-		       });
-	};
+	// waits for the pipeline, as others may read what it writes. Identical
+	// shader programs across consecutive crowd/stadium draws usually mean an
+	// identical pipeline: the L1 MRU inside TryGetGraphicsPipeline then hits
+	// on the full key without hashing or locking, so no caller-side pipeline
+	// cache is kept here (its key would duplicate GraphicsPipelineKey and
+	// risk stale reuse). vkCmdBindPipeline stays unconditional below.
 	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
@@ -1583,6 +1698,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
+	// Degenerate early-out first: culled passes often submit zero indices.
+	// No state setup, no buffer requests, no ExecutePreparedDraw.
+	if (args.index_count == 0 || args.instance_count == 0) {
+		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
+		                  -1);
+		return;
+	}
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1596,11 +1718,6 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
-		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
-		                  -1);
-		return;
-	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
@@ -1699,6 +1816,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
+	// Degenerate early-out first, mirroring DrawIndex: no state preparation.
+	if (args.vertex_count == 0 || args.instance_count == 0) {
+		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
+		                  -1, -1);
+		return;
+	}
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(buffer.IsInvalid());
@@ -1712,11 +1835,6 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.vertex_count == 0 || args.instance_count == 0) {
-		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
-		                  -1, -1);
-		return;
-	}
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {

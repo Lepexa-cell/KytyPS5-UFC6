@@ -35,6 +35,17 @@ struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
 struct DrawRenderState;
+// UFC crowd fast path: consecutive crowd/stadium draws share one guest index
+// buffer. Cached in RenderExecutor (GPU thread only) and validated by
+// MatchDrawIndexFastCache in renderDraw.cpp.
+struct DrawIndexFastCache {
+	uint64_t       address = 0;
+	uint64_t       size    = 0;
+	vk::IndexType  type    = vk::IndexType::eUint16;
+	vk::Buffer     buffer  = nullptr;
+	vk::DeviceSize offset  = 0;
+	bool           valid   = false;
+};
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
@@ -334,6 +345,7 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	DrawIndexFastCache                   m_draw_index_cache;
 	std::vector<ImageId>                  m_bound_images;
 	// Compute barrier coalescing: guest ranges written by dispatches whose
 	// post-barrier is still pending. Cleared when the barrier is emitted or
