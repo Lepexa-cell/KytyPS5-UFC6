@@ -121,6 +121,7 @@ public:
 private:
 	friend struct BufferCacheTestAccess;
 
+	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;

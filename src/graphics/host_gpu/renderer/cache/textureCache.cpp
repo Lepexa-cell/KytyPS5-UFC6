@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstdlib>
@@ -313,11 +314,34 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
+	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
+	// earlier may still be sampling the image on the GPU, and a draw recorded after the release
+	// was queued may have used it in a later tick. Destroying it at once let them read freed
+	// memory (device loss at the title, 2026-10-04).
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
 	} else {
-		m_slot_images.erase(id);
+		ReleaseImage(id);
 	}
+}
+
+void TextureCache::ReleaseImage(ImageId id) {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && !m_scheduler.IsFree(image->tick_accessed_last)) {
+		// Used after it was dropped, in a tick the GPU has not finished: keep it until then.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 16) {
+			LOGF("TextureCache: image %ux%u guest=0x%016" PRIx64 " used in tick %" PRIu64
+			     " after its release was queued; destruction waits for that tick\n",
+			     image->info.extent.width, image->info.extent.height, image->info.data.address,
+			     image->tick_accessed_last);
+		}
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferOperation([this, id] { ReleaseImage(id); });
+		}
+		return;
+	}
+	m_slot_images.erase(id);
 }
 
 void TextureCache::FreeImage(ImageId id) {
