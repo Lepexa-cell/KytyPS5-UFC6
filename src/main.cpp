@@ -450,15 +450,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 }
 
 static int Main(int argc, char* argv[]) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	DWORD_PTR process_mask = 0, system_mask = 0;
-	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0) {
-		DWORD_PTR want = static_cast<DWORD_PTR>(0x0FFF) & process_mask;
-		if (want != 0) {
-			SetProcessAffinityMask(GetCurrentProcess(), want);
-		}
-	}
-#endif
 	VirtualMemory::Init();
 	InitializeThreads();
 

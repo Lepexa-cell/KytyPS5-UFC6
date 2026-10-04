@@ -193,6 +193,15 @@ static int              g_main_thread_int;
 static std::atomic<int> g_thread_counter = 0;
 
 void InitializeThreads() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0) {
+		DWORD_PTR want = static_cast<DWORD_PTR>(0x0FFF) & process_mask;
+		if (want != 0) {
+			SetProcessAffinityMask(GetCurrentProcess(), want);
+		}
+	}
+#endif
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
 }

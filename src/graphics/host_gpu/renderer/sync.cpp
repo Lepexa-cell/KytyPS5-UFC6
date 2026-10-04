@@ -20,6 +20,39 @@
 namespace Libs::Graphics::Sync {
 
 constexpr uint64_t GRAPHICS_REFERENCE_CLOCK_FREQUENCY = 100000000;
+// Upper bound of the virtual GPU time a single frame may report: 2 000 000
+// ticks = 20.0 ms on the 100 MHz reference clock (an ideal 60 FPS frame is
+// 1 666 666 ticks = 16.666 ms).
+constexpr uint64_t kMaxVirtualFrameTicks = 2000000;
+
+namespace {
+
+// Virtual GPU clock shared by RELEASE_MEM/COPY_DATA timestamps. g_virtual_clock
+// is the last published guest-visible tick; g_frame_base anchors the start of
+// the current frame so per-frame growth can be clamped. Both advance only via
+// atomic CAS and never move backwards.
+std::atomic<uint64_t> g_virtual_clock {0};
+std::atomic<uint64_t> g_frame_base {0};
+std::atomic<bool>     g_frame_base_set {false};
+
+} // namespace
+
+void NotifyFrameBoundary() {
+	// Re-anchor the frame budget to the current virtual time. The next frame may
+	// then report at most kMaxVirtualFrameTicks above this point, no matter how
+	// long host-side translation of its draws takes. CAS publish keeps the base
+	// monotonic if several flip paths race; a lost race simply keeps the older
+	// (smaller) base, which only tightens the budget.
+	const uint64_t current = g_virtual_clock.load(std::memory_order_acquire);
+	uint64_t       prev    = g_frame_base.load(std::memory_order_relaxed);
+	while (current > prev) {
+		if (g_frame_base.compare_exchange_weak(prev, current, std::memory_order_acq_rel,
+		                                       std::memory_order_relaxed)) {
+			break;
+		}
+	}
+	g_frame_base_set.store(true, std::memory_order_release);
+}
 
 bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t& value) {
 	if (host_frequency == 0) {
@@ -54,6 +87,9 @@ uint64_t ReadReferenceClock() {
 	// IT_RELEASE_MEM opcode 0x49) and COPY_DATA reference-clock reads
 	// (IT_COPY_DATA opcode 0x40, src_sel 9/18) share this generator, and the
 	// atomic CAS loop at the end keeps it strictly monotonic.
+	// HTM virtualization: the value is additionally clamped to a per-frame budget
+	// (see kMaxVirtualFrameTicks and NotifyFrameBoundary below) so CPU-side
+	// command translation time never leaks into the guest-visible GPU clock.
 	static std::atomic<uint64_t> base_ticks {0};
 	static std::atomic<bool>     base_set {false};
 	uint64_t base = base_ticks.load(std::memory_order_relaxed);
@@ -73,17 +109,73 @@ uint64_t ReadReferenceClock() {
 		EXIT("cannot scale host clock, ticks=0x%016" PRIx64 " frequency=%" PRIu64 "\n", host_ticks,
 		     host_frequency);
 	}
-	static std::atomic<uint64_t> last_value{0};
-	uint64_t                     prev = last_value.load(std::memory_order_relaxed);
-	uint64_t                     current = value;
+	// HTM virtualization for Frostbite DRS: a frame's worth of CPU-side command
+	// translation (~80 ms for ~16k draws) must not leak into the guest-visible
+	// GPU clock, or the engine concludes the GPU stalled and engages its
+	// emergency ~12 FPS divider. Clamp virtual growth to kMaxVirtualFrameTicks
+	// per frame (20.0 ms at 100 MHz; ideal 60 FPS is 1 666 666 ticks =
+	// 16.666 ms), anchored at the last Flip/NextFrame boundary. Stamps stay
+	// strictly monotonic via atomic CAS: once pinned at the cap, later stamps in
+	// the same frame reuse cap+1, so 16k draws cannot walk the clock up while
+	// the raw host clock sits far above the budget.
+	if (!g_frame_base_set.load(std::memory_order_acquire)) {
+		// First stamp ever: anchor the frame budget here so even frame 0 (before
+		// the first Flip) is clamped. A lost CAS race just adopts the winner's
+		// base, which is also clamped below.
+		uint64_t expected = 0;
+		uint64_t desired  = value;
+		if (desired > kMaxVirtualFrameTicks) {
+			desired = kMaxVirtualFrameTicks;
+		}
+		if (g_frame_base.compare_exchange_strong(expected, desired, std::memory_order_acq_rel,
+		                                         std::memory_order_relaxed)) {
+			g_frame_base_set.store(true, std::memory_order_release);
+		}
+	}
+	if (g_frame_base_set.load(std::memory_order_acquire)) {
+		const uint64_t frame_base = g_frame_base.load(std::memory_order_acquire);
+		uint64_t       cap        = frame_base + kMaxVirtualFrameTicks;
+		if (cap < frame_base) {
+			cap = std::numeric_limits<uint64_t>::max();
+		}
+		if (value > cap) {
+			value = cap;
+		}
+		uint64_t prev = g_virtual_clock.load(std::memory_order_relaxed);
+		// Inside one frame the raw host clock can sit far above the cap (e.g.
+		// 80 ms of translation vs the 20 ms budget). Once the clock is pinned
+		// at the cap, publish cap+1 and stop: further stamps reuse cap+1 via
+		// the monotonic branch below, so 16k draws cannot walk the clock up.
+		if (prev >= cap) {
+			uint64_t pinned = cap + 1;
+			if (pinned < cap) {
+				pinned = std::numeric_limits<uint64_t>::max();
+			}
+			while (true) {
+				if (pinned <= prev) {
+					pinned = prev;
+					if (pinned == std::numeric_limits<uint64_t>::max()) {
+						return pinned;
+					}
+				}
+				if (g_virtual_clock.compare_exchange_weak(prev, pinned,
+				                                          std::memory_order_acq_rel,
+				                                          std::memory_order_relaxed)) {
+					return pinned;
+				}
+			}
+		}
+	}
+	uint64_t prev    = g_virtual_clock.load(std::memory_order_relaxed);
+	uint64_t current = value;
 	// Ensure strictly monotonic output: if the clock read would go backwards or stall,
 	// return prev+1 instead so RELEASE_MEM/COPY_DATA emit only ascending timestamps.
 	while (true) {
 		if (current <= prev) {
 			current = prev + 1;
 		}
-		if (last_value.compare_exchange_weak(prev, current, std::memory_order_acq_rel,
-		                                     std::memory_order_relaxed)) {
+		if (g_virtual_clock.compare_exchange_weak(prev, current, std::memory_order_acq_rel,
+		                                          std::memory_order_relaxed)) {
 			return current;
 		}
 	}
