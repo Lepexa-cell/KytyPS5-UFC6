@@ -400,6 +400,7 @@ public:
 
 	// Waits up to the budget; true when the job is done.
 	bool Wait(const PendingGraphicsPipeline& job, std::chrono::milliseconds budget) {
+		KYTY_PROFILER_BLOCK("PipelineCompiler::Wait");
 		std::unique_lock lock(m_mutex);
 		return m_done.wait_for(lock, budget,
 		                       [&job] { return job.done.load(std::memory_order_acquire); });
@@ -429,6 +430,7 @@ public:
 
 private:
 	void Run() {
+		KYTY_PROFILER_THREAD("PipelineCompiler");
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
 			{
@@ -440,7 +442,11 @@ private:
 				job = std::move(m_queue.front());
 				m_queue.pop_front();
 			}
-			job->result = CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
+			{
+				KYTY_PROFILER_BLOCK("PipelineCompiler::Compile");
+				job->result =
+				    CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
+			}
 			{
 				std::lock_guard lock(m_mutex);
 				job->done.store(true, std::memory_order_release);
