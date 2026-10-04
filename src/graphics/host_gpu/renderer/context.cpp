@@ -44,6 +44,11 @@ void CommandBuffer::Begin() {
 	m_cached_viewport        = {};
 	m_cached_scissor         = {};
 	m_cached_depth_bias      = {};
+	m_cached_line_width      = {};
+	m_cached_blend_constants = {};
+	m_cached_depth_state     = {};
+	m_cached_stencil_state   = {};
+	m_cached_color_write     = {};
 }
 
 bool CommandBuffer::BindVertexBuffersCached(uint32_t first_binding, uint32_t count,
@@ -197,6 +202,89 @@ bool CommandBuffer::SetDepthBiasCached(bool enable, float constant_factor, float
 	cached.clamp           = clamp;
 	cached.slope_factor    = slope_factor;
 	cached.valid           = true;
+	return true;
+}
+
+bool CommandBuffer::SetLineWidthCached(float line_width) const {
+	auto& cached = m_cached_line_width;
+	if (cached.valid &&
+	    std::memcmp(&cached.line_width, &line_width, sizeof(float)) == 0) {
+		return false;
+	}
+	cached.line_width = line_width;
+	cached.valid      = true;
+	return true;
+}
+
+bool CommandBuffer::SetBlendConstantsCached(const float* blend_constants) const {
+	auto& cached = m_cached_blend_constants;
+	if (cached.valid && std::memcmp(cached.values, blend_constants, sizeof(cached.values)) == 0) {
+		return false;
+	}
+	std::memcpy(cached.values, blend_constants, sizeof(cached.values));
+	cached.valid = true;
+	return true;
+}
+
+bool CommandBuffer::SetDepthStateCached(bool test_enable, bool write_enable,
+                                        vk::CompareOp compare_op) const {
+	auto& cached = m_cached_depth_state;
+	if (cached.valid && cached.test_enable == test_enable &&
+	    cached.write_enable == write_enable && cached.compare_op == compare_op) {
+		return false;
+	}
+	cached.test_enable  = test_enable;
+	cached.write_enable = write_enable;
+	cached.compare_op   = compare_op;
+	cached.valid        = true;
+	return true;
+}
+
+namespace {
+
+[[nodiscard]] bool StencilOpStateEqual(const vk::StencilOpState& a,
+                                       const vk::StencilOpState& b) {
+	// Field compare (not memcmp): padding bytes may differ between identical states.
+	return a.failOp == b.failOp && a.passOp == b.passOp && a.depthFailOp == b.depthFailOp &&
+	       a.compareOp == b.compareOp && a.compareMask == b.compareMask &&
+	       a.writeMask == b.writeMask && a.reference == b.reference;
+}
+
+} // namespace
+
+bool CommandBuffer::SetStencilStateCached(bool test_enable, const vk::StencilOpState& front,
+                                          const vk::StencilOpState& back) const {
+	auto& cached = m_cached_stencil_state;
+	if (cached.valid && cached.test_enable == test_enable &&
+	    StencilOpStateEqual(cached.front, front) && StencilOpStateEqual(cached.back, back)) {
+		return false;
+	}
+	cached.test_enable = test_enable;
+	cached.front        = front;
+	cached.back         = back;
+	cached.valid        = true;
+	return true;
+}
+
+bool CommandBuffer::SetColorWriteEnableCached(uint32_t count, const vk::Bool32* enable) const {
+	auto& cached = m_cached_color_write;
+	if (cached.valid && cached.count == count) {
+		bool same = true;
+		for (uint32_t i = 0; i < count; i++) {
+			if (cached.enable[i] != enable[i]) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			return false;
+		}
+	}
+	cached.count = count <= RENDER_COLOR_ATTACHMENTS_MAX ? count : RENDER_COLOR_ATTACHMENTS_MAX;
+	for (uint32_t i = 0; i < cached.count; i++) {
+		cached.enable[i] = enable[i];
+	}
+	cached.valid = true;
 	return true;
 }
 

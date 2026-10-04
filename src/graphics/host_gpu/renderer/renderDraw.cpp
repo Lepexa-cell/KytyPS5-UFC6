@@ -412,18 +412,25 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	if (buffer.SetLineWidthCached(line_width)) {
+		vk_buffer.setLineWidth(line_width);
+	}
 	if (!depth_only) {
 		// Depth-only shadow passes write no color: blend constants are
 		// unused by the pipeline (and blending is statically disabled),
 		// so skip the driver call on the 4 shadow cascades.
 		const auto&      blend = ctx.GetBlendColor();
 		const std::array blend_constants {blend.red, blend.green, blend.blue, blend.alpha};
-		vk_buffer.setBlendConstants(blend_constants.data());
+		if (buffer.SetBlendConstantsCached(blend_constants.data())) {
+			vk_buffer.setBlendConstants(blend_constants.data());
+		}
 	}
-	vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
-	vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	if (buffer.SetDepthStateCached(depth.depth_test_enable, depth.depth_write_enable,
+	                              depth.depth_compare_op)) {
+		vk_buffer.setDepthTestEnable(depth.depth_test_enable ? VK_TRUE : VK_FALSE);
+		vk_buffer.setDepthWriteEnable(depth.depth_write_enable ? VK_TRUE : VK_FALSE);
+		vk_buffer.setDepthCompareOp(depth.depth_compare_op);
+	}
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
@@ -452,16 +459,21 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 	}
 
-	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
-	if (depth.stencil_test_enable) {
-		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
-			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
-			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
-			vk_buffer.setStencilReference(face, state.reference);
-		};
-		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
-		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+	if (buffer.SetStencilStateCached(depth.stencil_test_enable, depth.stencil_front,
+	                                 depth.stencil_back)) {
+		vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
+		if (depth.stencil_test_enable) {
+			const auto set_stencil = [&](vk::StencilFaceFlagBits face,
+			                             const vk::StencilOpState& state) {
+				vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp,
+				                       state.compareOp);
+				vk_buffer.setStencilCompareMask(face, state.compareMask);
+				vk_buffer.setStencilWriteMask(face, state.writeMask);
+				vk_buffer.setStencilReference(face, state.reference);
+			};
+			set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
+			set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
+		}
 	}
 
 #if defined(__APPLE__)
@@ -472,7 +484,8 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	for (uint32_t slot = 0; slot < rendering.num_color_attachments; slot++) {
 		enable[slot] = rendering.color_attachments[slot].image_view != nullptr;
 	}
-	if (rendering.num_color_attachments != 0) {
+	if (rendering.num_color_attachments != 0 &&
+	    buffer.SetColorWriteEnableCached(rendering.num_color_attachments, enable)) {
 		vk_buffer.setColorWriteEnableEXT(rendering.num_color_attachments, enable);
 	}
 #endif
@@ -808,6 +821,59 @@ struct PreparedVertexBuffers {
 	uint32_t                               count = 0;
 };
 
+// Octagon hot loop: identical vertex buffers rebind thousands of times per frame.
+// The guest descriptor fingerprint below lets AcquireVertexBuffers skip the range
+// collect/sort/merge work on an exact repeat. The host ObtainBuffer calls are NOT
+// skipped: they keep the CPU->GPU upload honest and refresh bindings the cache
+// may have evicted or merged since (ForEachUploadRange invariant).
+struct VertexBufferFingerprint {
+	// Flat Pod copy of the guest descriptors actually consumed: per-slot address,
+	// stride and record count plus the attribute mapping (resources/resources_dst).
+	// The attribute extent sources (resources_num + resources[]/resources_dst[]) feed
+	// VertexBufferDescriptorSize for the stride==0 path, so they are part of the key.
+	int                                                   buffers_num   = -1;
+	int                                                   resources_num = -1;
+	std::array<ShaderVertexInputBuffer, ShaderVertexInputInfo::RES_MAX> buffers {};
+	std::array<ShaderBufferResource, ShaderVertexInputInfo::RES_MAX> resources {};
+	std::array<ShaderVertexDestination, ShaderVertexInputInfo::RES_MAX> resources_dst {};
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX> sizes {};
+	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
+	uint32_t merged_count = 0;
+	bool     valid        = false;
+};
+
+[[nodiscard]] static bool MatchVertexBufferFingerprint(const VertexBufferFingerprint& cached,
+                                               const ShaderVertexInputInfo& info) {
+	if (!cached.valid || cached.buffers_num != info.buffers_num ||
+	    cached.resources_num != info.resources_num) {
+		return false;
+	}
+	for (int i = 0; i < info.buffers_num; i++) {
+		const auto& a = cached.buffers[i];
+		const auto& b = info.buffers[i];
+		if (a.addr != b.addr || a.stride != b.stride || a.num_records != b.num_records ||
+		    a.fetch_index != b.fetch_index) {
+			return false;
+		}
+	}
+	for (int i = 0; i < info.resources_num; i++) {
+		const auto& a = cached.resources[i];
+		const auto& b = info.resources[i];
+		if (a.fields[0] != b.fields[0] || a.fields[1] != b.fields[1] ||
+		    a.fields[2] != b.fields[2] || a.fields[3] != b.fields[3]) {
+			return false;
+		}
+		const auto& da = cached.resources_dst[i];
+		const auto& db = info.resources_dst[i];
+		if (da.register_start != db.register_start || da.registers_num != db.registers_num ||
+		    da.attr_id != db.attr_id || da.fetch_index != db.fetch_index ||
+		    da.buffer_index != db.buffer_index) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
                                                   const ShaderVertexInputInfo& vs_input_info) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
@@ -817,34 +883,72 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
-	for (int i = 0; i < vs_input_info.buffers_num; i++) {
-		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
-		sizes[i]           = size;
-		if (size == 0) {
-			continue;
-		}
-		if (vertex.addr == 0 || size > UINT64_MAX - vertex.addr) {
-			EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-			     vertex.addr, size);
-		}
-		ranges[range_count++] = {vertex.addr, vertex.addr + size};
-	}
-
-	SortVertexBufferRanges(ranges.data(), range_count);
-
-	// Merge overlapping or touching ranges before acquiring host buffers.
+	// Fast path: the merged guest ranges are already known from the previous draw.
+	// Sizes are recomputed by VertexBufferDescriptorSize into the fingerprint on the
+	// slow path, and the fingerprint match above guarantees they are identical here.
+	thread_local VertexBufferFingerprint t_vertex_cache;
+	const bool range_hit = MatchVertexBufferFingerprint(t_vertex_cache, vs_input_info);
+	// The merged guest ranges: freshly computed on the slow path, replayed on a hit.
+	// Host bindings are always re-acquired below (honest CPU->GPU upload + refresh).
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> merged_ranges {};
 	uint32_t                                                      merged_count = 0;
-	for (uint32_t i = 0; i < range_count; i++) {
-		const auto& range = ranges[i];
-		if (merged_count != 0 &&
-		    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
-			merged_ranges[merged_count - 1].requested_end =
-			    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
-			continue;
+	if (!range_hit) {
+		for (int i = 0; i < vs_input_info.buffers_num; i++) {
+			const auto& vertex = vs_input_info.buffers[i];
+			const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
+			sizes[i]           = size;
+			if (size == 0) {
+				continue;
+			}
+			if (vertex.addr == 0 || size > UINT64_MAX - vertex.addr) {
+				EXIT("invalid vertex buffer range: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     vertex.addr, size);
+			}
+			ranges[range_count++] = {vertex.addr, vertex.addr + size};
 		}
-		merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+
+		SortVertexBufferRanges(ranges.data(), range_count);
+
+		// Merge overlapping or touching ranges before acquiring host buffers.
+		for (uint32_t i = 0; i < range_count; i++) {
+			const auto& range = ranges[i];
+			if (merged_count != 0 &&
+			    merged_ranges[merged_count - 1].requested_end >= range.base_address) {
+				merged_ranges[merged_count - 1].requested_end =
+				    std::max(merged_ranges[merged_count - 1].requested_end, range.requested_end);
+				continue;
+			}
+			merged_ranges[merged_count++] = {range.base_address, range.requested_end};
+		}
+
+		// Publish the slow-path result for the next exact-repeat draw.
+		t_vertex_cache.buffers_num   = vs_input_info.buffers_num;
+		t_vertex_cache.resources_num = vs_input_info.resources_num;
+		for (int i = 0; i < vs_input_info.buffers_num; i++) {
+			t_vertex_cache.buffers[i] = vs_input_info.buffers[i];
+		}
+		for (int i = 0; i < vs_input_info.resources_num; i++) {
+			t_vertex_cache.resources[i]     = vs_input_info.resources[i];
+			t_vertex_cache.resources_dst[i] = vs_input_info.resources_dst[i];
+		}
+		for (int i = 0; i < ShaderVertexInputInfo::RES_MAX; i++) {
+			t_vertex_cache.sizes[i] = sizes[i];
+		}
+		for (uint32_t i = 0; i < merged_count; i++) {
+			t_vertex_cache.merged_ranges[i] = {merged_ranges[i].base_address,
+			                                   merged_ranges[i].requested_end};
+		}
+		t_vertex_cache.merged_count = merged_count;
+		t_vertex_cache.valid        = true;
+	} else {
+		for (int i = 0; i < ShaderVertexInputInfo::RES_MAX; i++) {
+			sizes[i] = t_vertex_cache.sizes[i];
+		}
+		merged_count = t_vertex_cache.merged_count;
+		for (uint32_t i = 0; i < merged_count; i++) {
+			merged_ranges[i] = {t_vertex_cache.merged_ranges[i].base_address,
+			                    t_vertex_cache.merged_ranges[i].requested_end};
+		}
 	}
 
 	auto& cache = buffer.GetContext().GetBufferCache();

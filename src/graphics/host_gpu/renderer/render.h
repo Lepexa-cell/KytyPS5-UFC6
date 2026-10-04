@@ -136,6 +136,17 @@ public:
 	bool SetScissorWithCountCached(uint32_t count, const vk::Rect2D* scissors) const;
 	bool SetDepthBiasCached(bool enable, float constant_factor, float clamp,
 	                        float slope_factor) const;
+	// Octagon hot loop: the remaining dynamic state (line width, blend constants,
+	// depth test/write/compare, stencil, color-write mask) repeats across thousands
+	// of draws. Same contract: per-command-buffer caches reset in Begin(), true means
+	// the caller must still emit the Vulkan call.
+	bool SetLineWidthCached(float line_width) const;
+	bool SetBlendConstantsCached(const float* blend_constants) const;
+	bool SetDepthStateCached(bool test_enable, bool write_enable,
+	                         vk::CompareOp compare_op) const;
+	bool SetStencilStateCached(bool test_enable, const vk::StencilOpState& front,
+	                           const vk::StencilOpState& back) const;
+	bool SetColorWriteEnableCached(uint32_t count, const vk::Bool32* enable) const;
 	// NOTE: pipelines are bound unconditionally (meta-clear/image-clear/warmup
 	// rebind state behind any cache), so there is no BindPipelineCached.
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -205,11 +216,41 @@ private:
 		float slope_factor    = 0.0f;
 		bool  valid           = false;
 	};
+	struct CachedLineWidthState {
+		float line_width = 0.0f;
+		bool  valid      = false;
+	};
+	struct CachedBlendConstantsState {
+		float values[4] = {};
+		bool  valid     = false;
+	};
+	struct CachedDepthState {
+		bool          test_enable  = false;
+		bool          write_enable = false;
+		vk::CompareOp compare_op   = vk::CompareOp::eNever;
+		bool          valid        = false;
+	};
+	struct CachedStencilState {
+		vk::StencilOpState front;
+		vk::StencilOpState back;
+		bool               test_enable = false;
+		bool               valid       = false;
+	};
+	struct CachedColorWriteState {
+		uint32_t   count = 0;
+		vk::Bool32 enable[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+		bool       valid                                = false;
+	};
 	mutable CachedVertexBinding m_cached_vertex_binding;
 	mutable CachedIndexBinding  m_cached_index_binding;
 	mutable CachedViewportState m_cached_viewport;
 	mutable CachedScissorState  m_cached_scissor;
 	mutable CachedDepthBiasState m_cached_depth_bias;
+	mutable CachedLineWidthState m_cached_line_width;
+	mutable CachedBlendConstantsState m_cached_blend_constants;
+	mutable CachedDepthState m_cached_depth_state;
+	mutable CachedStencilState m_cached_stencil_state;
+	mutable CachedColorWriteState m_cached_color_write;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
