@@ -57,7 +57,6 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 // flushed at the next pass boundary (BeginRendering on a new state / EndRendering) with a
 // 4x safety cap so an unbounded single-pass frame cannot grow one buffer forever.
 uint32_t DrawFlushInterval() {
-uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
