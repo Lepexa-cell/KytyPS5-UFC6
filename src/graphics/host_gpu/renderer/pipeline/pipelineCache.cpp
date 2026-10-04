@@ -1375,10 +1375,6 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		mru.key_hash  = lookup_hash;
 		mru.key_valid = true;
 		mru.epoch     = PipelineMruEpoch();
-		m_repeat_key      = key;
-		m_repeat_pipeline = &found;
-		m_repeat_valid    = true;
-
 		return &found;
 	}
 

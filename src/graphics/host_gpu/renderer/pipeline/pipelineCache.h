@@ -201,15 +201,6 @@ public:
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
-	// Crowd/stadium repeat path: returns the previous ready pipeline only when
-	// the programs and every field of the graphics pipeline key match. A miss
-	// falls through to TryGetGraphicsPipeline unchanged.
-	[[nodiscard]] Pipeline* TryReuseGraphicsPipeline(
-	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
-	    std::span<const ShaderVertexInputInfo> vertex_info, const CommandBuffer& command,
-	    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-	    bool primitive_restart_enable, const GraphicsPrograms& programs, Pipeline* previous);
-
 private:
 	struct ProgramCache;
 
@@ -250,18 +241,10 @@ private:
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;
-	GraphicsPipelineKey                                     m_repeat_key {};
-	Pipeline*                                               m_repeat_pipeline = nullptr;
-	bool                                                    m_repeat_valid    = false;
 
 	void InitializeDriverCache();
 	// Takes a finished background compile into the pipeline; false while it still runs.
 	bool FinishPending(Pipeline& pipeline);
-	[[nodiscard]] GraphicsPipelineKey MakeGraphicsPipelineKey(
-	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
-	    std::span<const ShaderVertexInputInfo> vertex_info, const CommandBuffer& command,
-	    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
-	    bool primitive_restart_enable, const GraphicsPrograms& programs) const;
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
