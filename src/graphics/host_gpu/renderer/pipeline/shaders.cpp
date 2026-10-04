@@ -27,6 +27,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -237,6 +238,59 @@ static void FillSetLayouts(GraphicContext& graphics, const PipelineCache::Pipeli
 	}
 }
 
+namespace {
+
+// HTM cache suite: descriptor set layouts by binding-signature hash.
+// Identical shader binding signatures across pipelines share one
+// VkDescriptorSetLayout instead of re-creating it per pipeline.
+// Refcounted: each Pipeline that borrows the handle holds one reference.
+// PipelineCache teardown calls ReleaseDescriptorLayout once per Pipeline,
+// which destroys the Vulkan object exactly when the last borrower releases it.
+struct DescriptorLayoutKey {
+	vk::DescriptorSetLayoutCreateFlags flags;
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+
+	bool operator==(const DescriptorLayoutKey& other) const {
+		if (flags != other.flags || bindings.size() != other.bindings.size()) {
+			return false;
+		}
+		for (size_t i = 0; i < bindings.size(); i++) {
+			const auto& a = bindings[i];
+			const auto& b = other.bindings[i];
+			if (a.binding != b.binding || a.descriptorType != b.descriptorType ||
+			    a.descriptorCount != b.descriptorCount || a.stageFlags != b.stageFlags) {
+				return false;
+			}
+		}
+		return true;
+	}
+};
+struct DescriptorLayoutKeyHash {
+	std::size_t operator()(const DescriptorLayoutKey& key) const {
+		std::size_t hash = static_cast<std::size_t>(key.flags);
+		for (const auto& binding: key.bindings) {
+			hash ^= static_cast<std::size_t>(binding.binding) + 0x9e3779b9 + (hash << 6) +
+			        (hash >> 2);
+			hash ^= static_cast<std::size_t>(binding.descriptorType) + 0x9e3779b9 +
+			        (hash << 6) + (hash >> 2);
+			hash ^= static_cast<std::size_t>(binding.descriptorCount) + 0x9e3779b9 +
+			        (hash << 6) + (hash >> 2);
+			hash ^= static_cast<std::size_t>(vk::VkShaderStageFlags(binding.stageFlags)) +
+			        0x9e3779b9 + (hash << 6) + (hash >> 2);
+		}
+		return hash;
+	}
+};
+struct DescriptorLayoutSlot {
+	vk::DescriptorSetLayout layout = nullptr;
+	uint32_t refs = 0;
+};
+using DescriptorLayoutCache =
+    std::unordered_map<DescriptorLayoutKey, DescriptorLayoutSlot, DescriptorLayoutKeyHash>;
+DescriptorLayoutCache g_descriptor_layout_cache;
+
+} // namespace
+
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	uint32_t descriptor_count = 0;
@@ -251,8 +305,38 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	                          : vk::DescriptorSetLayoutCreateFlags {};
 	create.bindingCount = static_cast<uint32_t>(bindings.size());
 	create.pBindings    = bindings.data();
+
+	DescriptorLayoutKey key {create.flags, {bindings.begin(), bindings.end()}};
+	if (auto iter = g_descriptor_layout_cache.find(key); iter != g_descriptor_layout_cache.end()) {
+		pipeline.descriptor_set_layout = iter->second.layout;
+		iter->second.refs++;
+		return;
+	}
 	EXIT_IF(graphics.device.createDescriptorSetLayout(
 	            &create, nullptr, &pipeline.descriptor_set_layout) != vk::Result::eSuccess);
+	g_descriptor_layout_cache.emplace(std::move(key),
+	                                  DescriptorLayoutSlot {pipeline.descriptor_set_layout, 1});
+}
+
+// Releases one reference to a shared cached layout; destroys the Vulkan object
+// once the last borrowing Pipeline is gone. Called from PipelineCache teardown
+// once per Pipeline.
+void ReleaseDescriptorLayout(vk::Device device, vk::DescriptorSetLayout layout) {
+	if (layout == nullptr) {
+		return;
+	}
+	for (auto iter = g_descriptor_layout_cache.begin(); iter != g_descriptor_layout_cache.end();
+	     ++iter) {
+		if (iter->second.layout == layout) {
+			if (--iter->second.refs == 0) {
+				g_descriptor_layout_cache.erase(iter);
+				device.destroyDescriptorSetLayout(layout, nullptr);
+			}
+			return;
+		}
+	}
+	// Layout not from the cache (pre-cache path): destroy directly, as before.
+	device.destroyDescriptorSetLayout(layout, nullptr);
 }
 
 GraphicsPipelineBuild::~GraphicsPipelineBuild() {

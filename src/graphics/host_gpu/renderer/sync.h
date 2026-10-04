@@ -16,7 +16,6 @@ namespace Sync {
 [[nodiscard]] bool     ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency,
                                            uint64_t& value);
 [[nodiscard]] uint64_t ReadReferenceClock();
-void NotifyFrameBoundary();
 
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, int event_id, uint32_t context_id);
 

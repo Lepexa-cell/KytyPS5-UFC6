@@ -825,7 +825,12 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
-		const auto threads = std::clamp(std::thread::hardware_concurrency() / 4u, 1u, 4u);
+		// i5-14400F: 6 P-cores / 12 threads. HTM suite: compile driver
+		// pipelines on the fast P-cores in parallel instead of a 2-worker
+		// trickle. Half the logical CPUs, clamped to [4, 8], so shader
+		// compilation scales with the machine instead of serializing the
+		// first UFC 5 run behind one or two workers.
+		const auto threads = std::clamp(std::thread::hardware_concurrency() / 2u, 4u, 8u);
 		m_compiler         = std::make_unique<PipelineCompiler>(threads);
 		PipelineCacheLog("Vulkan pipelines: compiled on {} worker threads (wait {} ms)", threads,
 		                 g_pipeline_wait.count());
@@ -1425,8 +1430,33 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// HTM cache suite: shader-hash L1 for O(1) PSO lookup without map locking.
+	// Consecutive dispatches rerun the same Face Morph / skinning compute, so a
+	// single-entry MRU avoids the unordered_map hash+lock on every dispatch.
+	// Keyed by shader id; objects live in m_compute_pipelines for process
+	// lifetime, so the cached raw pointer stays valid (same pattern as the
+	// graphics pipeline MRU). VkCmdBindPipeline stays unconditional at the
+	// call site.
+	struct ComputeMruSlot {
+		const PipelineCache* owner = nullptr;
+		PipelineCache::Pipeline* pipeline = nullptr;
+		uint64_t shader_id = 0;
+		bool valid = false;
+		uint64_t epoch = 0;
+	};
+	static thread_local ComputeMruSlot compute_mru;
+	if (compute_mru.valid && compute_mru.owner == this && compute_mru.epoch == PipelineMruEpoch() &&
+	    compute_mru.shader_id == compute_program.id && compute_mru.pipeline != nullptr) {
+		return *compute_mru.pipeline;
+	}
+
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
+		compute_mru.owner     = this;
+		compute_mru.pipeline  = iter->second.get();
+		compute_mru.shader_id = compute_program.id;
+		compute_mru.valid     = true;
+		compute_mru.epoch     = PipelineMruEpoch();
 		return *iter->second;
 	}
 
@@ -1443,6 +1473,11 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 
+	compute_mru.owner     = this;
+	compute_mru.pipeline  = iter->second.get();
+	compute_mru.shader_id = compute_program.id;
+	compute_mru.valid     = true;
+	compute_mru.epoch     = PipelineMruEpoch();
 	return *iter->second;
 }
 } // namespace Libs::Graphics
