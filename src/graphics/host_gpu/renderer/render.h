@@ -334,6 +334,18 @@ private:
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
+	// UFC crowd fast path: consecutive crowd/stadium draws share one guest
+	// index buffer. Validated in ExecutePreparedDraw (owner + CPU/GPU dirty
+	// checks preserve the ForEachUploadRange invariant); a miss forces the
+	// honest PrepareIndexBuffer/ObtainBuffer slow path.
+	struct DrawIndexFastCache {
+		uint64_t       address = 0;
+		uint64_t       size    = 0;
+		vk::IndexType  type    = vk::IndexType::eUint16;
+		vk::Buffer     buffer  = nullptr;
+		vk::DeviceSize offset  = 0;
+		bool           valid   = false;
+	} m_draw_index_cache;
 	std::vector<ImageId>                  m_bound_images;
 	// Compute barrier coalescing: guest ranges written by dispatches whose
 	// post-barrier is still pending. Cleared when the barrier is emitted or
