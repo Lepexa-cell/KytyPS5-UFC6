@@ -1097,9 +1097,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 		} break;
 		case 0x03:
-			if (wait_op != 0) {
-				BufferFlushAndWait();
-			}
+			(void)wait_op;
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;

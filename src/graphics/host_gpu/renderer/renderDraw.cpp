@@ -587,7 +587,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
-		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		const auto per_fragment_writes = depth.AttachmentWriteAspects(false);
+		if ((feedback_aspects & per_fragment_writes) &&
+		    !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			// Without VK_EXT_attachment_feedback_loop_* (the AMD Windows driver), the draw samples
 			// the depth target it writes in the GENERAL layout: not defined by Vulkan, but what
 			// the hardware does anyway, and better than ending the emulator.
