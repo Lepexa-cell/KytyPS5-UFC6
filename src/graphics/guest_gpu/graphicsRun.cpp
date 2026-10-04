@@ -22,13 +22,6 @@
 #include "libs/agc.h"
 #include "libs/errno.h"
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h> // IWYU pragma: keep
-#endif
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -47,10 +40,10 @@ namespace {
 
 // Keep the hot GPU threads on the performance cores: first 12 logical threads
 // (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
+// Intersects with the process affinity mask so restricted launches stay valid.
 void PinThreadToPerformanceCores() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(0x0FFF));
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::Highest);
 #else
 	(void)0;
 #endif

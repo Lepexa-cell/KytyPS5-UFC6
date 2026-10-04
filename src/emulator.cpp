@@ -172,6 +172,9 @@ static void Execute(const std::filesystem::path& game_patch) {
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {
+		    // The guest main thread spawns every Frostbite job pool: P-cores at
+		    // highest priority so E-cores stay out of the frame-critical path.
+		    Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::Highest);
 		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
 	    },

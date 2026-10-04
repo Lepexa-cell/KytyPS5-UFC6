@@ -436,6 +436,10 @@ public:
 
 private:
 	void Run() {
+		// Background vkCreate*Pipeline traffic: keep it on the P-cores so the
+		// translator thread never waits behind a compiler parked on an E-core,
+		// but at below-normal priority so it never preempts real draws.
+		Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::BelowNormal);
 		for (;;) {
 			std::shared_ptr<PendingGraphicsPipeline> job;
 			{

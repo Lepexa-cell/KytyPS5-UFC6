@@ -24,6 +24,14 @@
 
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
+#else
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
+#endif
 // IWYU pragma: no_include <winbase.h>
 constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
@@ -166,6 +174,9 @@ struct ThreadPrivate {
 	static void Run(ThreadPrivate* t) {
 		t->unique_id = Thread::GetThreadIdUnique();
 		t->started   = true;
+		// Default every Common::Thread to the P-cores; the guest entry point below
+		// re-pins itself to Highest explicitly.
+		PinCurrentThreadToPerformanceCores(PerfCorePriority::AboveNormal);
 		t->func(t->arg);
 	}
 
@@ -185,6 +196,30 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+}
+
+void PinCurrentThreadToPerformanceCores(PerfCorePriority priority) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Intersect the P-core mask with the process affinity so a restricted launch
+	// (e.g. launcher affinitized elsewhere) never pins to a foreign core.
+	DWORD_PTR process_mask = 0, system_mask = 0;
+	DWORD_PTR want = static_cast<DWORD_PTR>(0x0FFF);
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0) {
+		want &= process_mask;
+	}
+	if (want != 0) {
+		(void)SetThreadAffinityMask(GetCurrentThread(), want);
+	}
+	int win_priority = THREAD_PRIORITY_HIGHEST;
+	switch (priority) {
+		case PerfCorePriority::Highest: win_priority = THREAD_PRIORITY_HIGHEST; break;
+		case PerfCorePriority::AboveNormal: win_priority = THREAD_PRIORITY_ABOVE_NORMAL; break;
+		case PerfCorePriority::BelowNormal: win_priority = THREAD_PRIORITY_BELOW_NORMAL; break;
+	}
+	(void)SetThreadPriority(GetCurrentThread(), win_priority);
+#else
+	(void)priority;
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)

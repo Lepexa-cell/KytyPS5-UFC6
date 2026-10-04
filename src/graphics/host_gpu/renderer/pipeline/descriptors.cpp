@@ -83,6 +83,10 @@ static uint64_t WatchedShaderHash() {
 	return hash;
 }
 
+bool WatchedShaderEnabled() {
+	return WatchedShaderHash() != 0;
+}
+
 static std::atomic<uint64_t> g_watched_first_frame {UINT64_MAX};
 
 uint64_t WatchedShaderFirstFrame() {

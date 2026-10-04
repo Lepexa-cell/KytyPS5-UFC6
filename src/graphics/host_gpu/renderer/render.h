@@ -116,6 +116,8 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IsRendering() const;
+	[[nodiscard]] bool HandlesState(const RenderState& state) const;
 
 	// Frostbite hot loop: skips redundant vkCmdBindVertexBuffers2 / vkCmdBindIndexBuffer
 	// when the same (buffers, offsets, sizes/type) is already bound on this command buffer.

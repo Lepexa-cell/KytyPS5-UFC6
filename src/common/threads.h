@@ -10,6 +10,12 @@ namespace Common {
 
 void InitializeThreads();
 
+// P-core affinity for hybrid CPUs (e.g. i5-14400F: 6 P-cores/12 threads, mask 0x0FFF).
+// Pins the calling thread to the P-core mask intersected with the process affinity
+// mask and raises/lowers its priority. No-op off Windows. Never fails.
+enum class PerfCorePriority { Highest, AboveNormal, BelowNormal };
+void PinCurrentThreadToPerformanceCores(PerfCorePriority priority = PerfCorePriority::Highest);
+
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

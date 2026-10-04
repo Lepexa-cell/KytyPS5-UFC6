@@ -1,6 +1,7 @@
 #include "common/archive.h"
 
 #include "common/stringUtils.h"
+#include "common/threads.h"
 
 #include <algorithm>
 #include <condition_variable>
@@ -206,7 +207,10 @@ private:
 	};
 
 	ArchiveIoThread() {
-		std::thread([this] { Loop(); }).detach();
+		std::thread([this] {
+			Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::BelowNormal);
+			Loop();
+		}).detach();
 	}
 
 	void Loop() {

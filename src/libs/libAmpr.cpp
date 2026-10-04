@@ -16,7 +16,6 @@
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <memory>
-#include <windows.h>
 #endif
 
 #include <algorithm>
@@ -1627,7 +1626,13 @@ struct PendingSubmission {
 class SubmissionEngine {
 public:
 	SubmissionEngine(const char* name, bool amm_engine): m_name(name), m_amm_engine(amm_engine) {
-		std::thread([this] { Run(); }).detach();
+		// Streaming I/O + map traffic feeds the render thread: keep it on the
+		// P-cores (below-normal) so a worker parked on an E-core never stalls
+		// the frame waiting for assets.
+		std::thread([this] {
+			Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::BelowNormal);
+			Run();
+		}).detach();
 	}
 
 	void Enqueue(PendingSubmission&& submission) {

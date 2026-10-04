@@ -856,6 +856,9 @@ void VideoOutDriver::Impl::VblankEnd() {
 }
 
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
+	// Vblank pacing is jitter-critical: P-cores at above-normal priority keep
+	// the flip cadence off the E-cores without preempting the GPU thread.
+	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::AboveNormal);
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 

@@ -1072,6 +1072,10 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
                                     uint32_t index_offset, int32_t base_vertex,
                                     uint32_t first_vertex, int32_t host_vertex_offset,
                                     uint32_t host_first_instance, bool indirect) {
+	// Hot path (~16k draws/frame): one env-cached check before touching atomics.
+	if (!WatchedShaderEnabled()) {
+		return;
+	}
 	static std::atomic<uint32_t> logged {0};
 	const auto*                  program = state.vertex_info[0].stage.program;
 	if (program == nullptr ||
@@ -1528,16 +1532,17 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.size = static_cast<uint64_t>(args.index_count) * index_source.guest_element_size;
 	const bool primitive_restart = ResolvePrimitiveRestart(buffer, index_source);
 
-	std::vector<uint16_t> expanded_indices;
+	static thread_local std::vector<uint16_t> t_expanded_indices;
 	if (index_source.guest_element_size == 1) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
+		// Hot path: reuse the thread-local buffer across draws; resize only grows.
+		t_expanded_indices.resize(args.index_count);
 		for (uint32_t i = 0; i < args.index_count; i++) {
-			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+			t_expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
 		}
-		index_source.host_data = expanded_indices.data();
-		index_source.size      = expanded_indices.size() * sizeof(uint16_t);
+		index_source.host_data = t_expanded_indices.data();
+		index_source.size      = t_expanded_indices.size() * sizeof(uint16_t);
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,

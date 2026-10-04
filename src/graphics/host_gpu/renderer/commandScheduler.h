@@ -25,6 +25,7 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
+	[[nodiscard]] bool IsRendering() const;
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
@@ -50,8 +51,9 @@ public:
 	// overlaps CPU recording with GPU execution without a submit per few dozen draws --
 	// override via KYTY_DRAW_FLUSH_INTERVAL (0 disables) if a different workload needs retuning:
 	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
-	// exists to remove. An open dynamic rendering scope is closed by End() before the chunk is
-	// queued and reopened by the next draw; a pending compute barrier is flushed into the chunk.
+	// exists to remove. While a dynamic-rendering scope is open the flush is deferred to the
+	// next pass boundary (see CompleteDraw): splitting a pass would close/reopen the scope and
+	// force an attachment reload.
 	void           CompleteDraw();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -81,7 +83,8 @@ public:
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
-	CommandBuffer&                 Current();
+	[[nodiscard]] CommandBuffer& Current();
+	[[nodiscard]] const CommandBuffer& Current() const;
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	// Non-blocking variant: single timeline poll, never enters vkWaitSemaphores.
@@ -151,6 +154,8 @@ private:
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
+	bool                         m_pending_draw_flush              = false;
+	uint32_t                     m_deferred_draw_flush             = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

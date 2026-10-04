@@ -4,17 +4,11 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/timeline.h"
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h> // IWYU pragma: keep
-#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -30,10 +24,10 @@ namespace {
 
 // Keep the hot GPU threads on the performance cores: first 12 logical threads
 // (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
+// Intersects with the process affinity mask so restricted launches stay valid.
 void PinThreadToPerformanceCores() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	SetThreadAffinityMask(GetCurrentThread(), static_cast<DWORD_PTR>(0x0FFF));
-	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::Highest);
 #else
 	(void)0;
 #endif
@@ -58,7 +52,11 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 // while the GPU sits idle. Closing and queueing a chunk every 2048 draws (Submit + BeginNext,
 // no Wait) lets the RTX 4070 execute the first chunk while the CPU records the next. 32 was
 // ~500 submits/frame and drowned the overlap in vkQueueSubmit overhead. 0 disables.
-// End() closes any open dynamic rendering scope before the chunk is queued.
+// The flush is deferred while a dynamic-rendering scope is open: splitting a pass forces
+// End/BeginRendering load+store traffic (VRAM -> tile cache reload). The pending chunk is
+// flushed at the next pass boundary (BeginRendering on a new state / EndRendering) with a
+// 4x safety cap so an unbounded single-pass frame cannot grow one buffer forever.
+uint32_t DrawFlushInterval() {
 uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
@@ -200,6 +198,16 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
+	// Natural pass boundary: drain any deferred mid-frame chunk before the new
+	// scope opens, so the previous chunk keeps its own render-pass instance and
+	// this pass records uninterrupted into the fresh buffer.
+	if (m_pending_draw_flush && Active() && !m_command.IsInvalid() &&
+	    !Current().HandlesState(state)) {
+		m_pending_draw_flush  = false;
+		m_deferred_draw_flush = 0;
+		CheckActive();
+		Flush();
+	}
 	Current().BeginRendering(state);
 }
 
@@ -207,7 +215,19 @@ void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
 		Context().GetRenderExecutor().FlushPendingComputeBarrier();
 		Current().EndRendering();
+		// The scope is closed: this is the cheapest point to submit a deferred
+		// mid-frame chunk -- no extra End/BeginRendering traffic is introduced.
+		if (m_pending_draw_flush) {
+			m_pending_draw_flush  = false;
+			m_deferred_draw_flush = 0;
+			CheckActive();
+			Flush();
+		}
 	}
+}
+
+bool CommandScheduler::IsRendering() const {
+	return Active() && !m_command.IsInvalid() && Current().IsRendering();
 }
 
 void CommandScheduler::Flush() {
@@ -247,6 +267,18 @@ void CommandScheduler::CompleteDraw() {
 		return;
 	}
 	CheckActive();
+	// Respect render-pass continuity: chunking mid-pass closes and reopens the
+	// dynamic-rendering scope (EndRendering -> BeginRendering), forcing the GPU
+	// to reload color/depth attachments. Defer the flush to the next pass
+	// boundary instead; a 4x safety cap guarantees progress inside one huge pass.
+	if (IsRendering()) {
+		m_pending_draw_flush = true;
+		if (++m_deferred_draw_flush < 4) {
+			return;
+		}
+		m_pending_draw_flush  = false;
+		m_deferred_draw_flush = 0;
+	}
 	// Draws leave vkCmdBeginRendering open across calls. End() (via Flush -> Submit) closes
 	// that scope before the buffer is queued, and the next draw reopens it on the new buffer.
 	// A coalesced compute barrier is recorded by Flush() itself, so it stays in this chunk.
@@ -344,7 +376,18 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	// Hot path (~16k draws/frame): skip the driver timeline query entirely when
+	// nothing is queued. KnownGpuTick is a relaxed atomic; Refresh() is the
+	// getSemaphoreCounterValue call and stays on the miss path only.
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty()) {
+			return;
+		}
+		if (!m_master.IsFree(m_pending_operations.front().tick)) {
+			m_master.Refresh();
+		}
+	}
 	for (;;) {
 		PendingOperation operation;
 		{
@@ -402,6 +445,10 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	// Event-release traffic unblocks guest job workers: P-cores at above-normal
+	// priority so RELEASE_MEM events never stall behind E-core scheduling.
+	KYTY_PROFILER_THREAD("GpuPriorityOps");
+	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::AboveNormal);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -473,6 +520,11 @@ CommandBuffer& CommandScheduler::Current() {
 	return m_command;
 }
 
+const CommandBuffer& CommandScheduler::Current() const {
+	CheckActive();
+	return m_command;
+}
+
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
@@ -501,6 +553,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg4   = m_command.m_debug_arg4,
 	};
 	m_command.m_buffer                = nullptr;
+	m_pending_draw_flush            = false;
+	m_deferred_draw_flush           = 0;
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;

@@ -289,4 +289,12 @@ void CommandBuffer::EndRendering() const {
 	m_render_state = {};
 }
 
+bool CommandBuffer::IsRendering() const {
+	return m_rendering && !IsInvalid();
+}
+
+bool CommandBuffer::HandlesState(const RenderState& state) const {
+	return m_rendering && m_render_state == state;
+}
+
 } // namespace Libs::Graphics
