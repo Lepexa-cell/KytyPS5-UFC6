@@ -107,7 +107,8 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
-		if (centroid) {
+		// A covered single-sample fragment has its only sample at the pixel center.
+		if (centroid && !state.input_info.pixel->ps_single_sample) {
 			const auto coordinates = state.builder.AllocateId();
 			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
 			state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
@@ -621,6 +622,13 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+		}
+		if (exp.kind == IR::ExportTargetKind::Parameter) {
+			for (const auto& binding: state.outputs) {
+				if (binding.alias_source == exp.index && binding.variable_id != 0) {
+					state.builder.AddFunction(spv::OpStore, binding.variable_id, value);
+				}
+			}
 		}
 	});
 }
