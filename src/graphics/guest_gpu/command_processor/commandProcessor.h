@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -166,6 +167,37 @@ private:
 	void SuspendPm4();
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+
+public:
+	// Lightweight per-frame telemetry: microsecond accumulators for the HTM
+	// 83 ms bottleneck hunt. All probes are O(1) QPC reads with no
+	// allocations; aggregation happens once per frame at Flip, logging once
+	// per 60 presented frames. Single GPU thread only (same threading model
+	// as the pipeline MRU caches).
+	struct FrameTelemetry {
+		uint64_t pm4_us = 0;
+		uint64_t draw_record_us = 0;
+		uint64_t gpu_wait_us = 0;
+		uint64_t flip_wait_us = 0;
+		uint32_t draws = 0;
+	};
+	[[nodiscard]] static inline uint64_t TelemetryNowUs() noexcept {
+		return Common::Timer::QueryPerformanceCounter() * 1000000ull /
+		       Common::Timer::QueryPerformanceFrequency();
+	}
+	void TelemetryAddPm4(uint64_t us) noexcept;
+	void TelemetryAddDrawRecord(uint64_t us) noexcept;
+	void TelemetryAddGpuWait(uint64_t us) noexcept;
+	void TelemetryAddFlipWait(uint64_t us) noexcept;
+	void TelemetryCountDraw() noexcept;
+	void TelemetryEndFrame();
+
+private:
+	FrameTelemetry m_telemetry {};
+	uint64_t       m_telemetry_frames = 0;
+	uint64_t       m_telemetry_frame_start_us = 0;
+
+private:
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
