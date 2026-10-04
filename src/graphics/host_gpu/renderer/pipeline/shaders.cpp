@@ -267,7 +267,7 @@ struct DescriptorLayoutKey {
 };
 struct DescriptorLayoutKeyHash {
 	std::size_t operator()(const DescriptorLayoutKey& key) const {
-		std::size_t hash = static_cast<std::size_t>(key.flags);
+		std::size_t hash = static_cast<std::size_t>(static_cast<uint32_t>(key.flags));
 		for (const auto& binding: key.bindings) {
 			hash ^= static_cast<std::size_t>(binding.binding) + 0x9e3779b9 + (hash << 6) +
 			        (hash >> 2);
@@ -275,7 +275,7 @@ struct DescriptorLayoutKeyHash {
 			        (hash << 6) + (hash >> 2);
 			hash ^= static_cast<std::size_t>(binding.descriptorCount) + 0x9e3779b9 +
 			        (hash << 6) + (hash >> 2);
-			hash ^= static_cast<std::size_t>(vk::VkShaderStageFlags(binding.stageFlags)) +
+			hash ^= static_cast<std::size_t>(static_cast<uint32_t>(binding.stageFlags)) +
 			        0x9e3779b9 + (hash << 6) + (hash >> 2);
 		}
 		return hash;
