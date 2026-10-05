@@ -83,6 +83,10 @@ enum class Counter : uint32_t {
 
 inline bool g_counters = false;
 
+// Set on the GPU thread (Thread_Gpu): GpuWaits and GpuWaitTime count only its waits, not those of
+// the threads that wait for ticks in the background (deferred operations).
+inline thread_local bool t_gpu_thread = false;
+
 struct alignas(64) CounterSlot {
 	std::atomic<int64_t> value {0};
 };

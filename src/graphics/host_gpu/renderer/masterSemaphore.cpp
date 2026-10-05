@@ -97,8 +97,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	const double waited = timer.GetTimeS();
 	RecordSemaphoreWait(waited, tick, m_gpu_tick.load(std::memory_order_acquire));
-	Profiler::Add(Profiler::Counter::GpuWaits);
-	Profiler::Add(Profiler::Counter::GpuWaitTime, static_cast<int64_t>(waited * 1e6));
+	if (Profiler::t_gpu_thread) {
+		Profiler::Add(Profiler::Counter::GpuWaits);
+		Profiler::Add(Profiler::Counter::GpuWaitTime, static_cast<int64_t>(waited * 1e6));
+	}
 	if (result != vk::Result::eSuccess) {
 		if (result == vk::Result::eErrorDeviceLost) {
 			DumpDeviceLossDiagnostics(m_graphics);
