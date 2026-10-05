@@ -186,8 +186,20 @@ public:
 		uint64_t draw_vertex_us = 0;
 		uint64_t draw_pipe_us = 0;
 		uint64_t draw_emit_us = 0;
+		// HTM named wait zones: label every wait by where it happens, so the
+		// 60-frame summary can tell instant scheduler waits apart from the few
+		// real GPU > CPU readback stalls. Subsets are not overlapping with
+		// gpu_wait_us/flip_wait_us above except wait_flip_us, which mirrors
+		// flip_wait_us for the HTM naming.
+		uint64_t wait_readmem_us = 0;
+		uint64_t wait_gc_us = 0;
+		uint64_t wait_flip_us = 0;
+		// DrawRecord breakdown: PrepareDrawRenderState cost inside DrawIndex.
+		uint64_t draw_state_us = 0;
 		uint32_t draws = 0;
 		uint32_t flushes = 0;
+		// Buffer churn metric for the custom VM dispatcher design.
+		uint32_t buffers_created = 0;
 	};
 	[[nodiscard]] static inline uint64_t TelemetryNowUs() noexcept {
 		return Common::Timer::QueryPerformanceCounter() * 1000000ull /
@@ -201,8 +213,13 @@ public:
 	void TelemetryAddDrawVertex(uint64_t us) noexcept;
 	void TelemetryAddDrawPipe(uint64_t us) noexcept;
 	void TelemetryAddDrawEmit(uint64_t us) noexcept;
+	void TelemetryAddWaitReadMem(uint64_t us) noexcept;
+	void TelemetryAddWaitGC(uint64_t us) noexcept;
+	void TelemetryAddWaitFlip(uint64_t us) noexcept;
+	void TelemetryAddDrawState(uint64_t us) noexcept;
 	void TelemetryCountDraw() noexcept;
 	void TelemetryCountFlush() noexcept;
+	void TelemetryCountBufferCreated() noexcept;
 	void TelemetryEndFrame();
 
 private:

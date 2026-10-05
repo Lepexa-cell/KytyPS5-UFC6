@@ -433,7 +433,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (window_end > window_begin &&
 		    DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			const auto tick = m_scheduler.CurrentTick();
+			// HTM named wait zone: GPU > CPU readback stall in ReadMemory.
+			const uint64_t wait_start_us = CommandProcessor::TelemetryNowUs();
 			m_scheduler.Wait(tick);
+			if (GuestGpu::IsGpuThread()) {
+				m_scheduler.Context().GetGpu().GraphicsProcessor().TelemetryAddWaitReadMem(
+				    CommandProcessor::TelemetryNowUs() - wait_start_us);
+			}
 			m_scheduler.WaitPriorityOperations(tick);
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
@@ -553,6 +559,10 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_scheduler.Current().IsInvalid());
+	// HTM buffer churn metric for the custom VM dispatcher design.
+	if (GuestGpu::IsGpuThread()) {
+		m_scheduler.Context().GetGpu().GraphicsProcessor().TelemetryCountBufferCreated();
+	}
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	if (vaddr < CACHING_PAGESIZE) {
 		// Guest page 0 is never mapped; a request here is a garbage or null descriptor that
@@ -1110,7 +1120,13 @@ void BufferCache::RunGarbageCollector() {
 	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
 	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
+	// HTM named wait zone: GC drain before releasing tracked pages/owners.
+	const uint64_t gc_wait_start_us = CommandProcessor::TelemetryNowUs();
 	m_scheduler.Wait(completion_tick);
+	if (GuestGpu::IsGpuThread()) {
+		m_scheduler.Context().GetGpu().GraphicsProcessor().TelemetryAddWaitGC(
+		    CommandProcessor::TelemetryNowUs() - gc_wait_start_us);
+	}
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];

@@ -478,12 +478,32 @@ void CommandProcessor::TelemetryAddDrawEmit(uint64_t us) noexcept {
 	m_telemetry.draw_emit_us += us;
 }
 
+void CommandProcessor::TelemetryAddWaitReadMem(uint64_t us) noexcept {
+	m_telemetry.wait_readmem_us += us;
+}
+
+void CommandProcessor::TelemetryAddWaitGC(uint64_t us) noexcept {
+	m_telemetry.wait_gc_us += us;
+}
+
+void CommandProcessor::TelemetryAddWaitFlip(uint64_t us) noexcept {
+	m_telemetry.wait_flip_us += us;
+}
+
+void CommandProcessor::TelemetryAddDrawState(uint64_t us) noexcept {
+	m_telemetry.draw_state_us += us;
+}
+
 void CommandProcessor::TelemetryCountDraw() noexcept {
 	m_telemetry.draws++;
 }
 
 void CommandProcessor::TelemetryCountFlush() noexcept {
 	m_telemetry.flushes++;
+}
+
+void CommandProcessor::TelemetryCountBufferCreated() noexcept {
+	m_telemetry.buffers_created++;
 }
 
 void CommandProcessor::TelemetryEndFrame() {
@@ -509,8 +529,13 @@ void CommandProcessor::TelemetryEndFrame() {
 	sums.draw_vertex_us += m_telemetry.draw_vertex_us;
 	sums.draw_pipe_us += m_telemetry.draw_pipe_us;
 	sums.draw_emit_us += m_telemetry.draw_emit_us;
+	sums.wait_readmem_us += m_telemetry.wait_readmem_us;
+	sums.wait_gc_us += m_telemetry.wait_gc_us;
+	sums.wait_flip_us += m_telemetry.wait_flip_us;
+	sums.draw_state_us += m_telemetry.draw_state_us;
 	sums.draws += m_telemetry.draws;
 	sums.flushes += m_telemetry.flushes;
+	sums.buffers_created += m_telemetry.buffers_created;
 	static uint64_t total_sum_us = 0;
 	total_sum_us += total_us;
 
@@ -523,11 +548,17 @@ void CommandProcessor::TelemetryEndFrame() {
 		const double pipe_ms = static_cast<double>(sums.draw_pipe_us) / 1000.0 / kFrames;
 		const double emit_ms = static_cast<double>(sums.draw_emit_us) / 1000.0 / kFrames;
 		const double pm4_ms = static_cast<double>(sums.pm4_us) / 1000.0 / kFrames;
+		const double state_ms = static_cast<double>(sums.draw_state_us) / 1000.0 / kFrames;
+		const double readmem_ms = static_cast<double>(sums.wait_readmem_us) / 1000.0 / kFrames;
+		const double flip_ms = static_cast<double>(sums.wait_flip_us) / 1000.0 / kFrames;
+		const double gc_ms = static_cast<double>(sums.wait_gc_us) / 1000.0 / kFrames;
 		const uint32_t draws = sums.draws / 60u;
 		const uint32_t flushes = sums.flushes / 60u;
-		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (Bind: %.2f ms, Vtx: %.2f ms, "
-		     "Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | Flushes: %u | Draws: %u\n",
-		     total_ms, draw_ms, bind_ms, vtx_ms, pipe_ms, emit_ms, pm4_ms, flushes, draws);
+		const uint32_t buf_creates = sums.buffers_created / 60u;
+		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms, Bind: %.2f ms, Vtx: %.2f ms, "
+		     "Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | BufCreates: %u | Draws: %u\n",
+		     total_ms, draw_ms, state_ms, bind_ms, vtx_ms, pipe_ms, emit_ms, pm4_ms,
+		     readmem_ms, flip_ms, gc_ms, flushes, buf_creates, draws);
 		sums = {};
 		total_sum_us = 0;
 	}
@@ -1494,7 +1525,9 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 	const uint64_t wait_start_us = TelemetryNowUs();
 	BufferFlush();
 	WaitFlipDoneNonBlocking(video_out_handle, display_buffer_index);
-	TelemetryAddFlipWait(TelemetryNowUs() - wait_start_us);
+	const uint64_t wait_us = TelemetryNowUs() - wait_start_us;
+	TelemetryAddFlipWait(wait_us);
+	TelemetryAddWaitFlip(wait_us);
 }
 
 void CommandProcessor::WaitFlipDoneNonBlocking(uint32_t video_out_handle,
@@ -1510,7 +1543,9 @@ void CommandProcessor::WaitFlipDoneNonBlocking(uint32_t video_out_handle,
 	const uint64_t wait_start_us = TelemetryNowUs();
 	video_out.WaitFlipDone(static_cast<int>(video_out_handle),
 	                       static_cast<int>(display_buffer_index));
-	TelemetryAddFlipWait(TelemetryNowUs() - wait_start_us);
+	const uint64_t flip_wait_us = TelemetryNowUs() - wait_start_us;
+	TelemetryAddFlipWait(flip_wait_us);
+	TelemetryAddWaitFlip(flip_wait_us);
 }
 
 template <typename T>

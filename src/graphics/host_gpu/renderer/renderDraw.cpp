@@ -1901,7 +1901,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	// HTM draw-state zone: PrepareDrawRenderState cost inside DrawIndex.
+	const uint64_t draw_state_us = CommandProcessor::TelemetryNowUs();
+	const bool draw_state_ok =
+	    PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	if (GuestGpu::IsGpuThread()) {
+		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawState(
+		    CommandProcessor::TelemetryNowUs() - draw_state_us);
+	}
+	if (!draw_state_ok) {
 		ResetBindings();
 		return;
 	}
