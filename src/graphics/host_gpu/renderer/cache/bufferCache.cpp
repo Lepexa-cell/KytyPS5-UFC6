@@ -432,15 +432,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 		if (window_end > window_begin &&
 		    DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			if (is_write) {
-				// CPU write to GPU-owned memory must publish GPU bytes before overwriting.
+			// Small point CPU reads (<=256 B: exposure scalars, luminance histograms,
+			// flag tags) require current data immediately; stale zeros cause exposure
+			// flicker. Large data faults stay non-blocking.
+			const bool is_scalar_read = (!is_write && size <= 256);
+			if (is_write || is_scalar_read) {
+				// Honest synchronous download for writes and light-critical scalars.
 				// Must be CurrentTick(): DownloadBufferMemory queues its copy-out command into
 				// whatever recording is currently open, so that recording has to actually be
 				// submitted and complete before the staging buffer it wrote into can be read back.
 				const auto tick = m_scheduler.CurrentTick();
 				m_scheduler.Wait(tick);
 				m_scheduler.WaitPriorityOperations(tick);
-				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 			} else {
 				// HTM secret #2 (deferred 1-frame readbacks): a CPU read of fresh GPU data
 				// must not force-submit the open frame recording and stall the GPU thread
@@ -449,8 +452,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				// the guest reads the current host backing (previous-frame value, 1-frame
 				// latency). Unmark optimistically so the same bytes don't fault again
 				// before the queued download publishes via DeferPriorityOperation.
-				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -585,8 +588,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	// HTM secret #1 (UFC 60 FPS): round new buffers up to 1 MB granularity to cut
 	// VkBuffer creation churn 5-10x and double draw throughput. Clamped to the guest
 	// region end so the span stays a valid GuestRange and never crosses the
-	// lower/extended gap; ResolveOverlaps below re-absorbs neighbours inside the
-	// rounded window so the non-overlapping invariant holds.
+	// lower/extended gap. Expansion never absorbs active neighbours: the extended
+	// window [end, clamped_end) is scanned in m_page_table/m_buffers and clamped to
+	// the next live neighbour begin (or left at the original size), so ResolveOverlaps
+	// below only merges true overlaps of the original request.
 	{
 		constexpr uint64_t kBufferGranularity = 1024 * 1024; // 1 MB
 		const uint64_t     region_end =
@@ -594,9 +599,36 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		        ? LOWER_ADDRESS_SIZE
 		        : LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 		const uint64_t rounded_end = vaddr + Common::AlignUp(size, kBufferGranularity);
-		const uint64_t clamped_end = std::min(region_end, rounded_end);
+		uint64_t       clamped_end = std::min(region_end, rounded_end);
 		if (clamped_end > end) {
-			size = clamped_end - vaddr;
+			uint64_t safe_end = clamped_end;
+			// Precise neighbour begin from the ordered map (first begin >= end).
+			const auto next = m_buffers.lower_bound(end);
+			if (next != m_buffers.end() && next->first < safe_end) {
+				safe_end = next->first;
+			}
+			// Honest m_page_table sweep of the expansion window: any occupied page
+			// stops the growth. Stale/deleted ids are treated as free.
+			for (uint64_t addr = end; addr < safe_end;) {
+				const auto* owner = m_page_table.Find(addr >> PageTable::kPageBits);
+				if (owner != nullptr && *owner && !IsBufferInvalid(*owner)) {
+					// Clamp to the exact neighbour begin when it lies inside the window,
+					// otherwise to this occupied page.
+					if (next != m_buffers.end() && next->first >= end && next->first <= addr) {
+						safe_end = next->first;
+					} else {
+						safe_end = addr;
+					}
+					break;
+				}
+				if (addr + CACHING_PAGESIZE <= addr) {
+					break; // overflow guard
+				}
+				addr += CACHING_PAGESIZE;
+			}
+			if (safe_end > end) {
+				size = safe_end - vaddr;
+			}
 		}
 	}
 	const auto overlap = ResolveOverlaps(vaddr, size);
