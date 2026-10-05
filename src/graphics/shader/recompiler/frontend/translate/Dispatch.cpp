@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -10,6 +11,9 @@ void Translator::FailMissingTranslation(const Decoder::Instruction& inst) {
 	if (TranslationNonFatalFlag()) {
 		LOGF("shader translation: opcode %s at pc 0x%08x has no IR translation\n",
 		     Decoder::InstructionToString(inst).c_str(), inst.pc);
+		Profiler::Message(Profiler::MessageWarning,
+		                  "Shader translation: opcode %s at pc 0x%08x has no IR translation",
+		                  Decoder::InstructionToString(inst).c_str(), inst.pc);
 		TranslationUnsupportedFlag() = true;
 		return;
 	}

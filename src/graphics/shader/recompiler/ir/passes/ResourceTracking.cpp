@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -497,6 +498,7 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		if (Frontend::TranslationNonFatal()) {
 			LOGF("%s\n", message.c_str());
+			Profiler::Message(Profiler::MessageWarning, "%s", message.c_str());
 			throw TrackingFailure {};
 		}
 		EXIT("%s", message.c_str());

@@ -429,11 +429,33 @@ static const std::chrono::milliseconds g_pipeline_wait = [] {
 
 struct PendingGraphicsPipeline {
 	std::unique_ptr<GraphicsPipelineBuild> build;
+	// For the profiler: the guest shaders (pixel 0 without one).
+	uint64_t                               vs_hash      = 0;
+	uint64_t                               ps_hash      = 0;
 	vk::PipelineCache                      driver_cache = nullptr;
 	vk::Pipeline                           pipeline     = nullptr;
 	vk::Result                             result       = vk::Result::eSuccess;
 	std::atomic<bool>                      done {false};
 };
+
+// Counts a finished pipeline build and puts it on the timeline (slow ones as a warning).
+static void ReportPipelineBuilt(Profiler::Counter counter, const char* kind, uint64_t first_hash,
+                                uint64_t second_hash, std::chrono::steady_clock::time_point begin) {
+	const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+	                                         std::chrono::steady_clock::now() - begin)
+	                                         .count());
+	Profiler::Add(counter);
+	Profiler::Add(Profiler::Counter::PipelineBuildTime, us);
+	Profiler::Message(us >= 100000 ? Profiler::MessageWarning : Profiler::MessageInfo,
+	                  "%s pipeline built in %.1f ms: 0x%016" PRIx64 " 0x%016" PRIx64, kind,
+	                  static_cast<double>(us) / 1000.0, first_hash, second_hash);
+}
+
+static void ReportGraphicsPipelineBuilt(uint64_t vs_hash, uint64_t ps_hash,
+                                        std::chrono::steady_clock::time_point begin) {
+	ReportPipelineBuilt(Profiler::Counter::GraphicsPipelinesBuilt, "Graphics", vs_hash, ps_hash,
+	                    begin);
+}
 
 // Compiles graphics pipelines on worker threads. The driver compiled on the GPU thread, which
 // stopped the whole emulated GPU for seconds per new pipeline (103 slow pipelines, 170 s of a
@@ -501,9 +523,14 @@ private:
 				m_queue.pop_front();
 			}
 			{
-				KYTY_PROFILER_BLOCK("PipelineCompiler::Compile");
+				Profiler::Phases zone;
+				zone.SetText("VS 0x%016" PRIx64 " PS 0x%016" PRIx64, job->vs_hash, job->ps_hash);
+				KYTY_PROFILER_PHASE(zone, "PipelineCompiler::Compile", profiler::colors::DeepOrangeA200);
+				const auto begin = std::chrono::steady_clock::now();
 				job->result =
 				    CreateGraphicsPipeline(*job->build, job->driver_cache, &job->pipeline);
+				ReportGraphicsPipelineBuilt(job->vs_hash, job->ps_hash, begin);
+				Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 			}
 			{
 				std::lock_guard lock(m_mutex);
@@ -605,6 +632,10 @@ struct PipelineCache::ProgramCache {
 	                               uint32_t push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		last_spirv_words = result.spirv.size();
+		Profiler::Phases phases;
+		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
+		KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V validate", profiler::colors::Blue300);
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -612,8 +643,10 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
+		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -641,6 +674,7 @@ struct PipelineCache::ProgramCache {
 		}
 
 		if (SkipShaderRequested(params.hash)) {
+			Profiler::Add(Profiler::Counter::SkippedSkipList);
 			return ShaderProgram {};
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
@@ -655,6 +689,7 @@ struct PipelineCache::ProgramCache {
 			                      lookup_key.function_code);
 		}
 		if (unsupported.contains(lookup_key)) {
+			Profiler::Add(Profiler::Counter::SkippedGaveUp);
 			return ShaderProgram {};
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
@@ -703,12 +738,18 @@ struct PipelineCache::ProgramCache {
 					if (!ShaderFailureNonFatal()) {
 						EXIT("shader resource materialization failed\n");
 					}
+					Profiler::Add(Profiler::Counter::SkippedResources);
 					static std::atomic<uint32_t> reported = 0;
 					if (reported.fetch_add(1) < 16) {
 						LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
 						     ": resource materialization failed (materialization line %d)\n",
 						     static_cast<uint32_t>(stage), params.hash,
 						     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+						Profiler::Message(Profiler::MessageWarning,
+						                  "Resources unreadable, draw skipped: stage %u 0x%016" PRIx64
+						                  " (materialization line %d; first 16 reported)",
+						                  static_cast<uint32_t>(stage), params.hash,
+						                  ShaderRecompiler::IR::LastIndirectImageFailureLine());
 					}
 					return ShaderProgram {};
 				}
@@ -770,6 +811,11 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		// The whole compile as one zone on the timeline, its phases below it.
+		Profiler::Phases compile_zone;
+		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
+		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
+		const auto compile_begin = std::chrono::steady_clock::now();
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
 		const auto compile_code = lookup_key.function_code.empty()
@@ -792,6 +838,10 @@ struct PipelineCache::ProgramCache {
 				     ": S_MEMREALTIME needs shaderDeviceClock\n",
 				     static_cast<uint32_t>(stage), params.hash);
 			}
+			Profiler::Add(Profiler::Counter::ShadersGaveUp);
+			Profiler::Message(Profiler::MessageFailure,
+			                  "Shader gave up: %s 0x%016" PRIx64 ": S_MEMREALTIME needs shaderDeviceClock",
+			                  stage_name, params.hash);
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
@@ -804,12 +854,18 @@ struct PipelineCache::ProgramCache {
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
 				}
+				Profiler::Add(Profiler::Counter::SkippedResources);
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 16) {
 					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
 					     ": resource materialization failed on first use (materialization line %d)\n",
 					     static_cast<uint32_t>(stage), params.hash,
 					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+					Profiler::Message(Profiler::MessageWarning,
+					                  "Resources unreadable on first use, draw skipped: %s 0x%016" PRIx64
+					                  " (materialization line %d; first 16 reported)",
+					                  stage_name, params.hash,
+					                  ShaderRecompiler::IR::LastIndirectImageFailureLine());
 				}
 				return ShaderProgram {};
 			}
@@ -817,6 +873,17 @@ struct PipelineCache::ProgramCache {
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
+		{
+			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		    std::chrono::steady_clock::now() - compile_begin).count());
+			Profiler::Add(Profiler::Counter::ShadersCompiled);
+			Profiler::Add(Profiler::Counter::ShaderCompileTime, us);
+			Profiler::Message(Profiler::MessageInfo,
+			                  "Shader compiled: %s 0x%016" PRIx64 " in %.1f ms, %zu SPIR-V words",
+			                  stage_name, params.hash, static_cast<double>(us) / 1000.0,
+			                  last_spirv_words);
+		}
+		compile_zone.End();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -876,6 +943,8 @@ struct PipelineCache::ProgramCache {
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
+	// SPIR-V size of the last permutation compiled (for the profiler).
+	size_t                                                      last_spirv_words = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1231,6 +1300,7 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 		}
 		// The workers stopped before this job started: compile it here.
 		job.result = CreateGraphicsPipeline(*job.build, m_driver_cache, &job.pipeline);
+		Profiler::Add(Profiler::Counter::PipelinesPending, -1);
 		job.done.store(true, std::memory_order_release);
 	}
 	EXIT_NOT_IMPLEMENTED(job.result != vk::Result::eSuccess || job.pipeline == nullptr);
@@ -1413,6 +1483,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	}
 
 	const auto defer = [this] {
+		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		if (++m_deferred_draws % 256 == 1) {
 			LOGF("PipelineCache: %" PRIu64 " draws skipped while their pipeline compiled in the "
 			     "background\n",
@@ -1454,7 +1525,10 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
 		job->build        = std::move(build);
 		job->driver_cache = m_driver_cache;
+		job->vs_hash      = vs_input_info.stage.program->shader_hash;
+		job->ps_hash      = ps_active ? ps_input_info->stage.program->shader_hash : 0;
 		cached->pending   = job;
+		Profiler::Add(Profiler::Counter::PipelinesPending);
 		m_compiler->Submit(job);
 		(void)m_compiler->Wait(*job, g_pipeline_wait);
 		auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
@@ -1466,8 +1540,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
 	}
+	const auto build_begin = std::chrono::steady_clock::now();
 	const auto result = CreateGraphicsPipeline(*build, m_driver_cache, &cached->pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	ReportGraphicsPipelineBuilt(vs_input_info.stage.program->shader_hash,
+	                            ps_active ? ps_input_info->stage.program->shader_hash : 0,
+	                            build_begin);
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1495,7 +1573,15 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	{
+		const auto hash = input_info.stage.program != nullptr ? input_info.stage.program->shader_hash : 0;
+		Profiler::Phases zone;
+		zone.SetText("CS 0x%016" PRIx64, hash);
+		KYTY_PROFILER_PHASE(zone, "Compute pipeline build", profiler::colors::RedA100);
+		const auto begin = std::chrono::steady_clock::now();
+		CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+		ReportPipelineBuilt(Profiler::Counter::ComputePipelinesBuilt, "Compute", hash, 0, begin);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

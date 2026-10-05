@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -55,6 +56,14 @@ void DumpGaveUpCode(const CompileOptions& options, std::span<const uint32_t> cod
 		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
 		std::fclose(file);
 	}
+}
+
+// A shader that gives up: the current compile phase turns red, and the timeline gets the reason.
+void ReportGaveUp(const CompileOptions& options, Profiler::Phases& phases, const char* reason) {
+	phases.Color(Profiler::MessageFailure);
+	Profiler::Add(Profiler::Counter::ShadersGaveUp);
+	Profiler::Message(Profiler::MessageFailure, "Shader gave up: %s 0x%016" PRIx64 ": %s",
+	                  StageName(options.stage), options.shader_hash, reason);
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
@@ -518,6 +527,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     static_cast<unsigned>(options.stage));
 	}
 
+	// The phases as Tracy zones, each with the stage and hash as its text.
+	Profiler::Phases phases;
+	phases.SetText("%s 0x%016" PRIx64, StageName(options.stage), options.shader_hash);
+	KYTY_PROFILER_PHASE(phases, "Shader: decode", profiler::colors::Green100);
+
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {
 		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -563,11 +577,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 
+	KYTY_PROFILER_PHASE(phases, "Shader: CFG", profiler::colors::Green200);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
 	auto native_cfg = CFG::BuildGraph(decoded);
 	if (options.non_fatal && native_cfg.unsupported && !native_cfg.irreducible) {
 		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, native_cfg.unsupported_reason.c_str());
 		LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", GetDumpLabel(options), options.shader_hash,
 		     native_cfg.unsupported_reason.c_str());
 		TranslateResult unsupported_result;
@@ -627,11 +643,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	    .input_info       = options.input_info,
 	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
+	KYTY_PROFILER_PHASE(phases, "Shader: IR translate", profiler::colors::Green300);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
 	if (options.non_fatal && Frontend::TranslationUnsupported()) {
 		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, "no IR translation for an instruction");
 		LOGF("%s gave up hash=0x%016" PRIx64 ": no IR translation for an instruction\n",
 		     GetDumpLabel(options), options.shader_hash);
 		TranslateResult unsupported_result;
@@ -648,6 +666,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                                 std::chrono::steady_clock::now() - begin)
 		                                 .count());
 	};
+	KYTY_PROFILER_PHASE(phases, "Shader: IR passes", profiler::colors::Green400);
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
@@ -687,6 +706,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			EXIT("%s failed hash=0x%016" PRIx64 ": unsupported tessellation memory shape\n",
 			     GetDumpLabel(options), options.shader_hash);
 		}
+		ReportGaveUp(options, phases, "unsupported tessellation memory shape");
 		TranslateResult unsupported_result;
 		unsupported_result.unsupported = true;
 		return unsupported_result;
@@ -700,6 +720,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	ir.bindless_images        = options.bindless_images;
+	KYTY_PROFILER_PHASE(phases, "Shader: resource tracking", profiler::colors::Amber300);
 	const auto tracking_begin = std::chrono::steady_clock::now();
 	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);
 	const auto tracking_ms    = ms_since(tracking_begin);
@@ -710,6 +731,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     ms_since(passes_begin), phase_ms());
 	if (!tracked && options.non_fatal) {
 		DumpGaveUpCode(options, code);
+		ReportGaveUp(options, phases, "resource tracking failed");
 		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
 		     options.shader_hash);
 		if (Config::GraphicsDebugDumpEnabled()) {
@@ -736,6 +758,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 				     GetDumpLabel(options), options.shader_hash, reason);
 			}
 			DumpGaveUpCode(options, code);
+			ReportGaveUp(options, phases, reason);
 			LOGF("%s gave up hash=0x%016" PRIx64 ": %u mesh passes, but %s\n",
 			     GetDumpLabel(options), options.shader_hash, options.input_info.vertex->mesh.passes,
 			     reason);
@@ -756,6 +779,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
+	Profiler::Phases phases;
+	phases.SetText("%s 0x%016" PRIx64, StageName(options.stage), options.shader_hash);
+	KYTY_PROFILER_PHASE(phases, "Shader: specialize and bind", profiler::colors::Green100);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
@@ -808,6 +834,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		}
 	}
 
+	KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V emit", profiler::colors::CyanA700);
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
 	auto spirv = Spirv::EmitProgram(ir, options.input_info);
