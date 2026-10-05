@@ -385,6 +385,43 @@ static const uint64_t g_pipeline_sync_words = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_SYNC_WORDS");
 	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {12000};
 }();
+static const bool g_dynamic_raster_state = [] {
+	const char* value = std::getenv("KYTY_DYNAMIC_RASTER_STATE");
+	return value == nullptr || value[0] != '0';
+}();
+
+bool PipelineDynamicRasterStateEnabled() {
+	return g_dynamic_raster_state;
+}
+
+namespace {
+
+// Zeroes key fields that cannot change the pipeline PrepareGraphicsPipeline creates, so draws
+// that differ only in them share one pipeline instead of compiling identical copies (idea from
+// Jetsku/KytyPS5 ef5e8fd9).
+// - Cull mode and front face are dynamic state, recorded per draw from the same registers with
+//   the same rect-list rule (SetGraphicsDynamicParams). The polygon mode stays static; it is
+//   resolved from the real cull bits before they leave the key.
+// - The depth-bounds test enable and bounds are dynamic state as well, so each DB_DEPTH_BOUNDS
+//   value no longer creates its own pipeline (before, even with the test off). On macOS the
+//   pipeline always disables the test (MoltenVK has no depthBounds), so they never mattered.
+// Blend factors and ops of an attachment with blending off, and the alpha ones without separate
+// alpha blending, are never written into the key (TryGetGraphicsPipeline), so they need no rule.
+// KYTY_DYNAMIC_RASTER_STATE=0 keeps all of these in the key and bakes them into the pipeline.
+void NormalizeGraphicsPipelineKey(PipelineStaticParameters& params) {
+	if (!g_dynamic_raster_state) {
+		return;
+	}
+	params.cull_front               = false;
+	params.cull_back                = false;
+	params.face                     = false;
+	params.depth_bounds_test_enable = false;
+	params.depth_min_bounds         = 0.0f;
+	params.depth_max_bounds         = 0.0f;
+}
+
+} // namespace
+
 static const std::chrono::milliseconds g_pipeline_wait = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_WAIT_MS");
 	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20u);
@@ -1350,6 +1387,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
+	NormalizeGraphicsPipelineKey(static_params);
 
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||

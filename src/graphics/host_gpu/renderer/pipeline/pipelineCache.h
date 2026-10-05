@@ -245,6 +245,12 @@ private:
 	bool FinishPending(Pipeline& pipeline);
 };
 
+// KYTY_DYNAMIC_RASTER_STATE (default on): cull mode and front face (and, except on macOS, the
+// depth-bounds test enable and bounds) are dynamic state of every renderer graphics pipeline,
+// recorded per draw by SetGraphicsDynamicParams, and leave the pipeline key; key fields that
+// cannot change the pipeline are zeroed. =0 bakes them into each pipeline as before.
+[[nodiscard]] bool PipelineDynamicRasterStateEnabled();
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 // Creates the pipeline's layouts and fills the create info; CreateGraphicsPipeline compiles it.
 std::unique_ptr<GraphicsPipelineBuild>

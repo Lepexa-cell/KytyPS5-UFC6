@@ -576,6 +576,17 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	if (graphics.attachment_feedback_loop_enabled) {
 		build.dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Core Vulkan 1.3 (cull mode, front face, depth-bounds test enable) and 1.0 (depth bounds;
+		// the depthBounds feature is required on these hosts). The key holds zeroes for them; the
+		// draw records the values from the same registers (SetGraphicsDynamicParams).
+		build.dynamic_states.push_back(vk::DynamicState::eCullMode);
+		build.dynamic_states.push_back(vk::DynamicState::eFrontFace);
+#if !defined(__APPLE__)
+		build.dynamic_states.push_back(vk::DynamicState::eDepthBoundsTestEnable);
+		build.dynamic_states.push_back(vk::DynamicState::eDepthBounds);
+#endif
+	}
 
 	build.dynamic_state.dynamicStateCount = static_cast<uint32_t>(build.dynamic_states.size());
 	build.dynamic_state.pDynamicStates    = build.dynamic_states.data();

@@ -414,6 +414,31 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, const CommandR
 		set_stencil(vk::StencilFaceFlagBits::eBack, depth.stencil_back);
 	}
 
+	if (PipelineDynamicRasterStateEnabled()) {
+		// Formerly pipeline-key fields (PipelineCache::TryGetGraphicsPipeline), from the same
+		// registers and with the same rule: rect lists are drawn without culling.
+		const bool        rect_list = Prospero::IsRectList(buffer.GetUserConfig().GetPrimType());
+		vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+		if (!rect_list && mode.cull_back) {
+			cull_mode |= vk::CullModeFlagBits::eBack;
+		}
+		if (!rect_list && mode.cull_front) {
+			cull_mode |= vk::CullModeFlagBits::eFront;
+		}
+		vk_buffer.setCullMode(cull_mode);
+		vk_buffer.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+		                                 : vk::FrontFace::eCounterClockwise);
+#if !defined(__APPLE__)
+		// Without a depth attachment the static pipeline had no depth/stencil state at all.
+		const bool bounds_test =
+		    depth.depth_bounds_test_enable && rendering.depth_stencil_attachment.has_depth;
+		vk_buffer.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
+		if (bounds_test) {
+			vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+		}
+#endif
+	}
+
 #if defined(__APPLE__)
 	// MoltenVK has no VK_EXT_color_write_enable; the pipeline is created without the
 	// eColorWriteEnableEXT dynamic state and relies on the static colorWriteMask instead.

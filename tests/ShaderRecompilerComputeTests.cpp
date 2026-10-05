@@ -15697,6 +15697,29 @@ public:
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
       cmd.setDepthBiasEnable(false);
+      if (PipelineDynamicRasterStateEnabled()) {
+        // As SetGraphicsDynamicParams: the cull and front-face registers are dynamic state.
+        const auto &mode = registers.GetModeControl();
+        const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+        vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
+        if (!rect_list && mode.cull_back) {
+          cull_mode |= vk::CullModeFlagBits::eBack;
+        }
+        if (!rect_list && mode.cull_front) {
+          cull_mode |= vk::CullModeFlagBits::eFront;
+        }
+        cmd.setCullMode(cull_mode);
+        cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
+                                   : vk::FrontFace::eCounterClockwise);
+#if !defined(__APPLE__)
+        const bool bounds_test = depth.depth_bounds_test_enable &&
+                                 rendering.depth_stencil_attachment.has_depth;
+        cmd.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
+        if (bounds_test) {
+          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+        }
+#endif
+      }
       cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
         const auto set_stencil = [&](vk::StencilFaceFlagBits face,

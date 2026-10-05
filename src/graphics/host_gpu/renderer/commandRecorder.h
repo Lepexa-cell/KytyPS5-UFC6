@@ -343,6 +343,18 @@ public:
 		const std::array<float, 4> values {constants[0], constants[1], constants[2], constants[3]};
 		Run([=](vk::CommandBuffer command) { command.setBlendConstants(values.data()); });
 	}
+	void setCullMode(vk::CullModeFlags mode) const {
+		Run([=](vk::CommandBuffer command) { command.setCullMode(mode); });
+	}
+	void setFrontFace(vk::FrontFace face) const {
+		Run([=](vk::CommandBuffer command) { command.setFrontFace(face); });
+	}
+	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		Run([=](vk::CommandBuffer command) { command.setDepthBoundsTestEnable(enable); });
+	}
+	void setDepthBounds(float min_bounds, float max_bounds) const {
+		Run([=](vk::CommandBuffer command) { command.setDepthBounds(min_bounds, max_bounds); });
+	}
 	void setDepthTestEnable(vk::Bool32 enable) const {
 		Run([=](vk::CommandBuffer command) { command.setDepthTestEnable(enable); });
 	}
