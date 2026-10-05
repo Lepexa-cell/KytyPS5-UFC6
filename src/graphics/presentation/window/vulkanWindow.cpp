@@ -514,6 +514,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	if (Config::ProfilerEnabled() && supported_features12.hostQueryReset == VK_TRUE) {
+		// The host GPU timeline resets its timestamp queries from the host.
+		features12.hostQueryReset         = VK_TRUE;
+		graphics.host_query_reset_enabled = true;
+	}
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -1226,6 +1231,17 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+		}
+		// --profile: the host GPU timeline reads the GPU clock to line it up with Tracy's.
+		if (Config::ProfilerEnabled()) {
+			for (const auto* extension: {VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
+			                             VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME}) {
+				if (HasExtension(available_extensions, extension)) {
+					device_extensions.push_back(extension);
+					graphic_ctx.calibrated_timestamps_enabled = true;
+					break;
+				}
+			}
 		}
 		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);

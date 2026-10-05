@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -1401,6 +1402,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	GpuTiming::Before(m_context, buffer);
+	int64_t gpu_zone = -1;
+	if (Profiler::g_counters) {
+		const bool     ps   = state.ps_active;
+		const uint64_t hash = ps ? state.ps_input_info.stage.program->shader_hash
+		                         : vertex_stages.back().stage.program->shader_hash;
+		char           name[32];
+		const int      size = std::snprintf(name, sizeof(name), "%s %016" PRIx64, ps ? "PS" : "VS", hash);
+		gpu_zone = GpuProfiler::Begin(m_context, buffer, name, static_cast<size_t>(size), 0x4e79a7);
+	}
 	if (mesh_active) {
 		if (mesh_indirect_buffer) {
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect_buffer, mesh_indirect_offset, 1, 16u);
@@ -1435,6 +1445,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 	Profiler::Add(Profiler::Counter::Draws);
+	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::After(m_context, buffer,
 	                 state.ps_active ? state.ps_input_info.stage.program->shader_hash
 	                                 : vertex_stages.back().stage.program->shader_hash,

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/gpuProfiler.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -68,6 +69,16 @@ static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* grou
 	     ShaderDeclaredHash(cs.cs_regs.data_addr), groups, user_data.c_str());
 }
 namespace {
+
+// A host GPU zone for a dispatch (gpuProfiler.h), named by its shader.
+int64_t BeginGpuZone(RenderContext& context, CommandBuffer& buffer, uint64_t hash) {
+	if (!Profiler::g_counters) {
+		return -1;
+	}
+	char      name[32];
+	const int size = std::snprintf(name, sizeof(name), "CS %016" PRIx64, hash);
+	return GpuProfiler::Begin(context, buffer, name, static_cast<size_t>(size), 0xf28e2b);
+}
 
 // The rollback below drains the GPU twice per dispatch and almost never fires once a shader's
 // pages are resident (one retry in a whole run, against ~2500 protected dispatches a frame). A
@@ -650,8 +661,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
+		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		Profiler::Add(Profiler::Counter::Dispatches);
+		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch", program.shader_hash,
 		               (static_cast<uint64_t>(thread_group_x) << 32u) |
@@ -758,8 +771,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
+		const auto gpu_zone = BeginGpuZone(m_context, buffer, program.shader_hash);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 		Profiler::Add(Profiler::Counter::Dispatches);
+		GpuProfiler::End(buffer, gpu_zone);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

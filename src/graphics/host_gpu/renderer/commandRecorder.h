@@ -204,6 +204,9 @@ public:
 			command.updateBuffer(buffer, offset, size, copy);
 		});
 	}
+	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {
+		Run([=](vk::CommandBuffer command) { command.writeTimestamp(stage, pool, query); });
+	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });

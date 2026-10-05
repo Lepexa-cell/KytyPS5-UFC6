@@ -53,6 +53,9 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               diagnostic_checkpoints_enabled        = false;
+	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
+	bool                               host_query_reset_enabled              = false;
+	bool                               calibrated_timestamps_enabled         = false;
 	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
