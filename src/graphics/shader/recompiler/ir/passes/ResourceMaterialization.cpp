@@ -1641,8 +1641,11 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 			const auto control = snapshot.samplers[i].dwords[2];
 			const auto filter = (control >> 26u) & 3u;
 			// MipNone always selects the base level. Explicit point gathers currently require
-			// encoded-zero primary and secondary bias; linear primary-mip selection is unsupported.
-			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
+			// encoded-zero primary and secondary bias. A gather returns the texels of one level,
+			// so linear mip filtering gathers the nearest level, as point does (GatherMip rounds):
+			// the game's HiZ compute shader 0x37ab7d3ab9bff0b9 samples linearly, and rejecting it
+			// skipped its dispatches every frame (the jungle floor went missing).
+			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u)) {
 				return SpecializationFail(
 				    "explicit-LOD gather requires mip filtering None or Point with zero LOD biases");
 			}
