@@ -378,6 +378,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 // Runs on the GPU thread. Returns 0 when the access may proceed, or (asynchronous readback only)
 // the tick whose download publication the caller must wait for before asking again.
+// The readback window (KYTY_READBACK_WINDOW_KB, default 512; 0 reads only the requested pages,
+// as upstream does).
+static uint64_t ReadbackWindow() {
+	static const uint64_t window = [] {
+		const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {512}) * 1024u;
+	}();
+	return window;
+}
+
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -441,6 +451,39 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			}
 			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
 		}
+		if (async && ReadbackWindow() != 0) {
+			// The whole download window, as the synchronous path lifts it: page by page, each
+			// page of the window faulted on its own and went through the GPU thread again.
+			const auto window = ReadbackWindow();
+			const auto begin  = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
+			const auto end    = std::min(begin + window, buffer.CpuAddress() + buffer.Size());
+			std::vector<uint64_t> current;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+				     page += TRACKER_PAGE_SIZE) {
+					if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+					    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+						current.push_back(page);
+					}
+				}
+			}
+			// One lift per run of neighbouring pages: each lift is a protection change, and
+			// page by page they were most of the GPU thread's VirtualProtect calls.
+			for (size_t first = 0; first < current.size();) {
+				size_t last = first + 1;
+				while (last < current.size() &&
+				       current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
+					last++;
+				}
+				const auto run_begin = current[first];
+				const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
+				if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
+				}
+				first = last;
+			}
+		}
 		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -473,18 +516,30 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		}
 	}
 
+	// Widen nearby CPU reads so they share one GPU drain. Upstream (0ce84e59) reads only the
+	// requested pages; Wolverine's game threads read ~2,500 GPU-written pages a frame at the Leap
+	// Attack prompt, each its own fault and download that way (7.5 fps against 20.3).
+	auto window_begin = vaddr;
+	auto window_end   = vaddr + size;
+	if (const auto window = ReadbackWindow(); window != 0) {
+		const auto buffer_begin = buffer.CpuAddress();
+		const auto buffer_end   = buffer_begin + buffer.Size();
+		window_begin = std::max(Common::AlignDown(vaddr, window), buffer_begin);
+		window_end   = std::min(std::max(window_begin + window, vaddr + size), buffer_end);
+	}
+
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
 		const auto tick = m_scheduler.CurrentTick();
-		if (DownloadBufferMemory<true>(buffer, vaddr, size)) {
+		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin)) {
 			m_scheduler.Flush();
 			m_last_async_download_tick = tick;
 			return tick;
 		}
-	} else if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
