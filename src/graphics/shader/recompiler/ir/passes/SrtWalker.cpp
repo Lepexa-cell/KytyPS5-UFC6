@@ -21,6 +21,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	if (runtime.read_specialization_memory == nullptr) {
+		runtime.map_clean_page = nullptr;
+	}
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -907,8 +910,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		return false;
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
+	const bool  vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	const auto  guard  = vector ? inst.Arg(4).Resolve() : Value {};
 	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
 		uint64_t enabled = 0;
 		if (!Arg(inst, 4, enabled)) return false;
@@ -927,51 +930,58 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
-	const auto base      = (high << 32u) | static_cast<uint32_t>(low);
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
+	const bool const_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+	const auto immediate    = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+	uint64_t   records      = 0;
+	uint64_t   word3        = 0;
+	if (const_buffer || vector) {
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
 			return false;
 		}
+	}
+	if (vector) {
+		// Only the uniform, unswizzled structured DWORD address is evaluated on the host, through
+		// the strict (specialization) reader. Not part of the replay traces.
 		if (immediate < 0) {
 			return false;
 		}
+		const auto base = (high << 32u) | static_cast<uint32_t>(low);
 		const auto byte_offset =
 		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
+		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
+			return false;
+		if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
+			result = 0u;
+			return true;
 		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		const auto size = static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			// A scalar buffer read past the end returns zero (PS5 ISA, scalar buffer addressing),
-			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
 			result = 0;
 			return true;
 		}
-		address = (base & AddressMask & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative =
-		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+		const auto address = (base & AddressMask & ~uint64_t {3}) + byte_offset;
+		uint32_t   word    = 0;
+		if (m_runtime.read_specialization_memory == nullptr) {
 			return false;
 		}
+		if (!m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
+			if (base == 0 && m_program.control_flow.empty()) {
+				result = 0;
+				return true;
+			}
+			m_read_failure         = "guest memory unreadable";
+			m_read_failure_address = address;
+			m_read_failure_offset  = 0;
+			m_read_failure_size    = 0;
+			return false;
+		}
+		result = word;
+		return true;
 	}
 	uint64_t base    = 0;
 	uint64_t address = 0;
-	switch (ComputeRawAddress(const_buffer, static_cast<int32_t>(mem.offset), low, high, offset,
-	                          records, base, address)) {
+	switch (ComputeRawAddress(const_buffer, immediate, low, high, offset, records, base, address)) {
 		case RawAddress::Fail: return false;
 		case RawAddress::Zero: result = 0; return true;
 		case RawAddress::Read: break;
@@ -981,9 +991,28 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+	if (m_runtime.map_clean_page != nullptr) {
+		// The reader's own first step (a GPU-clean page is read from its backing), without the
+		// callback chain and its page search for every dword. Raw reads are dword aligned.
+		const auto page = address >> m_runtime.page_shift;
+		if (page != m_mapped_page) {
+			m_mapped_page  = page;
+			m_mapped_bytes = m_runtime.map_clean_page(m_runtime.page_userdata,
+			                                          page << m_runtime.page_shift);
+		}
+		if (m_mapped_bytes != nullptr && (address & 3u) == 0u) {
+			std::memcpy(&word,
+			            m_mapped_bytes + (address & ((uint64_t {1} << m_runtime.page_shift) - 1u)),
+			            sizeof(word));
+			if (m_runtime.capture_ranges != nullptr) {
+				m_runtime.capture_ranges->emplace_back(address, sizeof(word));
+			}
+			result = word;
+			return true;
+		}
+	}
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			// A plan without control flow cannot tell a guarded read from an active one: a
 			// failed read through a null base there reads zero (CS 0x0b4b91abfed42248 tests
 			// s[4:5] against zero before its s_load; failing skipped its dispatch every frame).
@@ -1000,7 +1029,6 @@ bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 			return false;
 		}
 	} else {
-		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -1348,6 +1376,7 @@ struct SrtTraceOp {
 };
 
 struct SrtTraceCall {
+	Value       raw;                 // the requested value as given (matched without resolving)
 	const Inst* inst      = nullptr; // null: an immediate
 	uint64_t    immediate = 0;
 	uint32_t    end       = 0;       // ops up to here are evaluated for it
@@ -1447,8 +1476,14 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 	if (program.srt_trace != nullptr && program.srt_trace->key == key) {
 		m_mode  = Mode::Serve;
 		m_trace = program.srt_trace;
-		m_values.resize(m_trace->ops.size());
-		m_status.resize(m_trace->ops.size());
+		thread_local std::vector<uint64_t> values;
+		thread_local std::vector<uint8_t>  status;
+		if (values.size() < m_trace->ops.size()) {
+			values.resize(m_trace->ops.size());
+			status.resize(m_trace->ops.size());
+		}
+		m_values = values.data();
+		m_status = status.data();
 	} else if (++program.srt_trace_uses >= TraceAfterUses) {
 		m_mode      = Mode::Record;
 		m_recording = std::make_unique<SrtTrace>();
@@ -1549,6 +1584,7 @@ bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& result)
 	if (top) {
 		const auto resolved = value.Resolve();
 		SrtTraceCall call;
+		call.raw    = value;
 		call.inst   = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
 		call.end    = static_cast<uint32_t>(m_recording->ops.size());
 		call.result = frame.result.ref;
@@ -1735,12 +1771,19 @@ bool SrtTraceSession::Serve(SrtWalker& walker, Value value, uint64_t& result) {
 		Abandon("more calls than recorded");
 		return walker.EvaluateWideImpl(value, result);
 	}
-	const auto& call     = trace.calls[m_cursor];
-	const auto  resolved = value.Resolve();
-	const Inst* inst     = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
-	if (call.walker != walker.m_trace_id || call.inst != inst) {
+	const auto& call = trace.calls[m_cursor];
+	if (call.walker != walker.m_trace_id) {
 		Abandon("different call");
 		return walker.EvaluateWideImpl(value, result);
+	}
+	const Inst* inst = call.inst;
+	if (!(call.raw == value)) {
+		// The same value through another identity chain still matches.
+		const auto resolved = value.Resolve();
+		if ((resolved.IsImmediate() ? nullptr : resolved.TryInstruction()) != call.inst) {
+			Abandon("different call");
+			return walker.EvaluateWideImpl(value, result);
+		}
 	}
 	if (inst == nullptr) {
 		m_cursor++;
@@ -1766,8 +1809,8 @@ bool SrtTraceSession::RunOps(uint32_t end) {
 	const auto& trace = *m_trace;
 	const auto* ops   = trace.ops.data();
 	const auto* imms  = trace.immediates.data();
-	auto*       vals  = m_values.data();
-	auto*       stat  = m_status.data();
+	auto*       vals  = m_values;
+	auto*       stat  = m_status;
 	for (uint32_t i = m_next_op; i < end; i++) {
 		const auto& op = ops[i];
 		uint64_t    v[5] {};
