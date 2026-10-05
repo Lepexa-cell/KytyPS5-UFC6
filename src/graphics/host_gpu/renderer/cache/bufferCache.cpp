@@ -432,13 +432,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 		if (window_end > window_begin &&
 		    DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			// Must be CurrentTick(): DownloadBufferMemory queues its copy-out command into
-			// whatever recording is currently open, so that recording has to actually be
-			// submitted and complete before the staging buffer it wrote into can be read back.
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			if (is_write) {
+				// CPU write to GPU-owned memory must publish GPU bytes before overwriting.
+				// Must be CurrentTick(): DownloadBufferMemory queues its copy-out command into
+				// whatever recording is currently open, so that recording has to actually be
+				// submitted and complete before the staging buffer it wrote into can be read back.
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			} else {
+				// HTM secret #2 (deferred 1-frame readbacks): a CPU read of fresh GPU data
+				// must not force-submit the open frame recording and stall the GPU thread
+				// (~30 ms a fault). Leave the copy in the current recording so it rides to
+				// the next natural submit (batched RELEASE_MEM / progressive draw / flip);
+				// the guest reads the current host backing (previous-frame value, 1-frame
+				// latency). Unmark optimistically so the same bytes don't fault again
+				// before the queued download publishes via DeferPriorityOperation.
+				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+			}
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -570,6 +582,23 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
+	// HTM secret #1 (UFC 60 FPS): round new buffers up to 1 MB granularity to cut
+	// VkBuffer creation churn 5-10x and double draw throughput. Clamped to the guest
+	// region end so the span stays a valid GuestRange and never crosses the
+	// lower/extended gap; ResolveOverlaps below re-absorbs neighbours inside the
+	// rounded window so the non-overlapping invariant holds.
+	{
+		constexpr uint64_t kBufferGranularity = 1024 * 1024; // 1 MB
+		const uint64_t     region_end =
+		    vaddr < LOWER_ADDRESS_SIZE
+		        ? LOWER_ADDRESS_SIZE
+		        : LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
+		const uint64_t rounded_end = vaddr + Common::AlignUp(size, kBufferGranularity);
+		const uint64_t clamped_end = std::min(region_end, rounded_end);
+		if (clamped_end > end) {
+			size = clamped_end - vaddr;
+		}
+	}
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	// A mirror far larger than the request means the merge, not a descriptor, chose this

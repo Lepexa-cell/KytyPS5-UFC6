@@ -326,7 +326,14 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 }
 
 void CommandScheduler::BeginPresentedFrame() {
-	m_frame_submits = 0;
+	// Per-presented-frame batch windows: a new frame starts with a fresh submit budget
+	// and empty RELEASE_MEM / draw batch counters, so leftover counts can't force an
+	// immediate micro-flush at the start of the frame (161-flush elimination: submits only
+	// in handful-sized batches via CompleteReleaseMemWrite/Interrupt/CompleteDraw).
+	m_frame_submits                   = 0;
+	m_recorded_release_mem_writes     = 0;
+	m_recorded_release_mem_interrupts = 0;
+	m_recorded_draws                  = 0;
 }
 
 void CommandScheduler::FlushAndWait() {
