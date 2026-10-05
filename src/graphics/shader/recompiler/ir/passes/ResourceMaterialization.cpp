@@ -1047,6 +1047,118 @@ bool BoundableWriteOperand(const Program& program, Value value, Value predicate,
 
 } // namespace
 
+// Flat slots the host never needs, so their bytes can be left to the GPU when it wrote them
+// (SrtGpuFill): the slot's value is a raw scalar read whose address comes from user data and
+// immediates alone, and no value the host evaluates refers to the slot (descriptor dwords and
+// keys, branch conditions, uniform fills, buffer write bounds, other reads' addresses). The host
+// then only uploads the flat buffer; the shader reads the slot.
+static std::vector<uint8_t> GpuFillSlots(const ResourcePlan& plan) {
+	const auto           count = plan.srt_reads.size();
+	std::vector<uint8_t> host(count, 0u);
+	std::vector<Value>   pending;
+	std::unordered_set<const Inst*> visited;
+	const auto mark = [&](Value root) {
+		pending.push_back(root);
+		while (!pending.empty()) {
+			const auto  value = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst  = value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst->Arg(1).Resolve();
+				if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < count) {
+					host[slot.U32()] = 1u;
+					pending.push_back(plan.srt_reads[slot.U32()].value);
+				}
+				continue;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				pending.push_back(inst->Arg(arg));
+			}
+		}
+	};
+	for (const auto& source: plan.descriptor_sources) {
+		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
+			mark(source.dwords[dword]);
+		}
+		if (source.indirect_descriptor.has_value()) {
+			mark(source.indirect_descriptor->key_count);
+			mark(source.indirect_descriptor->selector_first);
+			mark(source.indirect_descriptor->selector_mask);
+		}
+	}
+	for (const auto& block: plan.control_flow) {
+		mark(block.condition);
+	}
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+		mark(plan.uniform_fill.values[i]);
+	}
+	for (const auto& write: plan.buffer_writes) {
+		mark(write.index);
+		mark(write.offset);
+		mark(write.soffset);
+		mark(write.predicate);
+	}
+	// Another read's address operands (the read itself is not a host use of its own slot).
+	for (const auto& read: plan.srt_reads) {
+		if (const auto* inst = read.value.Resolve().TryInstruction(); inst != nullptr) {
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				mark(inst->Arg(arg));
+			}
+		}
+	}
+	// The read's own address must not depend on memory: one host read per slot, the slot's own.
+	const auto memory_free = [&](const Inst& read) {
+		std::vector<Value>              stack;
+		std::unordered_set<const Inst*> seen;
+		for (size_t arg = 0; arg < read.NumArgs(); arg++) {
+			stack.push_back(read.Arg(arg));
+		}
+		while (!stack.empty()) {
+			const auto* inst = stack.back().Resolve().TryInstruction();
+			stack.pop_back();
+			if (inst == nullptr || !seen.insert(inst).second) {
+				continue;
+			}
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::ReadConst:
+				case ValueOpcode::LoadAddressU32:
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::LoadBufferU32:
+				case ValueOpcode::Phi: return false;
+				default: break;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				stack.push_back(inst->Arg(arg));
+			}
+		}
+		return true;
+	};
+	std::vector<uint8_t> fill(count, 0u);
+	for (size_t slot = 0; slot < count; slot++) {
+		const auto* inst = plan.srt_reads[slot].value.Resolve().TryInstruction();
+		if (inst == nullptr || host[slot] != 0u ||
+		    (slot < plan.clean_flat_slots.size() && plan.clean_flat_slots[slot] != 0u)) {
+			continue;
+		}
+		const auto op    = inst->GetOpcode();
+		const auto index = inst->Flags<MemoryFlags>().index;
+		if ((op != ValueOpcode::LoadAddressU32 && op != ValueOpcode::ReadConstBuffer) ||
+		    index >= plan.memory_info.size()) {
+			continue;
+		}
+		const auto kind = plan.memory_info[index].kind;
+		if (!((op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
+		      (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer))) {
+			continue;
+		}
+		fill[slot] = memory_free(*inst) ? 1u : 0u;
+	}
+	return fill;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1200,6 +1312,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			plan.buffer_writes_bounded[i] = 0u;
 		}
 	}
+	plan.gpu_fill_slots = GpuFillSlots(plan);
 	return plan;
 }
 

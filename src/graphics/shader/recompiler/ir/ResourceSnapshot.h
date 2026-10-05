@@ -63,6 +63,16 @@ struct BufferWriteExtent {
 	bool operator==(const BufferWriteExtent&) const = default;
 };
 
+// A flat SRT slot the GPU fills: its bytes at `address` were GPU-written when the refresh ran, and
+// only the shader uses the value, so the renderer copies them into the uploaded flat buffer on the
+// GPU before the command instead of the host waiting for the GPU to read them.
+struct SrtGpuFill {
+	uint32_t flat_offset = 0;
+	uint64_t address     = 0;
+
+	bool operator==(const SrtGpuFill& other) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<BufferWriteExtent>      buffer_write_extents;
 	std::vector<BindlessHeapUse>        bindless_heaps;
@@ -73,6 +83,7 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	UniformFill                 uniform_fill;
+	std::vector<SrtGpuFill>     gpu_fills;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

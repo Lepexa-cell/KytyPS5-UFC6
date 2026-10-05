@@ -27,6 +27,10 @@ struct SrtRuntime {
 	// indirect dispatch) and workgroup size bound the invocation IDs in buffer write extents.
 	std::array<uint32_t, 3>   workgroup_count            = {};
 	std::array<uint32_t, 3>   workgroup_size             = {};
+	// GPU-filled flat slots (SrtGpuFill): whether bytes are GPU-written, and where the refresh
+	// lists the slots it left to the GPU. Both null: every slot is read on the host.
+	bool (*gpu_written)(uint64_t address, uint64_t size) = nullptr;
+	std::vector<SrtGpuFill>* gpu_fills                    = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -83,6 +87,9 @@ private:
 	const SrtNativeCode*            m_native      = nullptr;
 	SrtNativeMode                   m_native_mode = SrtNativeMode::Self;
 	SrtNativeFrame                  m_native_frame;
+	// While a GPU-fillable slot is refreshed: its flat offset (its own read is the only raw read).
+	bool           m_fill_active  = false;
+	uint32_t       m_fill_offset  = 0;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
 	uint64_t    m_read_failure_address = 0;

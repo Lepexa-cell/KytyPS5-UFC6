@@ -655,6 +655,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
+	if (m_fill_active && m_runtime.gpu_written(address, sizeof(uint32_t))) {
+		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
+		// the command (SrtGpuFill), where reading them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
+	}
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			// A failed load through a null base pointer sits on a path the shader guards with a
@@ -1221,6 +1228,20 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) {
 			return report("value unreadable", index, read.flat_offset, clean);
+		}
+		if (!clean && index < m_program.gpu_fill_slots.size() &&
+		    m_program.gpu_fill_slots[index] != 0u && m_runtime.gpu_written != nullptr &&
+		    m_runtime.gpu_fills != nullptr) {
+			// Through the interpreter (it reads through EvaluateRawRead), not the native tables:
+			// EvaluateRawRead leaves GPU-written bytes to the GPU.
+			evaluator.m_fill_active = true;
+			evaluator.m_fill_offset = read.flat_offset;
+			const bool ok           = evaluator.Evaluate(read.value, flat[read.flat_offset]);
+			evaluator.m_fill_active = false;
+			if (!ok) {
+				return report("value unreadable", index, read.flat_offset, clean);
+			}
+			continue;
 		}
 		if (evaluator.UseNativeTables()) {
 			uint64_t wide = 0;
