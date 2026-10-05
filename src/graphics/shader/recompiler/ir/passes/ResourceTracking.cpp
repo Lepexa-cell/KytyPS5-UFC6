@@ -887,10 +887,35 @@ private:
 		// 14 compute shaders at Wolverine's title used BDA instead of 5, each paying PrepareBda,
 		// the fault-buffer pass and recovery drains. KYTY_SRT_RAW_READS_ON_GPU=1 follows upstream.
 		if (!SrtRawReadsOnGpu()) {
+			// Memory the shader itself writes is not snapshotted: its waves must see the writes
+			// (upstream's "mutable scalar data" test). A pointer whose base is also the base of
+			// a written or atomically updated buffer or address stays in the shader.
+			std::vector<Value> written_bases;
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					const auto op     = inst.GetOpcode();
+					const auto buffer = BufferAccessOf(op);
+					if ((buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+					     AddressOpcodeInfoOf(op).access == AddressAccess::Write) &&
+					    inst.NumArgs() != 0) {
+						if (const auto* handle = inst.Arg(0).ResolveInstruction();
+						    handle != nullptr && handle->NumArgs() != 0) {
+							written_bases.push_back(handle->Arg(0));
+						}
+					}
+				}
+			}
+			const auto written = [&](const Inst& load) {
+				const auto* handle = load.Arg(0).ResolveInstruction();
+				return handle == nullptr || handle->NumArgs() == 0 ||
+				       std::ranges::any_of(written_bases, [&](const Value& base) {
+					       return EquivalentValue(m_program, base, handle->Arg(0));
+				       });
+			};
 			for (auto* block: m_program.blocks) {
 				for (auto& inst: *block) {
 					uint32_t index = 0;
-					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && !written(inst) &&
 					    ScalarReadMemory(inst, index) != nullptr &&
 					    inst.Arg(1).Resolve().IsImmediate() &&
 					    ValidateRuntimeValue(m_program, Value(&inst)))
