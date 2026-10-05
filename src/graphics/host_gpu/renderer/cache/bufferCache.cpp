@@ -388,6 +388,14 @@ static uint64_t ReadbackWindow() {
 	return window;
 }
 
+static bool ReadbackRetick() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_READBACK_RETICK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
                                      bool from_gpu_thread, bool async) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -532,8 +540,17 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	if (async) {
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
-		const auto tick = m_scheduler.CurrentTick();
+		auto tick = m_scheduler.CurrentTick();
 		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin)) {
+			// The tick of the last copy, not of the first: a download ring that wraps within this
+			// recording submits it (StreamBuffer::WaitPendingOperations), and the later copies
+			// and their publication then land in the next tick. A caller waiting for the earlier
+			// tick went on before its bytes were published, and the GPU thread then lifted the
+			// page's protection over the older bytes (Jetsku bf8d6148, same idea for writers).
+			// KYTY_READBACK_RETICK=0 keeps the tick from before the download.
+			if (ReadbackRetick()) {
+				tick = m_scheduler.CurrentTick();
+			}
 			m_scheduler.Flush();
 			m_last_async_download_tick = tick;
 			return tick;
