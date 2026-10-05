@@ -497,7 +497,8 @@ SampleOffset SampleOffsetFor(ValueEmitContext& ctx, const IR::Inst& inst, const 
 // (relative to the view's base, clamped to the view's levels). Exact for single-level reads up
 // to float rounding; with linear mip filtering the coarser level moves by half the offset.
 uint32_t ApplyDynamicSampleOffset(EmitterState& state, uint32_t resource, uint32_t coord,
-                                  ImageDimension dimension, uint32_t packed, uint32_t level_f32) {
+                                  ImageDimension dimension, uint32_t packed, uint32_t level_f32,
+                                  uint32_t array_index = 0u) {
 	static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 	if (!warned.test_and_set(std::memory_order_relaxed)) {
 		std::fputs("Warning: IMAGE_SAMPLE*_O offsets that are not constant or lie outside -8..7 "
@@ -507,7 +508,7 @@ uint32_t ApplyDynamicSampleOffset(EmitterState& state, uint32_t resource, uint32
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
 	const auto& info       = ImageDimensionInfoFor(dimension);
 	const auto  components = info.spatial_components;
-	const auto  image      = LoadSampledImageDescriptor(state, resource);
+	const auto  image      = LoadImageDescriptor(state, resource, 0u, array_index);
 	const auto  levels     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
 	const auto floored = state.builder.AllocateId();
@@ -881,89 +882,6 @@ static uint32_t BindlessSlot(ValueEmitContext& ctx, const IR::ImageResource& ima
 	return slot;
 }
 
-static uint32_t GlslExt(EmitterState& state, uint32_t type, uint32_t opcode,
-                        std::initializer_list<uint32_t> args) {
-	const auto            result = state.builder.AllocateId();
-	std::vector<uint32_t> words {spv::OpExtInst, type, result, GlslStd450(state), opcode};
-	words.insert(words.end(), args.begin(), args.end());
-	state.builder.AddFunction(words);
-	return result;
-}
-
-// IMAGE_GATHER4_L on a 2D or 2D-array image. Core Vulkan gathers take no explicit LOD, so fetch
-// the 2x2 footprint at the rounded level instead, with clamp-to-edge addressing, returning the
-// components in gather order: (i0, j1), (i1, j1), (i1, j0), (i0, j0).
-static uint32_t EmitGatherAtLod(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t coord,
-                                uint32_t lod, bool arrayed,
-                                Prospero::TextureNumericClass numeric_class, uint32_t component) {
-	auto& state = ctx.state;
-	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image   = LoadSampledImageDescriptor(state, mem.resource);
-	const auto i32     = TypeI32(state);
-	const auto f32     = TypeF32(state);
-	const auto half    = ConstantF32(state, 0x3f000000u);
-	const auto Extract = [&](uint32_t type, uint32_t composite, uint32_t index) {
-		const auto value = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, type, value, composite, index);
-		return value;
-	};
-	const auto Round = [&](uint32_t value) {
-		return Unary(state, spv::OpConvertFToS, i32,
-		             GlslExt(state, f32, GLSLstd450Floor,
-		                     {Binary(state, spv::OpFAdd, f32, value, half)}));
-	};
-	const auto Clamp = [&](uint32_t value, uint32_t last) {
-		return GlslExt(state, i32, GLSLstd450SClamp, {value, ConstantI32(state, 0), last});
-	};
-	const auto levels = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageQueryLevels, i32, levels, image);
-	const auto level =
-	    Clamp(Round(lod), Binary(state, spv::OpISub, i32, levels, ConstantI32(state, 1)));
-	const uint32_t size_components = arrayed ? 3u : 2u;
-	const auto     size            = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpImageQuerySizeLod, TypeI32Vector(state, size_components), size,
-	                          image, level);
-	// Texels i0 = floor(c * extent - 0.5) and i0 + 1 on one axis, clamped to the level.
-	const auto Axis = [&](uint32_t axis) {
-		const auto extent = Extract(i32, size, axis);
-		const auto scaled = Binary(state, spv::OpFMul, f32, Extract(f32, coord, axis),
-		                           Unary(state, spv::OpConvertSToF, f32, extent));
-		const auto first  = Unary(state, spv::OpConvertFToS, i32,
-		                          GlslExt(state, f32, GLSLstd450Floor,
-		                                  {Binary(state, spv::OpFSub, f32, scaled, half)}));
-		const auto last   = Binary(state, spv::OpISub, i32, extent, ConstantI32(state, 1));
-		return std::pair {Clamp(first, last),
-		                  Clamp(Binary(state, spv::OpIAdd, i32, first, ConstantI32(state, 1)), last)};
-	};
-	const auto [x0, x1] = Axis(0);
-	const auto [y0, y1] = Axis(1);
-	uint32_t   layer    = 0;
-	if (arrayed) {
-		layer = Clamp(Round(Extract(f32, coord, 2)),
-		              Binary(state, spv::OpISub, i32, Extract(i32, size, 2), ConstantI32(state, 1)));
-	}
-	const auto vector_type = ImageVectorType(state, numeric_class, 4);
-	const auto scalar_type = ImageScalarType(state, numeric_class);
-	const auto Fetch       = [&](uint32_t x, uint32_t y) {
-        const auto position = state.builder.AllocateId();
-        if (arrayed) {
-            state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(state, 3), position,
-			                                x, y, layer);
-        } else {
-            state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(state, 2), position,
-			                                x, y);
-        }
-        const auto texel = state.builder.AllocateId();
-        state.builder.AddFunction(spv::OpImageFetch, vector_type, texel, image, position,
-		                                spv::ImageOperandsLodMask, level);
-        return Extract(scalar_type, texel, component);
-	};
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result, Fetch(x0, y1),
-	                          Fetch(x1, y1), Fetch(x1, y0), Fetch(x0, y0));
-	return result;
-}
-
 // The bindless sampler array slot of the sampler handle's key: region + key while the key is
 // inside the heap's entry count (both from the flattened SRT, patched by the host), otherwise
 // slot 0, the default sampler.
@@ -1257,7 +1175,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                          0u);
 				}
 				coord = ApplyDynamicSampleOffset(state, resource, coord, candidate.dimension,
-				                                 sample_offset.packed, level);
+				                                 sample_offset.packed, level, array_index);
 			}
 			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
 			const auto            sample  = state.builder.AllocateId();

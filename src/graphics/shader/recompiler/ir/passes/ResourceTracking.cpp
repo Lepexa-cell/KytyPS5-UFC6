@@ -417,12 +417,9 @@ public:
 		for (const auto& plan: m_indirect_descriptors) {
 			if (plan.handle->GetOpcode() != ValueOpcode::GetImageResource || plan.reads[0] == nullptr)
 				continue;
-			// A read the shader also uses as data keeps its value for its other users, and a word
-			// resolved through a Phi web (ResolveDescriptorPhi) keeps the web: the handle takes
-			// the key itself.
-			if (!plan.planning_only[0] ||
-			    plan.handle->Arg(0).Resolve() != Value(const_cast<Inst*>(plan.reads[0])))
-				plan.handle->SetArg(0, plan.key);
+			// A read the shader also uses as data keeps its value for its other users; only the
+			// handle takes the key.
+			if (!plan.planning_only[0]) plan.handle->SetArg(0, plan.key);
 			for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 				const auto* read = plan.reads[dword];
 				if (!plan.planning_only[dword]) continue;
@@ -2243,7 +2240,6 @@ private:
 			indirect.table_stride = table_stride;
 			indirect.bindless     = true;
 			material_source       = {};
-		}
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;

@@ -894,59 +894,6 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	return left;
 }
 
-// A thread-dimension dispatch starts its padding lanes with EXEC cleared, through
-// GlobalInvocationId < DispatchThreadCount on each axis (TranslateProgram). The fill
-// fast path only runs for whole-workgroup dispatches (ResolveComputeBufferFill), where
-// that bound holds for every lane, so it enables a store just like `true`.
-static bool IsDispatchBoundsEnable(Value value, uint32_t depth = 0) {
-	value = value.Resolve();
-	if (value == Value(true)) {
-		return true;
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr || depth == 8u) {
-		return false;
-	}
-	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
-		return IsDispatchBoundsEnable(inst->Arg(0), depth + 1u) &&
-		       IsDispatchBoundsEnable(inst->Arg(1), depth + 1u);
-	}
-	if (inst->GetOpcode() != ValueOpcode::ULessThan32) {
-		return false;
-	}
-	const auto builtin_axis = [](Value operand, StageInputKind kind, Value& axis) {
-		const auto* builtin = operand.Resolve().TryInstruction();
-		if (builtin == nullptr || builtin->GetOpcode() != ValueOpcode::GetBuiltin ||
-		    builtin->NumArgs() != 2u ||
-		    builtin->Arg(0).Resolve() != Value(static_cast<uint32_t>(kind))) {
-			return false;
-		}
-		axis = builtin->Arg(1).Resolve();
-		return axis.IsImmediate();
-	};
-	Value id_axis;
-	Value count_axis;
-	return builtin_axis(inst->Arg(0), StageInputKind::GlobalInvocationId, id_axis) &&
-	       builtin_axis(inst->Arg(1), StageInputKind::DispatchThreadCount, count_axis) &&
-	       id_axis == count_axis;
-}
-
-// A VGPR written under EXEC keeps its old value in disabled lanes, so a dispatch bound in
-// EXEC leaves select(enable, value, old). Enabled lanes, the only ones a store writes,
-// see the value.
-static Value EnabledValue(Value value, Value enable) {
-	value  = value.Resolve();
-	enable = enable.Resolve();
-	for (;;) {
-		const auto* select = value.TryInstruction();
-		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
-		    select->Arg(0).Resolve() != enable) {
-			return value;
-		}
-		value = select->Arg(1).Resolve();
-	}
-}
-
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
@@ -978,9 +925,6 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
 	}
 	const auto& memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
-	// Stores write only enabled lanes; buffer fills are enabled by EXEC.
-	const auto enable =
-	    store->GetOpcode() == ValueOpcode::ImageWrite ? Value(true) : store->Arg(5).Resolve();
 	UniformFillPlan result;
 	result.fill.resource = memory.resource;
 	Value data;
@@ -989,7 +933,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    !IsDispatchBoundsEnable(store->Arg(3))) return {};
+		    !IsFullDispatchPredicate(store->Arg(3))) return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -1030,7 +974,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.kind = UniformFillKind::Buffer;
 		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
 		result.fill.words = memory.data_dwords;
-		data = EnabledValue(store->Arg(4), store->Arg(5));
+		data = store->Arg(4);
 	}
 	data = ResolveActiveU32(data, guard);
 	const auto*          vector = data.TryInstruction();

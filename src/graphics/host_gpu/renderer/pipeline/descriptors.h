@@ -49,7 +49,6 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
-	std::array<uint32_t, 3>               dispatch_dimensions {};
 	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
 	// resolved images must be readable for this draw (stable: the table keeps heaps in a deque).
 	std::vector<std::array<uint32_t, 3>>  bindless_patches;

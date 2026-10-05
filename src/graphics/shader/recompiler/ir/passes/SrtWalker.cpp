@@ -119,7 +119,6 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::IMul32:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::IMul64:
-		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -522,10 +521,6 @@ float SrtWalker::Float32(uint64_t bits) {
 
 bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	value = value.Resolve();
-	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
-		result = 1u;
-		return true;
-	}
 	if (value.IsImmediate()) {
 		switch (value.GetType()) {
 			case Type::U1: result = value.U1(); return true;
@@ -826,7 +821,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return EvaluateRawRead(inst, result);
 			}
 			break;
-		case ValueOpcode::LoadBufferU32: return EvaluateBufferRead(inst, result);
 		case ValueOpcode::IAdd32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a + b);
@@ -1094,10 +1088,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::ULessThanEqual32:
-			if (!binary()) return false;
-			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-			return true;
 		case ValueOpcode::SGreaterThanEqual32:
 			if (binary()) {
 				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=

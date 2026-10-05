@@ -1741,7 +1741,8 @@ void TestBoundedBufferWrites() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     SrtRuntime runtime{.user_data = userdata};
-    runtime.workgroup_count = {options.unknown_groups ? 0u : 4u, 1u, 1u};
+    const std::array<uint32_t, 3> groups{options.unknown_groups ? 0u : 4u, 1u, 1u};
+    runtime.workgroup_counts = groups;
     runtime.workgroup_size = {64u, 1u, 1u};
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "bounded-write fixture did not materialize");

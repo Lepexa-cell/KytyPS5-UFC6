@@ -367,13 +367,12 @@ private:
 				return;
 			}
 		}
-		// R11 = base = ((high << 32) | low32) & AddressMask.
+		// R11 = base = (high << 32) | low32: a raw scalar address keeps its upper bits, as the
+		// interpreter does since upstream cd9fc6ff; a constant buffer masks it below.
 		a.Load(R11, RBP, -16);
 		a.ShlI(R11, 32);
 		a.Load32(RCX, RBP, -8);
 		a.Or(R11, RCX);
-		a.MovRI(RCX, AddressMask);
-		a.And(R11, RCX);
 		const auto read = a.NewLabel();
 		if (const_buffer) {
 			const auto zero = a.NewLabel();
@@ -398,8 +397,8 @@ private:
 			a.Sub(RDX, RCX);
 			a.CmpI(RDX, 4);
 			a.Jcc(CondB, zero);
-			a.MovRR(RAX, R11);
-			a.AndI(RAX, -4);
+			a.MovRI(RAX, AddressMask & ~uint64_t {3});
+			a.And(RAX, R11);
 			a.Add(RAX, RCX);
 			a.Jmp(read);
 			a.Bind(zero);
@@ -416,13 +415,13 @@ private:
 		a.AndI32(RCX, ~3u);
 		a.MovRI(RDX, static_cast<uint64_t>(immediate & ~int64_t {3}));
 		a.Add(RCX, RDX);
-		// RAX = (base & ~3) + relative, within the 48-bit address space (AddSignedAddress).
+		// RAX = (base & ~3) + relative, without wrapping (AddSignedAddress).
 		a.MovRR(RAX, R11);
 		a.AndI(RAX, -4);
 		const auto negative = a.NewLabel();
 		a.Test(RCX, RCX);
 		a.Jcc(CondL, negative);
-		a.MovRI(RDX, AddressMask);
+		a.MovRI(RDX, UINT64_MAX);
 		a.Sub(RDX, RAX);
 		a.Cmp(RCX, RDX);
 		a.Jcc(CondA, fail);

@@ -449,18 +449,14 @@ struct BindingLayout {
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
-	bool                           has_dispatch_dimensions = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t DispatchDimensionsDword() const {
-		return BufferLengthDword() + memory_offset_count;
-	}
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return DispatchDimensionsDword() + (has_dispatch_dimensions ? 3u : 0u);
+		return BufferLengthDword() + memory_offset_count;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

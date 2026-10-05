@@ -15184,7 +15184,6 @@ public:
     }
     // Shader data carries each storage buffer's bound length in dwords, as
     // RenderExecutor::RebindBuffers does; shaders bound buffer accesses with it.
-    std::vector<u32> shader_data = compiled.packed_user_data;
     for (u32 i = 0; i < buffer_infos.size(); i++) {
       const auto slot = layout.BufferLengthDword() + i;
       if (slot < shader_data.size()) {
