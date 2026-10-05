@@ -27,6 +27,7 @@ target_link_libraries(common
 		kyty_git_version
 		spdlog::spdlog
 		ZArchive::zarchive
+		nlohmann_json::nlohmann_json
 )
 if (WIN32)
 	target_link_libraries(common PRIVATE dbghelp)

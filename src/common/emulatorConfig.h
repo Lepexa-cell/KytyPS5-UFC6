@@ -72,6 +72,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 	bool                   bindless_images_enabled     = false;
 	bool                   float_image_atomics_enabled = true;
@@ -123,6 +124,7 @@ bool VulkanValidationFatal();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
+bool TrophyEnabled();
 bool BindlessImagesEnabled();
 const std::string& GetSkipShaderHashes();
 bool FloatImageAtomicsEnabled();
