@@ -1100,13 +1100,12 @@ struct ShaderRefreshKey {
 	uint64_t gs_addr           = 0;
 	uint64_t ps_addr           = 0;
 	uint64_t gs_user_data_addr = 0;
-	uint64_t ps_user_data_addr = 0;
 	uint32_t color_output_mask = 0;
 	uint32_t shader_stages     = 0;
 	uint32_t prim_type         = 0;
 	uint32_t gs_user_sgpr      = 0;
 	uint32_t ps_user_sgpr      = 0;
-	uint32_t export_mapping[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	std::array<Prospero::ColorComponentMapping, 8> export_mapping {};
 	uint32_t gs_user_sgpr_values[16]                      = {};
 	uint32_t ps_user_sgpr_values[16]                      = {};
 	bool     ps_active                                    = false;
@@ -1139,7 +1138,6 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	key.gs_addr           = vertex_shader_info.gs_regs.data_addr;
 	key.ps_addr           = pixel_shader_info.ps_regs.data_addr;
 	key.gs_user_data_addr = vertex_shader_info.gs_regs.user_data_addr;
-	key.ps_user_data_addr = pixel_shader_info.ps_regs.user_data_addr;
 	key.color_output_mask = color_output_mask;
 	key.shader_stages     = ctx.GetShaderStages();
 	key.prim_type         = static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType());
@@ -1171,7 +1169,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)
 			        .export_mapping;
-			key.export_mapping[slot] = static_cast<uint32_t>(target_export_mapping[slot]);
+			key.export_mapping[slot] = target_export_mapping[slot];
 		}
 	}
 	if (t_refresh.valid && t_refresh.key == key) {
@@ -1825,21 +1823,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	// Fast path: a normal draw has no metadata/resolve/depth-copy work, so the render mutex
-	// (shared with present and GC) is not taken. The flag is a plain register read.
-	const bool metadata_ops = DrawMayNeedMetadataLock(buffer);
-	std::optional<Common::LockGuard> lock;
-	if (metadata_ops) {
-		lock.emplace(m_context.GetMutex());
-	}
+	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
 		                  -1);
 		return;
 	}
 
-	if (metadata_ops && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	                    ResolveColorTargets(buffer, args.render_target_slice_offset))) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
 	}
@@ -1953,19 +1945,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	const bool metadata_ops = DrawMayNeedMetadataLock(buffer);
-	std::optional<Common::LockGuard> lock;
-	if (metadata_ops) {
-		lock.emplace(m_context.GetMutex());
-	}
+	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
 		                  -1, -1);
 		return;
 	}
 
-	if (metadata_ops && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	                    ResolveColorTargets(buffer, args.render_target_slice_offset))) {
+	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
 		ResetBindings();
 		return;
 	}
