@@ -1404,15 +1404,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	GpuTiming::Before(m_context, buffer);
 	int64_t gpu_zone = -1;
 	if (Profiler::g_counters) {
-		const bool     ps   = state.ps_active;
-		const uint64_t hash = ps ? state.ps_input_info.stage.program->shader_hash
-		                         : vertex_stages.back().stage.program->shader_hash;
-		char           name[32];
-		const int      size = std::snprintf(name, sizeof(name), "%s %016" PRIx64, ps ? "PS" : "VS", hash);
+		// The draw's program, as its GPU zone's name and its command zone's text.
+		char      name[48];
+		const int size = std::snprintf(
+		    name, sizeof(name), "VS %016" PRIx64 " PS %016" PRIx64,
+		    vertex_stages.back().stage.program->shader_hash,
+		    state.ps_active ? state.ps_input_info.stage.program->shader_hash : 0);
 		gpu_zone = GpuProfiler::Begin(m_context, buffer, name, static_cast<size_t>(size), 0x4e79a7);
-		Profiler::CommandZone::Annotate(
-		    "VS %016" PRIx64 " PS %016" PRIx64, vertex_stages.back().stage.program->shader_hash,
-		    ps ? state.ps_input_info.stage.program->shader_hash : 0);
+		Profiler::CommandZone::Annotate("%s", name);
 	}
 	if (mesh_active) {
 		if (mesh_indirect_buffer) {
