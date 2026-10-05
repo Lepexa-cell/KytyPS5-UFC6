@@ -2127,6 +2127,14 @@ private:
 		indirect.table_offset = table_offset;
 		indirect.table_stride = table_stride;
 		indirect.workgroup_axis = WorkgroupAxis(key);
+		// The bindless arrays hold sampled images only: a handle a storage access uses is
+		// enumerated (upstream's plan) or rejected.
+		const bool sampled_only = std::ranges::all_of(handle.Uses(), [](const Use& use) {
+			return ImageOpcodeInfoOf(use.user->GetOpcode()).resource_class ==
+			       ImageResourceClass::Sampled;
+		});
+		const bool bindless = m_program.bindless_images && sampled_only &&
+		                      table_source.dword_count == 4u;
 		// Enumerate the keys the table can reach (upstream's plan), or, when bindless images are
 		// enabled and the heap is a buffer, look the key up at run time: an enumeration that
 		// passes here can still fail per draw (a material table of more records than the probe
@@ -2139,8 +2147,7 @@ private:
 				return true;
 			}
 			// The host enumerates unmasked keys; a masked key is looked up only at run time.
-			if ((m_program.bindless_images && table_source.dword_count == 4u) ||
-			    key_mask != UINT32_MAX) {
+			if (bindless || key_mask != UINT32_MAX) {
 				return false;
 			}
 			if (table_stride != 32u) {
@@ -2231,8 +2238,7 @@ private:
 			return true;
 		};
 		if (!enumerable()) {
-			if (!m_program.bindless_images || table_source.dword_count != 4u ||
-			    table_stride != 32u) {
+			if (!bindless || table_stride != 32u) {
 				return false;
 			}
 			indirect              = {};
@@ -2658,6 +2664,21 @@ private:
 	// an indirect image's table reads are: registered as buffers, they would bind a
 	// descriptor that dead-code elimination then deletes. Only the filtering and edge
 	// addressing can differ from the material's own sampler.
+	// An explicit-LOD gather takes its mip from the LOD, so its sampler must not filter between
+	// mips (upstream's materialization rejects linear mip filtering there): a stand-in sampler
+	// shared with such a gather filters mips by point.
+	bool UsedByLodGather(const Inst& sampler) const {
+		return std::ranges::any_of(sampler.Uses(), [&](const Use& use) {
+			const auto& user = *use.user;
+			if (user.GetOpcode() != ValueOpcode::ImageGatherRaw) {
+				return false;
+			}
+			const auto index = user.Flags<MemoryFlags>().index;
+			return index < m_program.memory_info.size() &&
+			       (m_program.memory_info[index].image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
+		});
+	}
+
 	void PlanDefaultSamplers() {
 		if (!Frontend::TranslationNonFatal()) {
 			return;
@@ -2732,7 +2753,11 @@ private:
 					stranded++;
 				}
 				for (uint32_t dword = 0; dword < 4u; dword++) {
-					sampler->SetArg(dword, Value(DefaultSampler[dword]));
+					auto word = DefaultSampler[dword];
+					if (dword == 2u && UsedByLodGather(*sampler)) {
+						word = (word & ~(3u << 26u)) | (1u << 26u); // point mip
+					}
+					sampler->SetArg(dword, Value(word));
 				}
 				// The walk resolves the handle again, from the fixed words.
 				std::erase_if(m_resolved_handles,
@@ -2802,9 +2827,14 @@ private:
 				    0xfffu << 12u,                           // max_lod 255.9
 				    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
 				    0x00000000u};
+				const bool point_mip = UsedByLodGather(*handle);
 				for (uint32_t dword = 0; dword < 4u; dword++) {
-					handle->SetArg(dword, Value(DefaultSampler[dword]));
-					descriptor.dwords[dword] = Value(DefaultSampler[dword]);
+					auto word = DefaultSampler[dword];
+					if (dword == 2u && point_mip) {
+						word = (word & ~(3u << 26u)) | (1u << 26u); // point mip
+					}
+					handle->SetArg(dword, Value(word));
+					descriptor.dwords[dword] = Value(word);
 				}
 				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
 				     "using a default sampler\n",
