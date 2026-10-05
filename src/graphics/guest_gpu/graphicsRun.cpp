@@ -56,6 +56,61 @@ struct DrawIndexedIndirectArgs {
 	uint32_t start_instance_location;
 };
 
+// The Tracy source locations of the PM4 packets that get a command zone (Profiler::CommandZone):
+// draws, dispatches, copies, memory writes and synchronization; not register writes and NOPs.
+static const tracy::SourceLocationData* Pm4ZoneLocation(uint32_t opcode, uint32_t r) {
+	struct Table {
+		std::array<tracy::SourceLocationData, 256>        ops {};
+		std::array<tracy::SourceLocationData, Pm4::R_NUM> custom {};
+	};
+	static const Table table = [] {
+		Table      result;
+		const auto op = [&](uint32_t code, const char* name) {
+			result.ops[code] = {name, "CommandProcessor::ProcessPm4", __FILE__, 0, 0};
+		};
+		const auto custom = [&](uint32_t code, const char* name) {
+			result.custom[code] = {name, "CommandProcessor::ProcessPm4", __FILE__, 0, 0};
+		};
+		op(Pm4::IT_DISPATCH_DIRECT, "PM4 DISPATCH_DIRECT");
+		op(Pm4::IT_DISPATCH_INDIRECT, "PM4 DISPATCH_INDIRECT");
+		op(Pm4::IT_DRAW_INDIRECT, "PM4 DRAW_INDIRECT");
+		op(Pm4::IT_DRAW_INDEX_INDIRECT, "PM4 DRAW_INDEX_INDIRECT");
+		op(Pm4::IT_DRAW_INDEX_2, "PM4 DRAW_INDEX_2");
+		op(Pm4::IT_DRAW_INDIRECT_MULTI, "PM4 DRAW_INDIRECT_MULTI");
+		op(Pm4::IT_DRAW_INDEX_AUTO, "PM4 DRAW_INDEX_AUTO");
+		op(Pm4::IT_DRAW_INDEX_OFFSET_2, "PM4 DRAW_INDEX_OFFSET_2");
+		op(Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, "PM4 DRAW_INDEX_INDIRECT_MULTI");
+		op(Pm4::IT_DISPATCH_DRAW, "PM4 DISPATCH_DRAW");
+		op(Pm4::IT_WRITE_DATA, "PM4 WRITE_DATA");
+		op(Pm4::IT_MEM_SEMAPHORE, "PM4 MEM_SEMAPHORE");
+		op(Pm4::IT_WAIT_REG_MEM, "PM4 WAIT_REG_MEM");
+		op(Pm4::IT_WAIT_REG_MEM_64, "PM4 WAIT_REG_MEM_64");
+		op(Pm4::IT_COPY_DATA, "PM4 COPY_DATA");
+		op(Pm4::IT_CP_DMA, "PM4 CP_DMA");
+		op(Pm4::IT_DMA_DATA, "PM4 DMA_DATA");
+		op(Pm4::IT_SURFACE_SYNC, "PM4 SURFACE_SYNC");
+		op(Pm4::IT_EVENT_WRITE, "PM4 EVENT_WRITE");
+		op(Pm4::IT_EVENT_WRITE_EOP, "PM4 EVENT_WRITE_EOP");
+		op(Pm4::IT_EVENT_WRITE_EOS, "PM4 EVENT_WRITE_EOS");
+		op(Pm4::IT_RELEASE_MEM, "PM4 RELEASE_MEM");
+		op(Pm4::IT_ACQUIRE_MEM, "PM4 ACQUIRE_MEM");
+		op(Pm4::IT_DUMP_CONST_RAM, "PM4 DUMP_CONST_RAM");
+		custom(Pm4::R_DRAW_RESET, "PM4 NOP DRAW_RESET");
+		custom(Pm4::R_WAIT_FLIP_DONE, "PM4 NOP WAIT_FLIP_DONE");
+		custom(Pm4::R_DISPATCH_RESET, "PM4 NOP DISPATCH_RESET");
+		custom(Pm4::R_ACQUIRE_MEM, "PM4 NOP ACQUIRE_MEM");
+		custom(Pm4::R_WRITE_DATA, "PM4 NOP WRITE_DATA");
+		custom(Pm4::R_FLIP, "PM4 NOP FLIP");
+		custom(Pm4::R_RELEASE_MEM, "PM4 NOP RELEASE_MEM");
+		custom(Pm4::R_DMA_DATA, "PM4 NOP DMA_DATA");
+		custom(Pm4::R_CONTEXT_STATE, "PM4 NOP CONTEXT_STATE");
+		return result;
+	}();
+	const auto& location = opcode == Pm4::IT_NOP ? table.custom[r & (Pm4::R_NUM - 1u)]
+	                                             : table.ops[opcode & 0xffu];
+	return location.name != nullptr ? &location : nullptr;
+}
+
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -923,6 +978,13 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		std::optional<Profiler::CommandZone> command_zone;
+		if (Profiler::g_counters) {
+			if (const auto* location = Pm4ZoneLocation(opcode, KYTY_PM4_R(packet_header));
+			    location != nullptr) {
+				command_zone.emplace(location);
+			}
+		}
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);

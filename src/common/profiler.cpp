@@ -121,6 +121,10 @@ void Message(uint32_t color, const char* format, ...) {
 }
 
 void Phases::SetText(const char* format, ...) {
+	if (!Connected()) {
+		m_text_size = 0;
+		return;
+	}
 	va_list args;
 	va_start(args, format);
 	const int size = std::vsnprintf(m_text, sizeof(m_text), format, args);
@@ -139,6 +143,39 @@ void Phases::Begin(const tracy::SourceLocationData* location) {
 	m_zone.emplace(location, TRACY_CALLSTACK, true);
 	if (m_text_size != 0) {
 		m_zone->Text(m_text, m_text_size);
+	}
+}
+
+namespace {
+thread_local CommandZone* t_command_zone = nullptr;
+} // namespace
+
+CommandZone::CommandZone(const tracy::SourceLocationData* location) {
+	if (Connected()) {
+		m_zone.emplace(location, TRACY_CALLSTACK, true);
+		m_previous     = t_command_zone;
+		t_command_zone = this;
+	}
+}
+
+CommandZone::~CommandZone() {
+	if (m_zone) {
+		t_command_zone = m_previous;
+	}
+}
+
+void CommandZone::Annotate(const char* format, ...) {
+	auto* zone = t_command_zone;
+	if (zone == nullptr || !zone->m_zone) {
+		return;
+	}
+	char    text[160];
+	va_list args;
+	va_start(args, format);
+	const int size = std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	if (size > 0) {
+		zone->m_zone->Text(text, std::min(static_cast<size_t>(size), sizeof(text) - 1));
 	}
 }
 

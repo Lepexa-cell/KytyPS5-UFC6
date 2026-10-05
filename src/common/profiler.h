@@ -145,6 +145,27 @@ private:
 	size_t                           m_text_size = 0;
 };
 
+// The zone of the guest GPU command (PM4 packet) being processed on this thread: one per
+// significant packet (graphicsRun.cpp), kept with KYTY_PROFILE_ZONES=0. The code that handles it
+// adds text with Annotate (the shaders of a draw or dispatch, or why it was skipped); several
+// annotations are joined by line breaks.
+class CommandZone {
+public:
+	explicit CommandZone(const tracy::SourceLocationData* location);
+	~CommandZone();
+	KYTY_CLASS_NO_COPY(CommandZone);
+
+	static void Annotate(const char* format, ...)
+#if defined(__GNUC__) || defined(__clang__)
+	    __attribute__((format(printf, 1, 2)))
+#endif
+	    ;
+
+private:
+	std::optional<tracy::ScopedZone> m_zone;
+	CommandZone*                     m_previous = nullptr;
+};
+
 struct Lifecycle {
 	static constexpr const char* name               = "Profiler";
 	static constexpr auto        initialize         = Profiler::Initialize;

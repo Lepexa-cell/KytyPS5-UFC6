@@ -77,6 +77,7 @@ int64_t BeginGpuZone(RenderContext& context, CommandBuffer& buffer, uint64_t has
 	}
 	char      name[32];
 	const int size = std::snprintf(name, sizeof(name), "CS %016" PRIx64, hash);
+	Profiler::CommandZone::Annotate("CS %016" PRIx64, hash);
 	return GpuProfiler::Begin(context, buffer, name, static_cast<size_t>(size), 0xf28e2b);
 }
 

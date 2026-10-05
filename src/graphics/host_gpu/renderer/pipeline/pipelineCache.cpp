@@ -262,6 +262,20 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	return true;
 }
 
+// "VS", "PS", ... for zone texts.
+const char* StageLabel(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "DS";
+		case ShaderType::Pixel: return "PS";
+		case ShaderType::Compute: return "CS";
+		default: return "??";
+	}
+}
+
 // --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
 // these guest shaders, the same way a shader that fails to compile is skipped. To see what one
 // shader contributes, to step past one that loses the device, or to leave out work nothing can
@@ -675,6 +689,8 @@ struct PipelineCache::ProgramCache {
 
 		if (SkipShaderRequested(params.hash)) {
 			Profiler::Add(Profiler::Counter::SkippedSkipList);
+			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": skip list", StageLabel(stage),
+			                                params.hash);
 			return ShaderProgram {};
 		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
@@ -690,6 +706,8 @@ struct PipelineCache::ProgramCache {
 		}
 		if (unsupported.contains(lookup_key)) {
 			Profiler::Add(Profiler::Counter::SkippedGaveUp);
+			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": shader gave up",
+			                                StageLabel(stage), params.hash);
 			return ShaderProgram {};
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
@@ -718,7 +736,10 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != programs.end()) {
 			{
-				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
+				// One zone per refresh, named by the program (kept with KYTY_PROFILE_ZONES=0).
+				Profiler::Phases refresh_zone;
+				refresh_zone.SetText("%s %016" PRIx64, StageLabel(stage), params.hash);
+				KYTY_PROFILER_PHASE(refresh_zone, "SRT refresh", profiler::colors::Amber300);
 				t_srt_shader_hash = params.hash;
 				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 				    entry->second.resource_plan, runtime, entry->second.resources,
@@ -739,6 +760,8 @@ struct PipelineCache::ProgramCache {
 						EXIT("shader resource materialization failed\n");
 					}
 					Profiler::Add(Profiler::Counter::SkippedResources);
+					Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": resources unreadable",
+					                                StageLabel(stage), params.hash);
 					static std::atomic<uint32_t> reported = 0;
 					if (reported.fetch_add(1) < 16) {
 						LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
@@ -1484,6 +1507,7 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 
 	const auto defer = [this] {
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
+		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
 		if (++m_deferred_draws % 256 == 1) {
 			LOGF("PipelineCache: %" PRIu64 " draws skipped while their pipeline compiled in the "
 			     "background\n",
