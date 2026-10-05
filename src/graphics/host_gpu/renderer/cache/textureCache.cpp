@@ -29,6 +29,7 @@
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -52,6 +53,38 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 		       (std::strcmp(value, "0") != 0 && std::strcmp(value, "ticks") != 0);
 	}();
 	return enabled;
+}
+
+// The collector writes a GPU-written image back to guest memory before it frees it (under
+// memory pressure). Whether the image is CPU-dirty is checked when the copy is recorded, but the
+// bytes land only once the GPU is done with that tick, and the image is untracked by then: a
+// guest that reused the memory in between (a retired render target becoming a CPU-written vertex
+// table, as in Jetsku's 919e712a) had it overwritten with stale pixels. The guest bytes are hashed
+// when the copy is recorded and again before it is published; if they changed, the write-back
+// is dropped. KYTY_EVICT_WRITEBACK_GUARD=0 publishes unconditionally again.
+[[nodiscard]] bool EvictWriteBackGuard() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_EVICT_WRITEBACK_GUARD");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
+[[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
+	constexpr uint64_t   Chunk = 64 * 1024;
+	std::vector<uint8_t> bytes(static_cast<size_t>(std::min(size, Chunk)));
+	uint64_t             seed = 0;
+	for (uint64_t done = 0; done < size;) {
+		const auto part = std::min(size - done, Chunk);
+		if (!LibKernel::Memory::TryReadBacking(address + done, bytes.data(), part)) {
+			return false;
+		}
+		seed = XXH3_64bits_withSeed(bytes.data(), static_cast<size_t>(part), seed);
+		done += part;
+	}
+	hash = seed;
+	return true;
 }
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
@@ -1938,7 +1971,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool evicting) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -1975,6 +2008,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
+	const bool guard      = evicting && EvictWriteBackGuard();
+	uint64_t   guest_hash = 0;
+	if (guard && !HashGuestBacking(range.address, range.size, guest_hash)) {
+		return false;
+	}
 	download->Flush(offset, range.size);
 
 	DownloadImage(image, *download, offset, range.size, std::move(transfer));
@@ -1991,8 +2029,22 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset] {
+	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
+	                                    guest_hash] {
 		download->Invalidate(offset, range.size);
+		uint64_t current = 0;
+		if (guard && (!HashGuestBacking(range.address, range.size, current) ||
+		              current != guest_hash)) {
+			// The guest wrote (or unmapped) these bytes after the image was evicted: they are
+			// newer than its pixels.
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("TextureCache: evicted image write-back dropped, guest=0x%016" PRIx64
+				     " size=0x%" PRIx64 ": the guest bytes changed before it landed\n",
+				     range.address, range.size);
+			}
+			return;
+		}
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
@@ -2240,7 +2292,7 @@ void TextureCache::RunGarbageCollector() {
 					g_gc_skip.gpu_unpress++;
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id)) {
+				if (safe && !DownloadImageMemory(id, true)) {
 					g_gc_skip.gpu_download++;
 					continue;
 				}

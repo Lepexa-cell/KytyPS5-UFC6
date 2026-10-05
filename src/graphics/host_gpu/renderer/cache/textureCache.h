@@ -167,7 +167,9 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// evicting: the collector writes the image back before freeing it; the write is dropped if
+	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
