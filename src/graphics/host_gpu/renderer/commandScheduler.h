@@ -55,8 +55,8 @@ public:
 	// overlaps CPU recording with GPU execution without a submit per few dozen draws --
 	// override via KYTY_DRAW_FLUSH_INTERVAL (0 disables) if a different workload needs retuning:
 	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
-	// exists to remove. While a dynamic-rendering scope is open the flush is deferred to the
-	// next pass boundary (see CompleteDraw): splitting a pass would close/reopen the scope and
+	// exists to remove. While a dynamic-rendering scope is open the flush is skipped
+	// (see CompleteDraw): splitting a pass would close/reopen the scope and
 	// force an attachment reload.
 	void           CompleteDraw();
 	CommandBuffer& BeginCommand();
@@ -162,8 +162,6 @@ private:
 	// Presented-frame submits since the last Submit(). Caps batched RELEASE_MEM and
 	// progressive draw flushes; reset when the buffer is actually queued.
 	uint32_t                     m_frame_submits                   = 0;
-	bool                         m_pending_draw_flush              = false;
-	uint32_t                     m_deferred_draw_flush             = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

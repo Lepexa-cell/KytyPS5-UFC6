@@ -214,16 +214,6 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
-	// Natural pass boundary: drain any deferred mid-frame chunk before the new
-	// scope opens, so the previous chunk keeps its own render-pass instance and
-	// this pass records uninterrupted into the fresh buffer.
-	if (m_pending_draw_flush && Active() && !m_command.IsInvalid() &&
-	    !Current().HandlesState(state)) {
-		m_pending_draw_flush  = false;
-		m_deferred_draw_flush = 0;
-		CheckActive();
-		Flush();
-	}
 	Current().BeginRendering(state);
 }
 
@@ -231,14 +221,6 @@ void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
 		Context().GetRenderExecutor().FlushPendingComputeBarrier();
 		Current().EndRendering();
-		// The scope is closed: this is the cheapest point to submit a deferred
-		// mid-frame chunk -- no extra End/BeginRendering traffic is introduced.
-		if (m_pending_draw_flush) {
-			m_pending_draw_flush  = false;
-			m_deferred_draw_flush = 0;
-			CheckActive();
-			Flush();
-		}
 	}
 }
 
@@ -295,17 +277,12 @@ void CommandScheduler::CompleteDraw() {
 		return;
 	}
 	CheckActive();
-	// Respect render-pass continuity: chunking mid-pass closes and reopens the
-	// dynamic-rendering scope (EndRendering -> BeginRendering), forcing the GPU
-	// to reload color/depth attachments. Defer the flush to the next pass
-	// boundary instead; a 4x safety cap guarantees progress inside one huge pass.
+	// Never split an open dynamic-rendering scope: chunking mid-pass closes and
+	// reopens it (EndRendering -> BeginRendering), forcing the GPU to reload
+	// color/depth attachments and delaying UI draws past the Flip. Flush only
+	// between passes; end-of-frame / flip / FlushAndWait still submit.
 	if (IsRendering()) {
-		m_pending_draw_flush = true;
-		if (++m_deferred_draw_flush < 4) {
-			return;
-		}
-		m_pending_draw_flush  = false;
-		m_deferred_draw_flush = 0;
+		return;
 	}
 	// Once the frame already has its handful of natural submits, further progressive
 	// chunks only add driver overhead. End-of-frame / flip / FlushAndWait still submit.
@@ -597,8 +574,6 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg4   = m_command.m_debug_arg4,
 	};
 	m_command.m_buffer                = nullptr;
-	m_pending_draw_flush            = false;
-	m_deferred_draw_flush           = 0;
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;
