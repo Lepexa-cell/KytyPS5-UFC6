@@ -147,6 +147,21 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	// The kernel unmaps every free range it is about to (re)map, most of which were never GPU
+	// mapped. Buffers, images and GPU-dirty pages are only tracked inside mapped ranges (faults
+	// and invalidations outside them are ignored), so such an unmap has nothing to invalidate:
+	// skip the GPU-thread round trip and the full drain it forces. KYTY_UNMAP_SKIP_UNMAPPED=0
+	// sends every unmap to the GPU thread again.
+	static const bool skip_unmapped = [] {
+		const auto* value = std::getenv("KYTY_UNMAP_SKIP_UNMAPPED");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	if (skip_unmapped && GuestRange {vaddr, size}.Valid()) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_command_scheduler.Active()) {
 			const auto tick = m_command_scheduler.CurrentTick();

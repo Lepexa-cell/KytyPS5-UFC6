@@ -159,7 +159,12 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// Presented frame of the last access: overlapping aliases age by frames as well as by ticks
+	// (TextureCache::ResolveOverlap, KYTY_IMAGE_ALIAS_AGE).
+	uint64_t         frame_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
+	bool             alias_owner        = false;
 	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
 	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
 	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip

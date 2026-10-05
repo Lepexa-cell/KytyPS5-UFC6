@@ -35,6 +35,24 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Overlapping aliases (transient render targets sharing memory) stay registered until unused for
+// this many presented frames as well; see AliasAgeByFrames.
+constexpr uint64_t AliasFramesBeforeRemoval = 4;
+
+// An overlapped alias was freed once unused for NumFramesBeforeRemoval scheduler ticks. A title
+// submits hundreds of times a frame, so that is usually within the frame that used it: the
+// aliases of a transient image pool (Wolverine: ~4 a frame) were destroyed and recreated from
+// guest memory every frame. They now also have to be unused for AliasFramesBeforeRemoval
+// presented frames, and live aliases follow a single-owner rule (CommitGpuWrite).
+// KYTY_IMAGE_ALIAS_AGE=0 (or =ticks) restores the tick rule alone.
+[[nodiscard]] bool AliasAgeByFrames() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_IMAGE_ALIAS_AGE");
+		return value == nullptr ||
+		       (std::strcmp(value, "0") != 0 && std::strcmp(value, "ticks") != 0);
+	}();
+	return enabled;
+}
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -353,6 +371,7 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	image.frame_accessed_last = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, LruClock());
 	}
@@ -817,9 +836,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		return {merged_id};
 	}
 	auto&      cached       = *owner;
-	const auto current_tick = m_scheduler.CurrentTick();
+	const auto current_tick  = m_scheduler.CurrentTick();
+	const auto current_frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	    (!AliasAgeByFrames() || current_frame - std::min(current_frame, cached.frame_accessed_last) >
+	                                AliasFramesBeforeRemoval);
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1571,6 +1593,25 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
+	}
+	// Aliases aged by frames stay alive side by side. A single owner among them: this write
+	// supersedes the bytes of every other live image overlapping it, so none of those may later
+	// be written back (collector, linear readback, buffer sync) over it. Their native contents
+	// stay as they are; the tick rule freed them without a write-back. Scanned only when the
+	// owner changes, not on every bind.
+	if (AliasAgeByFrames() && !image.alias_owner && !image.depth_id && image.registered &&
+	    !image.info.data.Empty()) {
+		for (const auto id: FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto* other = m_slot_images.try_get(id);
+			if (other == nullptr || other == &image || other->depth_id || !other->registered) {
+				continue;
+			}
+			other->alias_owner = false;
+			if (other->IsGpuModified()) {
+				other->ClearGpuModified();
+			}
+		}
+		image.alias_owner = true;
 	}
 	image.MarkGpuModified();
 }
