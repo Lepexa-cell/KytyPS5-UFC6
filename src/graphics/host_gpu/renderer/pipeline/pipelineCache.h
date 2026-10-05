@@ -100,6 +100,7 @@ struct PipelineVertexInputState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	uint32_t         spirv_words = 0;
 
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };

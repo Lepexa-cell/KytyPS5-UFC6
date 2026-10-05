@@ -377,6 +377,14 @@ static const bool g_async_pipelines = [] {
 	const char* value = std::getenv("KYTY_ASYNC_PIPELINES");
 	return value == nullptr || value[0] != '0';
 }();
+// Pipelines whose stages are this small (SPIR-V words, all stages; KYTY_PIPELINE_SYNC_WORDS)
+// compile on the GPU thread: a few milliseconds, and their draws are never skipped. A skipped
+// draw is lost for good when the game draws it once into a cached layer: the title's UI drew its
+// WOLVERINE logo once, during the cold-start compile backlog, and the logo stayed missing.
+static const uint64_t g_pipeline_sync_words = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_SYNC_WORDS");
+	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {12000};
+}();
 static const std::chrono::milliseconds g_pipeline_wait = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_WAIT_MS");
 	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20u);
@@ -576,7 +584,9 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = {.id          = ++next_shader_id,
+		                       .module      = module,
+		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
 		};
 	}
 
@@ -1395,7 +1405,12 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, programs, static_params);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-	if (may_defer && m_compiler != nullptr && !m_compiler->Stopped()) {
+	uint64_t spirv_words = pixel_program.spirv_words;
+	for (const auto& program: programs.vertex) {
+		spirv_words += program.spirv_words;
+	}
+	if (may_defer && spirv_words > g_pipeline_sync_words && m_compiler != nullptr &&
+	    !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
 		// the background, and its draws are skipped until it is ready.
 		auto job          = std::make_shared<PendingGraphicsPipeline>();
