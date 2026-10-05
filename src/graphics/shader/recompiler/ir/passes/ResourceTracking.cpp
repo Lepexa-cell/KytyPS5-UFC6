@@ -882,6 +882,22 @@ private:
 				}
 			}
 		}
+		// Scalar loads through CPU-evaluable pointers at a fixed offset are snapshotted on the CPU
+		// as before upstream cd9fc6ff, which keeps them in the shader (BDA): with them on the GPU
+		// 14 compute shaders at Wolverine's title used BDA instead of 5, each paying PrepareBda,
+		// the fault-buffer pass and recovery drains. KYTY_SRT_RAW_READS_ON_GPU=1 follows upstream.
+		if (!SrtRawReadsOnGpu()) {
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					uint32_t index = 0;
+					if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+					    ScalarReadMemory(inst, index) != nullptr &&
+					    inst.Arg(1).Resolve().IsImmediate() &&
+					    ValidateRuntimeValue(m_program, Value(&inst)))
+						CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
+				}
+			}
+		}
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			auto& memory = m_program.memory_info[flags.index];
