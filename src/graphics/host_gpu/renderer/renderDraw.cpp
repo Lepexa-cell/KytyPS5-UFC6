@@ -1095,6 +1095,35 @@ bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderD
 	return colors.empty() ? render_sample_count(aa_config.msaa_num_samples) == 1u : single_sample;
 }
 
+struct ShaderRefreshKey {
+	uint64_t es_addr           = 0;
+	uint64_t gs_addr           = 0;
+	uint64_t ps_addr           = 0;
+	uint64_t gs_user_data_addr = 0;
+	uint64_t ps_user_data_addr = 0;
+	uint32_t color_output_mask = 0;
+	uint32_t shader_stages     = 0;
+	uint32_t prim_type         = 0;
+	uint32_t gs_user_sgpr      = 0;
+	uint32_t ps_user_sgpr      = 0;
+	uint32_t export_mapping[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t gs_user_sgpr_values[16]                      = {};
+	uint32_t ps_user_sgpr_values[16]                      = {};
+	bool     ps_active                                    = false;
+	bool     indexed                                      = false;
+	bool     single_sample                                = false;
+
+	[[nodiscard]] bool operator==(const ShaderRefreshKey&) const noexcept = default;
+};
+
+struct ShaderRefreshEntry {
+	ShaderRefreshKey                     key;
+	PipelineCache::GraphicsPrograms      programs;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	ShaderPixelInputInfo                 ps_input_info;
+	bool                                 valid = false;
+};
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1103,6 +1132,33 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	const auto& vertex_shader_info = sh_ctx.GetVs();
 	const auto& pixel_shader_info  = sh_ctx.GetPs();
 	const auto& shader_regs        = ctx.GetShaderRegisters();
+
+	thread_local ShaderRefreshEntry t_refresh;
+	ShaderRefreshKey                key {};
+	key.es_addr           = vertex_shader_info.es_regs.data_addr;
+	key.gs_addr           = vertex_shader_info.gs_regs.data_addr;
+	key.ps_addr           = pixel_shader_info.ps_regs.data_addr;
+	key.gs_user_data_addr = vertex_shader_info.gs_regs.user_data_addr;
+	key.ps_user_data_addr = pixel_shader_info.ps_regs.user_data_addr;
+	key.color_output_mask = color_output_mask;
+	key.shader_stages     = ctx.GetShaderStages();
+	key.prim_type         = static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType());
+	key.gs_user_sgpr      = vertex_shader_info.gs_regs.rsrc2.user_sgpr;
+	key.ps_user_sgpr      = pixel_shader_info.ps_regs.rsrc2.user_sgpr;
+	key.ps_active         = state.ps_active;
+	key.indexed           = draw.IsIndexed();
+	key.single_sample     = DrawUsesSingleSample(std::span {state.color_info, state.color_count},
+	                                            state.depth_info, ctx.GetAaConfig());
+	const auto gs_words = std::min<uint32_t>(key.gs_user_sgpr, 16u);
+	const auto ps_words = std::min<uint32_t>(key.ps_user_sgpr, 16u);
+	if (gs_words != 0) {
+		std::memcpy(key.gs_user_sgpr_values, vertex_shader_info.gs_user_sgpr.value,
+		            gs_words * sizeof(uint32_t));
+	}
+	if (ps_words != 0) {
+		std::memcpy(key.ps_user_sgpr_values, pixel_shader_info.ps_user_sgpr.value,
+		            ps_words * sizeof(uint32_t));
+	}
 
 	state.programs      = {};
 	state.ps_input_info = {};
@@ -1115,7 +1171,14 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)
 			        .export_mapping;
+			key.export_mapping[slot] = static_cast<uint32_t>(target_export_mapping[slot]);
 		}
+	}
+	if (t_refresh.valid && t_refresh.key == key) {
+		state.programs      = t_refresh.programs;
+		state.vertex_info   = t_refresh.vertex_info;
+		state.ps_input_info = t_refresh.ps_input_info;
+		return;
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	if (draw.IsIndexed()) {
@@ -1126,6 +1189,12 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
 	    DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
 	                         ctx.GetAaConfig()));
+	t_refresh.key           = key;
+	t_refresh.programs      = state.programs;
+	t_refresh.vertex_info   = state.vertex_info;
+	t_refresh.ps_input_info = state.ps_input_info;
+	t_refresh.valid         = static_cast<bool>(state.programs.vertex[0]) &&
+	                  (!state.ps_active || static_cast<bool>(state.programs.pixel));
 }
 
 // KYTY_LOG_DRAWS=<first_frame>:<count>: from that frame on, log count draws with their shader
@@ -1254,11 +1323,32 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		return false;
 	}
 	// Shader outputs identify active attachments; finalize centroid after resolving them.
+	// Bypass the thread_local shader cache here: the re-refresh is rare (a single-sample flip
+	// after targets resolve), and the key already holds the pre-resolve value.
 	if (state.ps_active &&
 	    state.ps_input_info.ps_single_sample !=
 	        DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
 	                             buffer.GetRegisters().GetAaConfig())) {
-		RefreshShaders(buffer, draw, color_output_mask, state);
+		state.programs      = {};
+		state.ps_input_info = {};
+		std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
+		    target_export_mapping {};
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			const auto& rt = buffer.GetRegisters().GetRenderTarget(slot);
+			if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
+				target_export_mapping[slot] =
+				    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
+				                                 rt.info.channel_order)
+				        .export_mapping;
+			}
+		}
+		state.programs = buffer.GetContext().GetPipelineCache().GetGraphicsPrograms(
+		    buffer.GetShaders().GetVs(), buffer.GetShaders().GetPs(),
+		    buffer.GetRegisters().GetShaderRegisters(), buffer.GetRegisters(),
+		    buffer.GetUserConfig(), target_export_mapping, state.ps_active, state.vertex_info,
+		    state.ps_input_info,
+		    DrawUsesSingleSample(std::span {state.color_info, state.color_count},
+		                         state.depth_info, buffer.GetRegisters().GetAaConfig()));
 	}
 
 	return true;
@@ -1735,15 +1825,21 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    args.index_count, 0, 1, args.instance_count,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
-	Common::LockGuard lock(m_context.GetMutex());
+	// Fast path: a normal draw has no metadata/resolve/depth-copy work, so the render mutex
+	// (shared with present and GC) is not taken. The flag is a plain register read.
+	const bool metadata_ops = DrawMayNeedMetadataLock(buffer);
+	std::optional<Common::LockGuard> lock;
+	if (metadata_ops) {
+		lock.emplace(m_context.GetMutex());
+	}
 	if (args.index_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
 		                  -1);
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (metadata_ops && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	                    ResolveColorTargets(buffer, args.render_target_slice_offset))) {
 		ResetBindings();
 		return;
 	}
@@ -1857,15 +1953,19 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.vertex_count, 0, args.first_vertex, args.instance_count,
 	                    args.first_instance);
 
-	Common::LockGuard lock(m_context.GetMutex());
+	const bool metadata_ops = DrawMayNeedMetadataLock(buffer);
+	std::optional<Common::LockGuard> lock;
+	if (metadata_ops) {
+		lock.emplace(m_context.GetMutex());
+	}
 	if (args.vertex_count == 0 || args.instance_count == 0) {
 		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
 		                  -1, -1);
 		return;
 	}
 
-	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
-	    ResolveColorTargets(buffer, args.render_target_slice_offset)) {
+	if (metadata_ops && (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
+	                    ResolveColorTargets(buffer, args.render_target_slice_offset))) {
 		ResetBindings();
 		return;
 	}

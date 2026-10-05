@@ -67,6 +67,23 @@ uint32_t DrawFlushInterval() {
 	return interval;
 }
 
+// UFC 5 telemetry: 161 vkQueueSubmit per frame (~every 14 draws) is almost entirely
+// RELEASE_MEM fence writes, not the 2048-draw progressive flush. Guest-visible values
+// are already written synchronously, so a larger batch does not change correctness.
+// A per-frame budget keeps the presented frame at a handful of natural submits
+// (end of frame, flip, FlushAndWait drains) instead of one submit per fence.
+// KYTY_FRAME_FLUSH_BUDGET overrides the cap; 0 disables the cap.
+uint32_t FrameFlushBudget() {
+	static const uint32_t budget = [] {
+		const char* v = std::getenv("KYTY_FRAME_FLUSH_BUDGET");
+		if (v == nullptr) {
+			return 8u;
+		}
+		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}();
+	return budget;
+}
+
 } // namespace
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
@@ -236,13 +253,20 @@ void CommandScheduler::Flush() {
 	// presented frame. Compute queues and the async submit worker do not.
 	if (GuestGpu::IsGpuThread() && Active()) {
 		Context().GetGpu().GraphicsProcessor().TelemetryCountFlush();
+		m_frame_submits++;
 	}
 }
 
+bool CommandScheduler::FrameFlushBudgetReached() const {
+	const auto budget = FrameFlushBudget();
+	return budget != 0u && m_frame_submits >= budget;
+}
+
 void CommandScheduler::CompleteReleaseMemWrite() {
-	// Tuned for Frostbite UFC 5/6: higher batch size reduces CPU overhead from frequent submissions
-	constexpr uint32_t WritesPerSubmission = 64;
-	if (++m_recorded_release_mem_writes < WritesPerSubmission) {
+	// Tuned for Frostbite UFC 5/6: higher batch size reduces CPU overhead from frequent submissions.
+	// 64 was ~one submit per 14 draws (161 flushes/frame). The write is already guest-visible.
+	constexpr uint32_t WritesPerSubmission = 512;
+	if (++m_recorded_release_mem_writes < WritesPerSubmission || FrameFlushBudgetReached()) {
 		return;
 	}
 	CheckActive();
@@ -250,15 +274,15 @@ void CommandScheduler::CompleteReleaseMemWrite() {
 }
 
 void CommandScheduler::CompleteReleaseMemInterrupt() {
-	// Deliberately smaller than CompleteReleaseMemWrite's 64: this event has already been queued
+	// Deliberately smaller than CompleteReleaseMemWrite's 512: this event has already been queued
 	// for guest delivery once its tick completes (see Sync::TriggerEopEventAtEndOfPipe ->
 	// DeferPriorityOperation), and a guest thread may be blocked waiting on it via an event queue.
 	// Batching still defers only the vkQueueSubmit -- the event fires once that (now slightly
 	// larger) submission's tick completes, same as before, just a handful of RELEASE_MEM events
-	// later instead of immediately.
-	// Tuned for Frostbite: slightly increased to reduce overhead while keeping latency acceptable
-	constexpr uint32_t InterruptsPerSubmission = 16;
-	if (++m_recorded_release_mem_interrupts < InterruptsPerSubmission) {
+	// later instead of immediately. 16 was the other half of the 161-flush frame.
+	constexpr uint32_t InterruptsPerSubmission = 256;
+	if (++m_recorded_release_mem_interrupts < InterruptsPerSubmission ||
+	    FrameFlushBudgetReached()) {
 		return;
 	}
 	CheckActive();
@@ -283,6 +307,11 @@ void CommandScheduler::CompleteDraw() {
 		m_pending_draw_flush  = false;
 		m_deferred_draw_flush = 0;
 	}
+	// Once the frame already has its handful of natural submits, further progressive
+	// chunks only add driver overhead. End-of-frame / flip / FlushAndWait still submit.
+	if (FrameFlushBudgetReached()) {
+		return;
+	}
 	// Draws leave vkCmdBeginRendering open across calls. End() (via Flush -> Submit) closes
 	// that scope before the buffer is queued, and the next draw reopens it on the new buffer.
 	// A coalesced compute barrier is recorded by Flush() itself, so it stays in this chunk.
@@ -294,6 +323,10 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	Context().GetRenderExecutor().FlushPendingComputeBarrier();
 	Submit(submit);
 	BeginNext();
+}
+
+void CommandScheduler::BeginPresentedFrame() {
+	m_frame_submits = 0;
 }
 
 void CommandScheduler::FlushAndWait() {

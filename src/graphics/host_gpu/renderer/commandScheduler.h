@@ -30,6 +30,9 @@ public:
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
+	// Presented-frame budget for batched RELEASE_MEM / progressive draw flushes.
+	// Called from the flip path so the next frame starts with a fresh allowance.
+	void           BeginPresentedFrame();
 	// Bounds how many no-interrupt RELEASE_MEM fence writes accumulate in one command buffer
 	// before it is submitted, so consecutive fence updates that nothing is blocked waiting on
 	// don't each pay a host vkQueueSubmit. Only safe for a RELEASE_MEM whose guest-visible write
@@ -38,8 +41,9 @@ public:
 	void           CompleteReleaseMemWrite();
 	// Same idea, but for a RELEASE_MEM that DOES request a guest interrupt/event (a guest thread
 	// may be waiting on it via an event queue) -- deferring the flush delays real event delivery,
-	// so this uses a much smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
-	// some of the possible win for less added latency. Never waits itself.
+	// so this uses a smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
+	// some of the possible win for less added latency. Never waits itself. Both paths also stop
+	// once the frame has already submitted FrameFlushBudget times (default 8).
 	void           CompleteReleaseMemInterrupt();
 	// Called after every DrawIndex/DrawAuto. Long chains of draws with no intervening
 	// RELEASE_MEM/wait can otherwise sit fully recorded but unsubmitted for a long time, leaving
@@ -145,6 +149,7 @@ private:
 	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	[[nodiscard]] bool FrameFlushBudgetReached() const;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -154,6 +159,9 @@ private:
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;
+	// Presented-frame submits since the last Submit(). Caps batched RELEASE_MEM and
+	// progressive draw flushes; reset when the buffer is actually queued.
+	uint32_t                     m_frame_submits                   = 0;
 	bool                         m_pending_draw_flush              = false;
 	uint32_t                     m_deferred_draw_flush             = 0;
 	std::queue<PendingOperation> m_pending_operations;

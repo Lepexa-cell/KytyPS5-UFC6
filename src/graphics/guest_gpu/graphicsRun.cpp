@@ -1859,7 +1859,9 @@ void CommandProcessor::Flip() {
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	// New presented frame: read-sync stamps from the previous frame expire.
+	// The flush budget is per presented frame, not per command buffer.
 	TelemetryEndFrame();
+	GetScheduler().BeginPresentedFrame();
 	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
@@ -1882,6 +1884,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	                                 m_flip.flip_arg, request);
 	// New presented frame: read-sync stamps from the previous frame expire.
 	TelemetryEndFrame();
+	GetScheduler().BeginPresentedFrame();
 	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
@@ -1910,6 +1913,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
 	// New presented frame: read-sync stamps from the previous frame expire.
 	TelemetryEndFrame();
+	GetScheduler().BeginPresentedFrame();
 	command.GetContext().GetBufferCache().NextFrame();
 	GetScheduler().Flush();
 }
