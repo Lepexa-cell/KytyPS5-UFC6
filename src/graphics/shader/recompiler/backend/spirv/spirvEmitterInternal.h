@@ -465,7 +465,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState&         state,
                                                         const IR::MemoryInfo& mem,
-                                                        uint32_t variable, uint32_t pointer_type);
+                                                        uint32_t variable, uint32_t pointer_type,
+                                                        uint32_t element_bits = 32);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

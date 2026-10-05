@@ -195,7 +195,8 @@ void EnsureLdsStorage(EmitterState& state) {
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
-                                                         uint32_t pointer_type) {
+                                                         uint32_t pointer_type,
+                                                         uint32_t element_bits) {
 	if (variable == 0) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
 		                             "storage buffer descriptor array was not emitted");
@@ -211,7 +212,28 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	access.byte_offset = state.memory_byte_offsets[array_index];
 	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
 	// Use the actual bound range, including alignment, without truncating guest memory.
-	access.length = state.memory_dword_lengths[array_index];
+	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
+	// storage indexes bytes or halfwords, 64-bit atomics qwords). A dword length compared with a
+	// byte index dropped every access past the first quarter of the buffer.
+	const auto dwords = state.memory_dword_lengths[array_index];
+	switch (element_bits) {
+		case 8u:
+		case 16u: {
+			const auto shift = element_bits == 8u ? 2u : 1u;
+			access.length    = Select(
+			    state, TypeU32(state),
+			    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), dwords,
+			           ConstantU32(state, 1u << (32u - shift))),
+			    ConstantU32(state, UINT32_MAX),
+			    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), dwords, ConstantU32(state, shift)));
+			break;
+		}
+		case 64u:
+			access.length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), dwords,
+			                       ConstantU32(state, 1u));
+			break;
+		default: access.length = dwords; break;
+	}
 	return access;
 }
 
@@ -253,7 +275,7 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			                      : bits == 16u ? state.storage_buffer_u16_variable
 			                                    : state.storage_buffer_variable;
 			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits));
+			    state, mem, variable, TypeStorageBufferPointer(state, bits), bits);
 			access.element_bits = bits;
 			return access;
 		}
