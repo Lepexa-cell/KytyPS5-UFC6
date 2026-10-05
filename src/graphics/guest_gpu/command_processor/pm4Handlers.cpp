@@ -2328,10 +2328,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		} else {
 			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
 			// schedules a callback gated on this submission's tick actually completing on the
-			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
-			// behind a batching window.
-			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			// GPU. Route it through the small interrupt batch bound instead of an unconditional
+			// submit: the callback fires once the batched submission completes, and the batch
+			// window is bounded by CompleteReleaseMemInterrupt (256) plus the per-frame submit
+			// budget, so a waiting guest thread stalls by at most one handful-sized chunk
+			// instead of paying one vkQueueSubmit per fence.
+			cp.CompleteReleaseMemInterrupt();
 		}
 
 		return 7;
@@ -2350,8 +2352,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
-			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			// Same interrupt batching as the data_sel==1 path above: defer only the
+			// vkQueueSubmit, not the guest-visible write or the queued EOP event.
+			cp.CompleteReleaseMemInterrupt();
 		}
 
 		return 7;

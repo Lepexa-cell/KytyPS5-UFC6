@@ -1123,6 +1123,69 @@ struct ShaderRefreshEntry {
 	bool                                 valid = false;
 };
 
+struct DrawRenderStateL1Entry {
+	uint64_t tick  = 0;
+	HW::Context    ctx {};
+	HW::UserConfig ucfg {};
+	HW::Shader     sh {};
+	uint32_t slice   = 0;
+	bool     indexed = false;
+	bool     valid   = false;
+	bool     result  = false;
+	DrawRenderState state {};
+};
+
+static void FixDrawRenderStateL1Pointers(DrawRenderState& s) {
+	// GetGraphicsPrograms makes vertex_info[0].pixel_input point at the state's own
+	// ps_input_info. A value copy leaves a dangling pointer at the source, so re-point
+	// any non-null entry at this copy's storage (other stages stay null).
+	for (auto& vi : s.vertex_info) {
+		if (vi.pixel_input != nullptr) {
+			vi.pixel_input = &s.ps_input_info;
+		}
+	}
+}
+
+static bool DrawRenderStateL1KeyMatches(const DrawRenderStateL1Entry& e, const HW::Context& ctx,
+                                        const HW::UserConfig& ucfg, const HW::Shader& sh,
+                                        uint32_t slice, bool indexed, uint64_t tick) {
+	if (!e.valid || e.tick != tick || e.slice != slice || e.indexed != indexed) {
+		return false;
+	}
+	if (std::memcmp(&e.ctx, &ctx, sizeof(HW::Context)) != 0) {
+		return false;
+	}
+	if (std::memcmp(&e.ucfg, &ucfg, sizeof(HW::UserConfig)) != 0) {
+		return false;
+	}
+	if (std::memcmp(&e.sh, &sh, sizeof(HW::Shader)) != 0) {
+		return false;
+	}
+	return true;
+}
+
+static void DrawRenderStateL1Store(DrawRenderStateL1Entry& e, const HW::Context& ctx,
+                                   const HW::UserConfig& ucfg, const HW::Shader& sh, uint32_t slice,
+                                   bool indexed, uint64_t tick, const DrawRenderState& s,
+                                   bool result) {
+	std::memcpy(&e.ctx, &ctx, sizeof(HW::Context));
+	std::memcpy(&e.ucfg, &ucfg, sizeof(HW::UserConfig));
+	std::memcpy(&e.sh, &sh, sizeof(HW::Shader));
+	e.tick    = tick;
+	e.slice   = slice;
+	e.indexed = indexed;
+	e.state   = s;
+	FixDrawRenderStateL1Pointers(e.state);
+	e.result = result;
+	e.valid  = true;
+}
+
+// NOTE: the L1 hit path itself lives inline in PrepareDrawRenderState (a
+// RenderExecutor member), because it touches TextureCache::m_slot_images
+// (private, friended to RenderExecutor only) and replays BindRenderTarget
+// (a private member). A free helper cannot do either.
+
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1279,6 +1342,55 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
+	// L1: Frostbite re-emits identical register blocks across consecutive draws,
+	// so a key hit reuses the whole resolved state (programs + targets) in O(1).
+	// Key covers every guest input discovery reads (full Cx/Uc/Sh blobs plus
+	// slice + indexed bit); the submission tick bounds it to the current command
+	// buffer because Flush/Submit retires image handles. A hit still replays the
+	// per-draw BindRenderTarget side effects (ResetBindings consumes them), and
+	// bails to the slow path if any cached image was recycled (needs_rebind).
+	// Miss cost is one memcmp triplet over the register blobs + the existing
+	// work. Skipped draws (false) are cached too: their callers ResetBindings
+	// and return the same way.
+	thread_local DrawRenderStateL1Entry t_draw_state_l1;
+	const HW::Context&    l1_ctx    = buffer.GetRegisters();
+	const HW::UserConfig& l1_ucfg   = buffer.GetUserConfig();
+	const HW::Shader&     l1_sh     = buffer.GetShaders();
+	const uint64_t        l1_tick   = buffer.GetContext().GetCommandScheduler().CurrentTick();
+	const bool            l1_indexed = draw.IsIndexed();
+	if (DrawRenderStateL1KeyMatches(t_draw_state_l1, l1_ctx, l1_ucfg, l1_sh,
+	                                render_target_slice_offset, l1_indexed, l1_tick)) {
+		// Same checks AcquireRenderTargets applies below: a stale handle (GC
+		// recycled, overlap-expanded -> needs_rebind) falls back to discovery.
+		auto&          l1_cache = buffer.GetContext().GetTextureCache();
+		bool           l1_live  = true;
+		for (uint32_t i = 0; l1_live && i < t_draw_state_l1.state.color_count; i++) {
+			const auto* owner =
+			    l1_cache.m_slot_images.try_get(t_draw_state_l1.state.color_info[i].image_id);
+			l1_live = owner != nullptr && owner->registered && !owner->binding.needs_rebind;
+		}
+		if (l1_live && t_draw_state_l1.state.depth_info.image_id) {
+			const auto* owner =
+			    l1_cache.m_slot_images.try_get(t_draw_state_l1.state.depth_info.image_id);
+			l1_live = owner != nullptr && owner->registered && !owner->binding.needs_rebind;
+		}
+		if (l1_live) {
+			state = t_draw_state_l1.state;
+			FixDrawRenderStateL1Pointers(state);
+			if (t_draw_state_l1.result) {
+				// Replay the per-draw BindRenderTarget side effects discovery
+				// performs (binding flags + m_bound_images tracking consumed by
+				// ResetBindings) and keep the images GC-live via GetImage().
+				for (uint32_t i = 0; i < state.color_count; i++) {
+					BindRenderTarget(state.color_info[i].image_id);
+				}
+				if (state.depth_info.image_id) {
+					BindRenderTarget(state.depth_info.image_id);
+				}
+			}
+			return t_draw_state_l1.result;
+		}
+	}
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1287,6 +1399,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		DrawRenderStateL1Store(t_draw_state_l1, l1_ctx, l1_ucfg, l1_sh, render_target_slice_offset,
+		                       l1_indexed, l1_tick, state, false);
 		return false;
 	}
 	uint32_t mrt_mask = 0;
@@ -1318,6 +1432,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		DrawRenderStateL1Store(t_draw_state_l1, l1_ctx, l1_ucfg, l1_sh, render_target_slice_offset,
+		                       l1_indexed, l1_tick, state, false);
 		return false;
 	}
 	// Shader outputs identify active attachments; finalize centroid after resolving them.
@@ -1349,6 +1465,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		                         state.depth_info, buffer.GetRegisters().GetAaConfig()));
 	}
 
+	DrawRenderStateL1Store(t_draw_state_l1, l1_ctx, l1_ucfg, l1_sh, render_target_slice_offset,
+	                       l1_indexed, l1_tick, state, true);
 	return true;
 }
 
