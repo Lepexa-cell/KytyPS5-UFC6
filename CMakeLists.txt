@@ -516,7 +516,7 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt Tracy::TracyClient)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(srt_native_tests EXCLUDE_FROM_ALL
@@ -528,7 +528,7 @@ add_executable(srt_native_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNative.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtNativeMemory.cpp"
 )
-target_link_libraries(srt_native_tests fmt::fmt)
+target_link_libraries(srt_native_tests fmt::fmt Tracy::TracyClient)
 target_include_directories(srt_native_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "common/profiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -1380,6 +1381,15 @@ struct TraceStats {
 TraceStats g_trace_stats;
 
 void CountTrace(uint64_t TraceStats::*field, const char* reason = nullptr) {
+	if (field == &TraceStats::refreshes) {
+		Profiler::Add(Profiler::Counter::SrtRefreshes);
+	} else if (field == &TraceStats::served) {
+		Profiler::Add(Profiler::Counter::SrtReplayed);
+	} else if (field == &TraceStats::abandoned) {
+		Profiler::Add(Profiler::Counter::SrtAbandoned);
+	} else if (field == &TraceStats::recorded) {
+		Profiler::Add(Profiler::Counter::SrtRecorded);
+	}
 	if (!TraceStatsEnabled()) {
 		return;
 	}

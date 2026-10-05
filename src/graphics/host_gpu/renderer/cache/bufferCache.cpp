@@ -194,6 +194,8 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 template <bool async>
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
+	Profiler::Add(Profiler::Counter::Readbacks);
+	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
 	const auto buffer_address = buffer.CpuAddress();
 	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -819,6 +821,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Profiler::Add(Profiler::Counter::UploadBytes, static_cast<int64_t>(total_size));
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {

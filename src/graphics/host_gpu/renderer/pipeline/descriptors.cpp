@@ -1251,6 +1251,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
 		}
 	}
+	Profiler::Add(Profiler::Counter::BindlessResolved, resolved);
 	static std::atomic<uint32_t> logged = 0;
 	if (requested != 0 && logged.fetch_add(1) < 64) {
 		LOGF("Bindless requests: frame=%" PRIu64 " requested=%u resolved=%u\n", frame,

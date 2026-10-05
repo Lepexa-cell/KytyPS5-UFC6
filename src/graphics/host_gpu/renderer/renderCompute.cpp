@@ -651,6 +651,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch", program.shader_hash,
 		               (static_cast<uint64_t>(thread_group_x) << 32u) |
@@ -758,6 +759,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		Profiler::Add(Profiler::Counter::Dispatches);
 		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
 		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

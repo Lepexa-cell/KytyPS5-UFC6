@@ -477,6 +477,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
+	Profiler::Add(Profiler::Counter::CommandBuffersSubmitted);
 
 	SubmitJob job {
 	    .buffer       = m_command.m_buffer,
@@ -654,6 +655,7 @@ vk::CommandBuffer CommandScheduler::DrainRecording() {
 	DispatchChunk();
 	std::unique_lock lock(m_record_mutex);
 	m_drains++;
+	Profiler::Add(Profiler::Counter::RecordingDrains);
 	// KYTY_RECORD_DRAIN_STACKS=1: which raw Handle() sites make the GPU thread wait (a host stack
 	// for every 4,999th drain, up to 64).
 	static const bool stacks = std::getenv("KYTY_RECORD_DRAIN_STACKS") != nullptr;

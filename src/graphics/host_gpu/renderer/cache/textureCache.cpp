@@ -281,6 +281,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
@@ -393,6 +394,7 @@ void TextureCache::ReleaseImage(ImageId id) {
 		return;
 	}
 	m_slot_images.erase(id);
+	Profiler::Add(Profiler::Counter::ImagesDestroyed);
 }
 
 void TextureCache::FreeImage(ImageId id) {
