@@ -240,6 +240,20 @@ bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32
 	return true;
 }
 
+// KYTY_SRT_GPU_FILL=0: read every flat SRT slot on the host, waiting for the GPU when it wrote
+// the bytes, instead of leaving shader-only slots to the GPU (SrtGpuFill).
+bool SrtGpuFillEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_GPU_FILL");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool SrtBytesGpuWritten(uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::IsGpuBufferWritten(address, size);
+}
+
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
@@ -740,11 +754,20 @@ struct PipelineCache::ProgramCache {
 				Profiler::Phases refresh_zone;
 				refresh_zone.SetText("%s %016" PRIx64, StageLabel(stage), params.hash);
 				KYTY_PROFILER_PHASE(refresh_zone, "SRT refresh", profiler::colors::Amber300);
+				// Compute: flat slots only the shader uses are left to the GPU when it wrote their
+				// bytes; the renderer copies them on the GPU before the dispatch (SrtGpuFill).
+				entry->second.resources.gpu_fills.clear();
+				if (stage == ShaderType::Compute && SrtGpuFillEnabled()) {
+					runtime.gpu_written = SrtBytesGpuWritten;
+					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
+				}
 				t_srt_shader_hash = params.hash;
 				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 				    entry->second.resource_plan, runtime, entry->second.resources,
 				    entry->second.specialization);
 				t_srt_shader_hash = 0;
+				runtime.gpu_written = nullptr;
+				runtime.gpu_fills   = nullptr;
 				if (ShaderRecompiler::IR::SrtNativeStats stats;
 				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
 					LOGF("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64

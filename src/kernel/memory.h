@@ -115,6 +115,9 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
+// GPU holds it and a host read would wait for the GPU.
+[[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
 // work has written any of them, else nullptr. Current until the GPU thread marks them

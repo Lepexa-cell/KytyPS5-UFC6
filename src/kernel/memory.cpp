@@ -908,6 +908,14 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
 	if (g_guest_address_space == nullptr) {
 		return nullptr;

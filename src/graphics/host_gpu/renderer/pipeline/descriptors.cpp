@@ -985,6 +985,41 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// The flat slots the refresh left to the GPU (SrtGpuFill): their guest bytes are copied, where
+// the buffer cache holds them, into the uploaded flat buffer before the command, behind the
+// writes that produced them. Reading them on the host instead waited for the GPU (2.8 ms a frame
+// for one dispatch in the jungle).
+static void FillFlatSlotsOnGpu(RenderContext& context, const vk::DescriptorBufferInfo& flat,
+                               std::span<const ShaderRecompiler::IR::SrtGpuFill> fills) {
+	if (fills.empty()) {
+		return;
+	}
+	auto& cache   = context.GetBufferCache();
+	auto& command = context.GetCommandScheduler().Current();
+	command.EndRendering();
+	const auto      recorder = command.Recorder();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                         nullptr);
+	for (const auto& fill: fills) {
+		auto [buffer, offset] = cache.ObtainBuffer(fill.address, sizeof(uint32_t), false);
+		(void)offset;
+		const vk::BufferCopy copy {buffer->Offset(fill.address),
+		                           flat.offset + uint64_t {fill.flat_offset} * sizeof(uint32_t),
+		                           sizeof(uint32_t)};
+		recorder.copyBuffer(buffer->Handle(), flat.buffer, 1, &copy);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eUniformRead;
+	recorder.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                         vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                         nullptr);
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -1581,6 +1616,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		if (prepared.bindless_patches.empty()) {
 			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		} else {
 			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
 			for (const auto& [offset, region, entries]: prepared.bindless_patches) {
@@ -1599,6 +1635,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				}
 			}
 			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
+			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(

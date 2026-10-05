@@ -625,6 +625,9 @@ struct ResourcePlan {
 	std::vector<uint8_t>                buffer_writes_bounded;
 	std::vector<BufferWrite>            buffer_writes;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Flat slots only the shader uses (GpuFillSlots): a raw read whose address comes from user data
+	// and immediates alone, which no host-evaluated value refers to.
+	std::vector<uint8_t>                gpu_fill_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
 	// The device supports bindless images: an indirect image the enumeration cannot cover

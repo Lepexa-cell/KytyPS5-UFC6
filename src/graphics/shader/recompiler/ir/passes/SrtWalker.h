@@ -39,6 +39,10 @@ struct SrtRuntime {
 	// When the refresh captures its reads (specialization_reads), reads taken through the fast
 	// path are recorded here, as read_memory's capture records them.
 	std::vector<std::pair<uint64_t, uint64_t>>* capture_ranges = nullptr;
+	// GPU-filled flat slots (SrtGpuFill): whether bytes are GPU-written, and where the refresh
+	// lists the slots it left to the GPU. Both null: every slot is read on the host.
+	bool (*gpu_written)(uint64_t address, uint64_t size) = nullptr;
+	std::vector<SrtGpuFill>* gpu_fills                    = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -234,6 +238,9 @@ private:
 	uint8_t                         m_trace_id = 0;
 	// ReadRawWord's fast path: the last page mapped (SrtRuntime::map_clean_page).
 	uint64_t       m_mapped_page  = UINT64_MAX;
+	// While a GPU-fillable slot is refreshed: its flat offset (its own read is the only raw read).
+	bool           m_fill_active  = false;
+	uint32_t       m_fill_offset  = 0;
 	const uint8_t* m_mapped_bytes = nullptr;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;

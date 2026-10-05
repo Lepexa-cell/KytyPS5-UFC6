@@ -991,6 +991,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
+	if (m_fill_active && m_runtime.gpu_written(address, sizeof(uint32_t))) {
+		// Only the shader uses this slot: the GPU copies the bytes into the flat buffer before
+		// the command (SrtGpuFill), where reading them here would wait for the GPU.
+		m_runtime.gpu_fills->push_back({m_fill_offset, address});
+		result = 0;
+		return true;
+	}
 	uint32_t word = 0;
 	if (m_runtime.map_clean_page != nullptr) {
 		// The reader's own first step (a GPU-clean page is read from its backing), without the
@@ -1210,6 +1217,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return false;
+		if (!clean && slot < m_program.gpu_fill_slots.size() && m_program.gpu_fill_slots[slot] != 0u &&
+		    m_runtime.gpu_written != nullptr && m_runtime.gpu_fills != nullptr) {
+			// Through the interpreter or a replay (both read through ReadRawWord), not the native
+			// tables: ReadRawWord leaves GPU-written bytes to the GPU.
+			m_fill_active = true;
+			m_fill_offset = read.flat_offset;
+			const bool ok = Evaluate(read.value, flat[read.flat_offset]);
+			m_fill_active = false;
+			return ok;
+		}
 		if (evaluator.UseNativeTables()) {
 			uint64_t wide = 0;
 			if (!evaluator.EvaluateNative(evaluator.m_native->FlatReads()[slot], wide)) return false;
