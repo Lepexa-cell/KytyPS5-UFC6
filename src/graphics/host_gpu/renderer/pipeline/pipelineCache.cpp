@@ -1465,7 +1465,8 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	static thread_local ComputeMruSlot compute_mrus[4];
 	auto& compute_mru = compute_mrus[(compute_program.id >> 3u) & 3u];
 	if (compute_mru.valid && compute_mru.owner == this && compute_mru.epoch == PipelineMruEpoch() &&
-	    compute_mru.shader_id == compute_program.id && compute_mru.pipeline != nullptr) {
+	    compute_mru.shader_id == compute_program.id && compute_mru.pipeline != nullptr &&
+	    compute_mru.pipeline->pending == nullptr) {
 		return *compute_mru.pipeline;
 	}
 

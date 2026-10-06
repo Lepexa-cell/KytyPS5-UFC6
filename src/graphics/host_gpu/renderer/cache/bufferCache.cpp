@@ -581,17 +581,6 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size  = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
-	// HTM buffer-churn: reserve capped 1MB-aligned tail growth so sequential stream appends reuse
-	// the same VkBuffer instead of recreating it. capped at 1MB extra and only when the merged
-	// range stays within the VRAM ceiling; ownership/merge logic above is untouched. The buffer is
-	// created with [overlap.begin, alloc_end); uploads still cover only the requested range.
-	uint64_t alloc_end = overlap.end;
-	const uint64_t rounded_end = Common::AlignUp(overlap.end, MiB);
-	if (rounded_end > overlap.end && rounded_end - overlap.end <= MiB &&
-	    GuestRange {overlap.begin, rounded_end - overlap.begin}.Valid() &&
-	    m_total_used_memory + (rounded_end - overlap.end) <= m_memory_ceiling) {
-		alloc_end = rounded_end;
-	}
 
 	// A mirror far larger than the request means the merge, not a descriptor, chose this
 	// size: buffers only ever grow here, so one that swallows its neighbours as a title
@@ -611,14 +600,11 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, alloc_end - overlap.begin);
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
 	const auto& buffer = m_slot_buffers[id];
-	// HTM buffer-churn: reserve this buffer's 1MB-aligned tail so later appends from the same
-	// stream hit FindBuffer/IsInBounds instead of recreating the VkBuffer. Register() accounts
-	// the full alloc_end size in m_total_used_memory, so the VRAM ceiling/GC see the reserve.
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
-	                     alloc_end - overlap.begin);
+	                     overlap.end - overlap.begin);
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);

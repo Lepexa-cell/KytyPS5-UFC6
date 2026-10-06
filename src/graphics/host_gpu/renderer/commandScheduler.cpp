@@ -61,7 +61,7 @@ uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
-			return 1024u; // HTM parallel pass recording: 2048->1024 overlaps CPU record with GPU on 2332-draw octagon frames; env override unchanged.
+			return 2048u;
 		}
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();
