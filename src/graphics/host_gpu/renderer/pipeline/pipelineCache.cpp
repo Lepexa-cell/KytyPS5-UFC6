@@ -450,6 +450,15 @@ void NormalizeGraphicsPipelineKey(PipelineStaticParameters& params) {
 
 } // namespace
 
+// Draws without depth or stencil whose vertex shaders total at most KYTY_PIPELINE_SYNC_UI_VS_WORDS
+// SPIR-V words (default 8000; 0 = off) also compile on the GPU thread, whatever the pixel
+// shader's size: those are UI and 2D layer draws, which a game may also draw only once. On cold
+// starts the title's frosted panels lost their blur (PS 0x09161b28ae4039bb, 80k words) and
+// showed as dark boxes.
+static const uint64_t g_pipeline_sync_ui_vs_words = [] {
+	const char* value = std::getenv("KYTY_PIPELINE_SYNC_UI_VS_WORDS");
+	return value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {8000};
+}();
 static const std::chrono::milliseconds g_pipeline_wait = [] {
 	const char* value = std::getenv("KYTY_PIPELINE_WAIT_MS");
 	return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20u);
@@ -684,7 +693,8 @@ struct PipelineCache::ProgramCache {
 		    .program        = std::move(result.program).TakeCompiledInfo(),
 		    .handle         = {.id          = ++next_shader_id,
 		                       .module      = module,
-		                       .spirv_words = static_cast<uint32_t>(result.spirv.size())},
+		                       .spirv_words = static_cast<uint32_t>(result.spirv.size()),
+		                       .hash        = options.shader_hash},
 		};
 	}
 
@@ -1528,9 +1538,25 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		}
 	}
 
-	const auto defer = [this] {
+	const auto defer = [&] {
 		Profiler::Add(Profiler::Counter::SkippedPipelinePending);
 		Profiler::CommandZone::Annotate("skipped: pipeline compiling");
+		// Diagnostics: each pipeline whose draws are skipped, once (the first 128).
+		static std::unordered_set<uint64_t> logged;
+		const auto pipeline_key = (vs_id << 32u) ^ ps_id;
+		if (logged.size() < 128 && logged.insert(pipeline_key).second) {
+			uint32_t vs_words = 0;
+			for (const auto& program: programs.vertex) {
+				vs_words += program.spirv_words;
+			}
+			LOGF("PipelineCache: draw skipped, pipeline compiling: VS 0x%016" PRIx64
+			     " (%u words) PS 0x%016" PRIx64
+			     " (%u words) colors=%u depth=%d/%d stencil=%d\n",
+			     vertex_program.hash, vs_words, ps_active ? pixel_program.hash : 0,
+			     ps_active ? pixel_program.spirv_words : 0, color_count,
+			     depth.depth_test_enable ? 1 : 0, depth.depth_write_enable ? 1 : 0,
+			     depth.stencil_test_enable ? 1 : 0);
+		}
 		if (++m_deferred_draws % 256 == 1) {
 			LOGF("PipelineCache: %" PRIu64 " draws skipped while their pipeline compiled in the "
 			     "background\n",
@@ -1561,11 +1587,15 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto build = PrepareGraphicsPipeline(m_graphics, *cached, rendering, key.vertex_input,
 	                                     vertex_info, ps_input_info, programs, static_params);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-	uint64_t spirv_words = pixel_program.spirv_words;
+	uint64_t vertex_words = 0;
 	for (const auto& program: programs.vertex) {
-		spirv_words += program.spirv_words;
+		vertex_words += program.spirv_words;
 	}
-	if (may_defer && spirv_words > g_pipeline_sync_words && m_compiler != nullptr &&
+	const uint64_t spirv_words = vertex_words + pixel_program.spirv_words;
+	// Stencil does not count: UI libraries clip their panels with stencil masks.
+	const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
+	                        vertex_words <= g_pipeline_sync_ui_vs_words;
+	if (may_defer && spirv_words > g_pipeline_sync_words && !layer_draw && m_compiler != nullptr &&
 	    !m_compiler->Stopped()) {
 		// A pipeline the driver has cached finishes within the wait; a new one is compiled in
 		// the background, and its draws are skipped until it is ready.
