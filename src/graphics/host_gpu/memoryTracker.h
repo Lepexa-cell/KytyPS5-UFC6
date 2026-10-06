@@ -35,7 +35,7 @@ struct TrackerRegionMru {
 	uint64_t             base     = ~uint64_t(0);
 	RegionManager*       manager  = nullptr;
 };
-inline thread_local TrackerRegionMru s_region_mru;
+inline thread_local TrackerRegionMru s_region_mru[4]; // HTM 10-cache suite: 1->4-way region MRU for parallel shadow cascades.
 
 class MemoryTracker final {
 public:
@@ -193,7 +193,7 @@ private:
 		// 4 MiB region. A hit skips only the atomic index load; the callback below runs
 		// exactly as on a miss, so uploads are never skipped.
 		if (!create && size != 0 && size <= TRACKER_REGION_SIZE - offset) {
-			auto& mru = s_region_mru;
+			auto& mru = s_region_mru[index & 3u]; // HTM: 4-way set-associative by region index; same honesty guarantees as the single-slot MRU.
 			if (mru.owner == this && mru.instance == m_mru_instance && mru.manager != nullptr &&
 			    mru.base == index * TRACKER_REGION_SIZE) {
 				if constexpr (returns_bool) {

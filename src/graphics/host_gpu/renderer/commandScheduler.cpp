@@ -48,10 +48,11 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 // KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
-// Mid-frame progressive submit: UFC 5 records ~16k draws into one buffer (~50 ms of CPU)
-// while the GPU sits idle. Closing and queueing a chunk every 2048 draws (Submit + BeginNext,
-// no Wait) lets the RTX 4070 execute the first chunk while the CPU records the next. 32 was
-// ~500 submits/frame and drowned the overlap in vkQueueSubmit overhead. 0 disables.
+// Mid-frame progressive submit: UFC records ~2332 draws into one buffer while the GPU sits idle.
+// HTM parallel pass recording: closing and queueing a chunk every 1024 draws (Submit + BeginNext,
+// no Wait) lets the GPU execute the first chunk while the CPU records the next. 2048 left larger
+// idle bubbles on octagon frames; 32 was ~500 submits/frame and drowned the overlap in
+// vkQueueSubmit overhead. 0 disables.
 // The flush is deferred while a dynamic-rendering scope is open: splitting a pass forces
 // End/BeginRendering load+store traffic (VRAM -> tile cache reload). The pending chunk is
 // flushed at the next pass boundary (BeginRendering on a new state / EndRendering) with a
@@ -60,7 +61,7 @@ uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
-			return 2048u;
+			return 1024u; // HTM parallel pass recording: 2048->1024 overlaps CPU record with GPU on 2332-draw octagon frames; env override unchanged.
 		}
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();

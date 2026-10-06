@@ -56,7 +56,8 @@ bool ScaleReferenceClock(uint64_t host_ticks, uint64_t host_frequency, uint64_t&
 }
 
 uint64_t ReadReferenceClock() {
-	const auto host_frequency = LibKernel::KernelGetTscFrequency();
+	static const uint64_t cached_frequency = LibKernel::KernelGetTscFrequency(); // HTM DRS fix: cache TSC frequency O(1); scale + monotonic CAS below unchanged.
+	const auto host_frequency = cached_frequency;
 	const auto host_ticks     = LibKernel::KernelReadTsc();
 	// Anchor the guest-visible clock to the first observed host tick so the first
 	// timestamp the game ever sees starts near zero. An absolute host-tick base

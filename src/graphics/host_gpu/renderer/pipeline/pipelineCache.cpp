@@ -134,7 +134,7 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 // jungle). Only pages with no GPU-written byte are cached; within one synchronous evaluation on
 // the GPU thread nothing marks them GPU-written. A page that is not clean stays on the exact path.
 struct GuestPageReadCache {
-	static constexpr size_t Capacity = 16;
+	static constexpr size_t Capacity = 32; // HTM 10-cache suite: 16->32 cuts SRT page rewalks in the jungle/octagon.
 	struct Entry {
 		uint64_t       page    = 0;
 		const uint8_t* backing = nullptr;
@@ -1357,12 +1357,15 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		bool key_valid = false;
 		uint64_t epoch = 0;
 	};
-	static thread_local PipelineMruSlot mru;
+	// HTM 10-cache suite: 4-way set-associative so shadow cascades / crowd materials stop
+	// evicting the fighter pipeline on alternating passes. Same full-key compare as before.
+	static thread_local PipelineMruSlot mrus[4];
+	const std::size_t lookup_hash = GraphicsPipelineKeyHash {}(key);
+	auto& mru = mrus[lookup_hash & 3u];
 	if (mru.key_valid && mru.owner == this && mru.epoch == PipelineMruEpoch() &&
 	    mru.pipeline != nullptr && mru.key == key && mru.pipeline->pending == nullptr) {
 		return mru.pipeline;
 	}
-	const std::size_t lookup_hash = GraphicsPipelineKeyHash {}(key);
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
 		auto& found = *iter->second;
 		if (found.pending && !FinishPending(found)) {
@@ -1458,7 +1461,9 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 		bool valid = false;
 		uint64_t epoch = 0;
 	};
-	static thread_local ComputeMruSlot compute_mru;
+	// HTM 10-cache suite: 4-way set-associative for 250+ interleaved compute shaders.
+	static thread_local ComputeMruSlot compute_mrus[4];
+	auto& compute_mru = compute_mrus[(compute_program.id >> 3u) & 3u];
 	if (compute_mru.valid && compute_mru.owner == this && compute_mru.epoch == PipelineMruEpoch() &&
 	    compute_mru.shader_id == compute_program.id && compute_mru.pipeline != nullptr) {
 		return *compute_mru.pipeline;
