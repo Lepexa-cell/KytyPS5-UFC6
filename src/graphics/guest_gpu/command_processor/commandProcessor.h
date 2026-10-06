@@ -196,6 +196,9 @@ public:
 		uint64_t wait_flip_us = 0;
 		// DrawRecord breakdown: PrepareDrawRenderState cost inside DrawIndex.
 		uint64_t draw_state_us = 0;
+		// Mega-suite fix 4 (TopPM4): per-opcode PM4 time in microseconds per frame,
+		// indexed by the type-3 opcode byte, aggregated over the 60-frame window.
+		uint64_t pm4_op_us[256] = {};
 		uint32_t draws = 0;
 		uint32_t flushes = 0;
 		// Buffer churn metric for the custom VM dispatcher design.

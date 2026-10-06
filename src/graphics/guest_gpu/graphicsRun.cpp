@@ -39,12 +39,13 @@ namespace Libs::Graphics {
 
 namespace {
 
-// Keep the hot GPU threads on the performance cores: first 12 logical threads
-// (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
-// Intersects with the process affinity mask so restricted launches stay valid.
+// Mega-suite fix 5: CommandProcessor (PM4 translation) owns P-Core 0 (0x0003).
+// The submit worker takes P-Core 1, guest jobs take P-Cores 2..5, so the
+// translator and the driver never share logical cores or evict each L1/L2.
 void PinThreadToPerformanceCores() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::Highest);
+	Common::PinCurrentThreadToMask(static_cast<uint32_t>(Common::PerfCoreMask::CommandProcessor),
+	                               Common::PerfCorePriority::Highest);
 #else
 	(void)0;
 #endif
@@ -522,6 +523,9 @@ void CommandProcessor::TelemetryEndFrame() {
 
 	static FrameTelemetry sums {};
 	sums.pm4_us += m_telemetry.pm4_us;
+	for (uint32_t op = 0; op < 256; op++) {
+		sums.pm4_op_us[op] += m_telemetry.pm4_op_us[op];
+	}
 	sums.draw_record_us += m_telemetry.draw_record_us;
 	sums.gpu_wait_us += m_telemetry.gpu_wait_us;
 	sums.flip_wait_us += m_telemetry.flip_wait_us;
@@ -555,9 +559,29 @@ void CommandProcessor::TelemetryEndFrame() {
 		const uint32_t draws = sums.draws / 60u;
 		const uint32_t flushes = sums.flushes / 60u;
 		const uint32_t buf_creates = sums.buffers_created / 60u;
+		// Mega-suite fix 4 (TopPM4): two heaviest PM4 opcodes of the window.
+		uint32_t top_op0 = 0;
+		uint32_t top_op1 = 0;
+		uint64_t top_us0 = 0;
+		uint64_t top_us1 = 0;
+		for (uint32_t op = 0; op < 256; op++) {
+			const uint64_t us = sums.pm4_op_us[op];
+			if (us > top_us0) {
+				top_us1 = top_us0;
+				top_op1 = top_op0;
+				top_us0 = us;
+				top_op0 = op;
+			} else if (us > top_us1) {
+				top_us1 = us;
+				top_op1 = op;
+			}
+		}
+		const double top_ms0 = static_cast<double>(top_us0) / 1000.0 / kFrames;
+		const double top_ms1 = static_cast<double>(top_us1) / 1000.0 / kFrames;
 		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms, Bind: %.2f ms, Vtx: %.2f ms, "
-		     "Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | BufCreates: %u | Draws: %u\n",
+		     "Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | TopPM4: [op 0x%02X: %.2f ms, op 0x%02X: %.2f ms] | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | BufCreates: %u | Draws: %u\n",
 		     total_ms, draw_ms, state_ms, bind_ms, vtx_ms, pipe_ms, emit_ms, pm4_ms,
+		     top_op0, top_ms0, top_op1, top_ms1,
 		     readmem_ms, flip_ms, gc_ms, flushes, buf_creates, draws);
 		sums = {};
 		total_sum_us = 0;
@@ -1059,11 +1083,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
-		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
-		const auto        remaining_dw  = total_dw - cursor.offset_dw;
-		const auto        packet_header = packet[0];
-		const auto        opcode        = (packet_header >> 8u) & 0xffu;
+		const auto* const packet_base = cursor.commands.data();
+		const auto        total_dw    = static_cast<uint32_t>(cursor.commands.size());
+		// Mega-suite fix 2: hoist the cursor math out of the per-packet path so the
+		// hot loop advances one inlined dword pointer instead of recomputing
+		// base+offset, size-offset and re-masking the header word per packet.
+		const uint32_t* packet       = packet_base + cursor.offset_dw;
+		const auto      remaining_dw = total_dw - cursor.offset_dw;
+		const auto      packet_header = packet[0];
+		// Decode the type-3 header once: packet class (bits 31:30), length
+		// (bits 29:16) and opcode (bits 15:8). The old code re-applied the
+		// 0xC0000000 mask and shifted the same word on every branch below.
+		const auto packet_class = packet_header >> 30u;
+		const auto opcode       = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
 		if (packet_header == 0x80000000u) {
@@ -1074,7 +1106,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
-		if ((packet_header >> 30u) == 0u) {
+		if (packet_class == 0u) {
 			// A type-0 packet writes COUNT+1 registers from a base index; the command processor
 			// ignores them, and games leave reserved dwords as zeros, which decode to this
 			// (a zero header is one register write of 0 to index 0).
@@ -1095,6 +1127,18 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
+		}
+
+		// Mega-suite fix 2 (pointer leap): a type-3 NOP with no custom payload has
+		// no side effects, so skip its body with a single pointer advance instead
+		// of paying the dispatch-table load, indirect branch and CpOpNop call.
+		if (packet_class == 3u && opcode == Pm4::IT_NOP &&
+		    KYTY_PM4_R(packet_header) == Pm4::R_ZERO && !GraphicsRunDebugDumpEnabled()) {
+			const auto nop_dw = KYTY_PM4_LEN(packet_header);
+			EXIT_NOT_IMPLEMENTED(nop_dw == 0 || nop_dw > remaining_dw);
+			cursor.offset_dw += nop_dw;
+			execution.m_made_progress = true;
+			continue;
 		}
 
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
@@ -1125,6 +1169,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 
 		auto handler = g_cp_op_func[opcode];
+
+		// Mega-suite fix 4 (TopPM4): one QPC read per dispatched packet attributes
+		// its handler cost to the opcode bucket. Skipped fast paths above (sync
+		// NOP, type-0, pointer-leap NOP, predicated skip) stay out on purpose:
+		// they are pointer arithmetic, and probing them would cost more than them.
+		const uint64_t packet_start_us = TelemetryNowUs();
 
 		// Hot PM4 opcodes (UFC 5 records tens of thousands of these per frame). A direct
 		// call avoids the function-pointer load/indirect branch of the 256-entry table.
@@ -1158,6 +1208,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
+		// Mega-suite fix 4 (TopPM4): account the whole packet cost (dwords decoded
+		// above plus the handler time) to its opcode using one QPC delta.
+		m_telemetry.pm4_op_us[opcode] += TelemetryNowUs() - packet_start_us;
 		if (execution.m_suspended) {
 			return;
 		}

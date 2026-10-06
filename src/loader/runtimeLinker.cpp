@@ -33,6 +33,7 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -130,7 +131,8 @@ struct StubbedImportRecord {
 };
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
-static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
+static std::mutex                         g_unresolved_stub_log_mutex;
+static std::unordered_set<uint64_t>       g_unresolved_stub_logged;
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
@@ -201,20 +203,30 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
-	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	// Mega-suite fix 1: console spam mute. A guest thread polling a network or
+	// dialog stub called printf()/LOGF() on every invocation, stalling on the
+	// Win32 console (conhost WriteFile) and micro-freezing the frame. Each unique
+	// stub now logs exactly once per process lifetime; repeats return SCE_OK (0)
+	// silently so guest polling loops make progress without I/O stalls.
+	bool first_call = false;
+	{
+		std::lock_guard lock(g_unresolved_stub_log_mutex);
+		first_call = g_unresolved_stub_logged.insert(record_id).second;
+	}
+	if (first_call) {
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
-			printf("Unresolved import stub called: %s\n", record.name.c_str());
-			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
+			LOGF("Unresolved import stub called: %s (further calls muted)\n",
+			     record.name.c_str());
+			LOGF("Unresolved import stub detail: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
-			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
+			     record.patch_vaddr, record.index, record.name.c_str(),
 			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
 		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
+			LOGF("Unresolved import stub called: <bad-record> record_id=%" PRIu64
+			     " (further calls muted)\n",
+			     record_id);
 		}
 	}
 	return 0;

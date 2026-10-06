@@ -22,12 +22,12 @@ static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
 
 namespace {
 
-// Keep the hot GPU threads on the performance cores: first 12 logical threads
-// (6 P-cores with Hyper-Threading on i5-14400F, mask 0x0FFF), never the E-cores.
-// Intersects with the process affinity mask so restricted launches stay valid.
+// Mega-suite fix 5: submit worker (Vulkan driver calls) owns P-Core 1 (0x000C).
+// The CommandProcessor translator owns P-Core 0, guest jobs own P-Cores 2..5.
 void PinThreadToPerformanceCores() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::Highest);
+	Common::PinCurrentThreadToMask(static_cast<uint32_t>(Common::PerfCoreMask::SubmitWorker),
+	                               Common::PerfCorePriority::Highest);
 #else
 	(void)0;
 #endif

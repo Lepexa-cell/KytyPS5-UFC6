@@ -207,11 +207,15 @@ void InitializeThreads() {
 }
 
 void PinCurrentThreadToPerformanceCores(PerfCorePriority priority) {
+	PinCurrentThreadToMask(static_cast<uint32_t>(PerfCoreMask::AllP), priority);
+}
+
+void PinCurrentThreadToMask(uint32_t mask, PerfCorePriority priority) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// Intersect the P-core mask with the process affinity so a restricted launch
+	// Intersect the requested mask with the process affinity so a restricted launch
 	// (e.g. launcher affinitized elsewhere) never pins to a foreign core.
 	DWORD_PTR process_mask = 0, system_mask = 0;
-	DWORD_PTR want = static_cast<DWORD_PTR>(0x0FFF);
+	DWORD_PTR want = static_cast<DWORD_PTR>(mask);
 	if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) != 0) {
 		want &= process_mask;
 	}
@@ -226,6 +230,7 @@ void PinCurrentThreadToPerformanceCores(PerfCorePriority priority) {
 	}
 	(void)SetThreadPriority(GetCurrentThread(), win_priority);
 #else
+	(void)mask;
 	(void)priority;
 #endif
 }

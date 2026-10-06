@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -14,7 +15,19 @@ void InitializeThreads();
 // Pins the calling thread to the P-core mask intersected with the process affinity
 // mask and raises/lowers its priority. No-op off Windows. Never fails.
 enum class PerfCorePriority { Highest, AboveNormal, BelowNormal };
+// Mega-suite fix 5 (P-core topology isolation on i5-14400F, mask 0x0FFF):
+// CommandProcessor owns P-Core 0 (0x0003), the Vulkan submit worker owns P-Core 1
+// (0x000C), guest JobManager/physics workers spread over P-Cores 2..5 (0x0FF0).
+// Splitting the masks keeps the translator and the driver off each other's
+// logical cores so they stop evicting each other's L1/L2.
+enum class PerfCoreMask : uint32_t {
+	AllP = 0x0FFF,
+	CommandProcessor = 0x0003,
+	SubmitWorker = 0x000C,
+	GuestJobs = 0x0FF0,
+};
 void PinCurrentThreadToPerformanceCores(PerfCorePriority priority = PerfCorePriority::Highest);
+void PinCurrentThreadToMask(uint32_t mask, PerfCorePriority priority);
 
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();

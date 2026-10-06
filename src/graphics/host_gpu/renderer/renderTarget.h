@@ -15,6 +15,12 @@ struct RenderAttachment {
 	vk::ImageLayout         image_layout  = vk::ImageLayout::eUndefined;
 	std::array<uint32_t, 4> clear_value   = {};
 	bool                    is_clear      = false;
+	// Mega-suite fix 6 (dynamic rendering loadOp): explicit full-overwrite hint.
+	// When true, the pass provably rewrites every texel (fullscreen clear or
+	// guaranteed overwrite), so BeginRendering may use LOAD_OP_DONT_CARE and skip
+	// the VRAM->tile reload. Defaults to false (LOAD), so behaviour is unchanged
+	// until a producer sets it.
+	bool                    is_discard    = false;
 	bool                    has_depth     = false;
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;

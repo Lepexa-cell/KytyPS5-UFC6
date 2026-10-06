@@ -333,8 +333,16 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		const auto& attachment = state.color_attachments[i];
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp =
-		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+		// Mega-suite fix 6: a fully overwritten color target skips the VRAM
+		// reload (DONT_CARE); clears still clear, everything else still loads.
+		// is_discard defaults to false, so no producer changes behaviour yet.
+		if (attachment.is_clear) {
+			colors[i].loadOp = vk::AttachmentLoadOp::eClear;
+		} else if (attachment.is_discard) {
+			colors[i].loadOp = vk::AttachmentLoadOp::eDontCare;
+		} else {
+			colors[i].loadOp = vk::AttachmentLoadOp::eLoad;
+		}
 		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
 		colors[i].clearValue.color.uint32 = attachment.clear_value;
 	}
@@ -343,16 +351,26 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	vk::RenderingAttachmentInfo depth {};
 	depth.imageView   = depth_stencil.image_view;
 	depth.imageLayout = depth_stencil.image_layout;
-	depth.loadOp =
-	    depth_stencil.depth_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	if (depth_stencil.depth_clear) {
+		depth.loadOp = vk::AttachmentLoadOp::eClear;
+	} else if (depth_stencil.is_discard) {
+		depth.loadOp = vk::AttachmentLoadOp::eDontCare;
+	} else {
+		depth.loadOp = vk::AttachmentLoadOp::eLoad;
+	}
 	depth.storeOp                       = vk::AttachmentStoreOp::eStore;
 	depth.clearValue.depthStencil.depth = std::bit_cast<float>(depth_stencil.clear_value[0]);
 
 	vk::RenderingAttachmentInfo stencil {};
 	stencil.imageView   = depth_stencil.image_view;
 	stencil.imageLayout = depth_stencil.image_layout;
-	stencil.loadOp =
-	    depth_stencil.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+	if (depth_stencil.stencil_clear) {
+		stencil.loadOp = vk::AttachmentLoadOp::eClear;
+	} else if (depth_stencil.is_discard) {
+		stencil.loadOp = vk::AttachmentLoadOp::eDontCare;
+	} else {
+		stencil.loadOp = vk::AttachmentLoadOp::eLoad;
+	}
 	stencil.storeOp                         = vk::AttachmentStoreOp::eStore;
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 

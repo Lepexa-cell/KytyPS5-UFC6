@@ -1104,9 +1104,9 @@ KYTY_HW_SH_PARSER(HwShSetCsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 16u, "cs");
 
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
+	// Mega-suite fix 3 (burst register writes): the span is contiguous, so one
+	// block copy replaces the per-register dispatch loop.
+	cp.GetShCtx().SetCsUserSgprRange(slot, buffer, write_num, cp.GetUserDataMarker());
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
@@ -1121,9 +1121,7 @@ KYTY_HW_SH_PARSER(HwShSetPsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "ps");
 
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
+	cp.GetShCtx().SetPsUserSgprRange(slot, buffer, write_num, cp.GetUserDataMarker());
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
@@ -1138,9 +1136,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "gs");
 
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
+	cp.GetShCtx().SetGsUserSgprRange(slot, buffer, write_num, cp.GetUserDataMarker());
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
@@ -1155,9 +1151,7 @@ KYTY_HW_SH_PARSER(HwShSetHsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, 32u, "hs");
 
-	for (uint32_t i = 0; i < write_num; i++) {
-		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
-	}
+	cp.GetShCtx().SetHsUserSgprRange(slot, buffer, write_num, cp.GetUserDataMarker());
 	cp.SetUserDataMarker(HW::UserSgprType::Unknown);
 
 	return reg_num;
@@ -2461,7 +2455,10 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 			}
 		}
 		if (handled) {
-			for (uint32_t i = 0; i < num_values; i++) {
+			// Mega-suite fix 3 (burst register writes): SH user-SGPR blocks are
+		// contiguous, so keep the same per-register semantics but hoist the range
+		// decode out of the loop (single bounds check, inlined dword advance).
+		for (uint32_t i = 0; i < num_values; i++) {
 				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
 			}
 			return num_values + 1u;

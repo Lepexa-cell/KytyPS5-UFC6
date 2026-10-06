@@ -597,6 +597,22 @@ struct UserSgprInfo {
 	uint32_t     count            = 0;
 };
 
+// Mega-suite fix 3 (burst register writes): one contiguous SET_SH_REG span over a
+// user-SGPR block uses block memory writes for values/types plus a single count
+// update, instead of per-register setter dispatch per dword.
+inline void SetUserSgprRange(UserSgprInfo& info, uint32_t first, const uint32_t* values,
+                             uint32_t count, UserSgprType type) {
+	EXIT_IF(values == nullptr);
+	EXIT_IF(first + count > static_cast<uint32_t>(UserSgprInfo::SGPRS_MAX));
+	std::memcpy(&info.value[first], values, static_cast<size_t>(count) * sizeof(uint32_t));
+	for (uint32_t i = 0; i < count; i++) {
+		info.type[first + i] = type;
+	}
+	if (first + count > info.count) {
+		info.count = first + count;
+	}
+}
+
 struct VertexShaderInfo {
 	EsStageRegisters es_regs;
 	LsStageRegisters ls_regs;
@@ -1039,6 +1055,22 @@ public:
 		m_ps.ps_user_sgpr.type[id]  = type;
 		m_ps.ps_user_sgpr.count =
 		    ((id + 1) > m_ps.ps_user_sgpr.count ? (id + 1) : m_ps.ps_user_sgpr.count);
+	}
+	void SetPsUserSgprRange(uint32_t first, const uint32_t* values, uint32_t count,
+	                        UserSgprType type) {
+		SetUserSgprRange(m_ps.ps_user_sgpr, first, values, count, type);
+	}
+	void SetCsUserSgprRange(uint32_t first, const uint32_t* values, uint32_t count,
+	                        UserSgprType type) {
+		SetUserSgprRange(m_cs.cs_user_sgpr, first, values, count, type);
+	}
+	void SetHsUserSgprRange(uint32_t first, const uint32_t* values, uint32_t count,
+	                        UserSgprType type) {
+		SetUserSgprRange(m_vs.hs_user_sgpr, first, values, count, type);
+	}
+	void SetGsUserSgprRange(uint32_t first, const uint32_t* values, uint32_t count,
+	                        UserSgprType type) {
+		SetUserSgprRange(m_vs.gs_user_sgpr, first, values, count, type);
 	}
 	void SetCsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
 		m_cs.cs_user_sgpr.value[id] = value;

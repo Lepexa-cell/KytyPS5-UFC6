@@ -3186,10 +3186,12 @@ static void CleanupThread(void* arg) {
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	// Every Frostbite job/fiber worker runs on a guest pthread: keep all of them
-	// on the P-cores so the 5 fast cores never stall behind a worker parked on an
-	// E-core. Intersects with the process mask; never fails.
-	Common::PinCurrentThreadToPerformanceCores(Common::PerfCorePriority::AboveNormal);
+	// Mega-suite fix 5: every Frostbite job/fiber worker runs on a guest pthread.
+	// Spread them over P-Cores 2..5 (0x0FF0); P-Core 0 belongs to the PM4
+	// translator and P-Core 1 to the Vulkan submit worker. Intersects with the
+	// process mask; never fails.
+	Common::PinCurrentThreadToMask(static_cast<uint32_t>(Common::PerfCoreMask::GuestJobs),
+	                               Common::PerfCorePriority::AboveNormal);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (!Common::HostException::InitializeThreadSignalStack()) {
