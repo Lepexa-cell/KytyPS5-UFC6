@@ -351,12 +351,16 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		EmitIfCondition(state, is_primitive, [&] {
 			const auto packed = MeshLoad(state, state.mesh_primitive_data, spv::StorageClassPrivate,
 			                             TypeU32(state), ConstantU32(state, slot));
+			// Three 10-bit fields at bits 0, 10 and 20. Each field's top bit is that vertex's
+			// edge flag (the GS passthrough VGPR is {edge 2, offset 2, edge 1, offset 1, edge 0,
+			// offset 0}, exported as is), and a subgroup has at most 256 vertices: the index is
+			// the low 9 bits. A set edge flag read as part of the index pointed past 511.
 			uint32_t   vertex[3] {};
 			for (uint32_t component = 0; component < 3; component++) {
 				vertex[component] = state.builder.AllocateId();
 				state.builder.AddFunction(
 				    spv::OpBitFieldUExtract, TypeU32(state), vertex[component], packed,
-				    ConstantU32(state, component * 10u), ConstantU32(state, 10));
+				    ConstantU32(state, component * 10u), ConstantU32(state, 9));
 			}
 			const auto triangle = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 3), triangle,
