@@ -351,6 +351,7 @@ void VisitPlanFields(Io& io, T& v) {
 	io(v.buffer_writes_bounded);
 	io(v.buffer_writes);
 	io(v.clean_flat_slots);
+	io(v.gpu_fill_slots);
 	io(v.requires_specialization_memory);
 	io(v.capture_specialization_reads);
 	io(v.bindless_images);
@@ -388,7 +389,7 @@ static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
 static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
 static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
 static_assert(sizeof(IR::ResourceSpecialization) == 72);
-static_assert(sizeof(IR::ResourcePlan) == 832);
+static_assert(sizeof(IR::ResourcePlan) == 856);
 #endif
 
 struct Writer {
