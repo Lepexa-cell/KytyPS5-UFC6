@@ -1123,126 +1123,6 @@ struct ShaderRefreshEntry {
 	bool                                 valid = false;
 };
 
-struct DrawRenderStateL1Key {
-	// Shader program identities (ES/GS/PS bases). HS/LS only matter for
-	// tessellation draws, handled via prim_type + full re-resolve on miss.
-	uint64_t es_addr = 0;
-	uint64_t gs_addr = 0;
-	uint64_t ps_addr = 0;
-	// Color targets: base address + view selector (mip/layers).
-	uint64_t color_base[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t color_view[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t color_view_hi[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	// Depth target: Z/stencil read/write bases + depth view selector.
-	uint64_t depth_z_read   = 0;
-	uint64_t depth_s_read   = 0;
-	uint64_t depth_z_write  = 0;
-	uint64_t depth_s_write  = 0;
-	uint32_t depth_view_lo  = 0;
-	uint32_t depth_view_hi  = 0;
-	uint32_t depth_override = 0;
-	// Masks / stages / modes that gate color output and program selection.
-	uint32_t render_target_mask = 0;
-	uint32_t shader_stages      = 0;
-	uint32_t cb_shader_mask     = 0;
-	uint8_t  target_output_mode[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	uint32_t prim_type = 0;
-	uint32_t slice     = 0;
-	bool     indexed   = false;
-
-	[[nodiscard]] bool operator==(const DrawRenderStateL1Key&) const noexcept = default;
-};
-
-struct DrawRenderStateL1Entry {
-	DrawRenderStateL1Key key {};
-	bool                valid  = false;
-	bool                result = false;
-	DrawRenderState     state {};
-};
-
-// Scoped to the active render pass: EndRendering invalidates it, so a new
-// pass or frame never reuses the previous pass's resolved targets.
-// (BeginRendering routes pass changes through EndRendering, and Submit/End
-// do the same at command-buffer boundaries.)
-thread_local DrawRenderStateL1Entry t_draw_state_l1;
-void                                InvalidateDrawRenderStateL1() {
-	t_draw_state_l1.valid = false;
-}
-
-static DrawRenderStateL1Key MakeDrawRenderStateL1Key(const HW::Context& ctx,
-                                                     const HW::UserConfig& ucfg,
-                                                     const HW::Shader& sh, uint32_t slice,
-                                                     bool indexed) {
-	DrawRenderStateL1Key key {};
-	const auto&          vs = sh.GetVs();
-	const auto&          ps = sh.GetPs();
-	key.es_addr = vs.es_regs.data_addr;
-	key.gs_addr = vs.gs_regs.data_addr;
-	key.ps_addr = ps.ps_regs.data_addr;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		const auto& rt = ctx.GetRenderTarget(slot);
-		key.color_base[slot]    = rt.base.addr;
-		key.color_view[slot]    = rt.view.base_array_slice_index |
-		                          (rt.view.last_array_slice_index << 16u);
-		key.color_view_hi[slot] = rt.view.current_mip_level;
-	}
-	const auto& z = ctx.GetDepthRenderTarget();
-	key.depth_z_read   = z.z_read_base_addr;
-	key.depth_s_read   = z.stencil_read_base_addr;
-	key.depth_z_write  = z.z_write_base_addr;
-	key.depth_s_write  = z.stencil_write_base_addr;
-	key.depth_view_lo  = z.depth_view.slice_start | (z.depth_view.slice_max << 16u);
-	key.depth_view_hi  = static_cast<uint32_t>(z.depth_view.current_mip_level) |
-	                     (static_cast<uint32_t>(z.depth_view.depth_write_disable) << 8u) |
-	                     (static_cast<uint32_t>(z.depth_view.stencil_write_disable) << 9u);
-	const auto& ov = ctx.GetDepthRenderOverride();
-	key.depth_override = static_cast<uint32_t>(ov.force_z_valid) |
-	                     (static_cast<uint32_t>(ov.force_z_dirty) << 1u) |
-	                     (static_cast<uint32_t>(ov.force_stencil_valid) << 2u) |
-	                     (static_cast<uint32_t>(ov.force_stencil_dirty) << 3u);
-	key.render_target_mask = ctx.GetRenderTargetMask();
-	key.shader_stages      = ctx.GetShaderStages();
-	key.cb_shader_mask     = ctx.GetShaderRegisters().m_cbShaderMask;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		key.target_output_mode[slot] = ctx.GetShaderRegisters().target_output_mode[slot];
-	}
-	key.prim_type = static_cast<uint32_t>(ucfg.GetPrimType());
-	key.slice     = slice;
-	key.indexed   = indexed;
-	return key;
-}
-
-static void FixDrawRenderStateL1Pointers(DrawRenderState& s) {
-	// GetGraphicsPrograms makes vertex_info[0].pixel_input point at the state's own
-	// ps_input_info. A value copy leaves a dangling pointer at the source, so re-point
-	// any non-null entry at this copy's storage (other stages stay null).
-	for (auto& vi : s.vertex_info) {
-		if (vi.pixel_input != nullptr) {
-			vi.pixel_input = &s.ps_input_info;
-		}
-	}
-}
-
-static bool DrawRenderStateL1KeyMatches(const DrawRenderStateL1Entry& e,
-                                        const DrawRenderStateL1Key& key) {
-	return e.valid && e.key == key;
-}
-
-static void DrawRenderStateL1Store(DrawRenderStateL1Entry& e, const DrawRenderStateL1Key& key,
-                                   const DrawRenderState& s, bool result) {
-	e.key    = key;
-	e.state  = s;
-	FixDrawRenderStateL1Pointers(e.state);
-	e.result = result;
-	e.valid  = true;
-}
-
-// NOTE: the L1 hit path itself lives inline in PrepareDrawRenderState (a
-// RenderExecutor member), because it touches TextureCache::m_slot_images
-// (private, friended to RenderExecutor only) and replays BindRenderTarget
-// (a private member). A free helper cannot do either.
-
-
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -1399,55 +1279,7 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	// L1: Frostbite re-emits identical target/shader blocks across consecutive
-	// draws, so a key hit reuses the whole resolved state (programs + targets)
-	// in O(1). The key covers ONLY what discovery reads: ES/GS/PS shader
-	// bases, color base+view per slot, depth Z/stencil bases+view+override,
-	// render-target/shader-stage/CB masks, target output modes, prim type,
-	// slice and indexed bit. No tick check (state outlives a command buffer)
-	// and no blind Context memcmp (user SGPRs/counters churn every draw and
-	// are consumed later, not here). A hit still replays the per-draw
-	// BindRenderTarget side effects (ResetBindings consumes them), and bails
-	// to the slow path if any cached image was recycled (needs_rebind).
-	// Skipped draws (false) are cached too: their callers ResetBindings
-	// and return the same way. The entry is scoped to the active render
-	// pass (invalidated on EndRendering), so a new pass or frame
-	// never renders into the previous pass's buffers.
-	const auto l1_key = MakeDrawRenderStateL1Key(buffer.GetRegisters(), buffer.GetUserConfig(),
-	                                             buffer.GetShaders(), render_target_slice_offset,
-	                                             draw.IsIndexed());
-	if (DrawRenderStateL1KeyMatches(t_draw_state_l1, l1_key)) {
-		// Same checks AcquireRenderTargets applies below: a stale handle (GC
-		// recycled, overlap-expanded -> needs_rebind) falls back to discovery.
-		auto&          l1_cache = buffer.GetContext().GetTextureCache();
-		bool           l1_live  = true;
-		for (uint32_t i = 0; l1_live && i < t_draw_state_l1.state.color_count; i++) {
-			const auto* owner =
-			    l1_cache.m_slot_images.try_get(t_draw_state_l1.state.color_info[i].image_id);
-			l1_live = owner != nullptr && owner->registered && !owner->binding.needs_rebind;
-		}
-		if (l1_live && t_draw_state_l1.state.depth_info.image_id) {
-			const auto* owner =
-			    l1_cache.m_slot_images.try_get(t_draw_state_l1.state.depth_info.image_id);
-			l1_live = owner != nullptr && owner->registered && !owner->binding.needs_rebind;
-		}
-		if (l1_live) {
-			state = t_draw_state_l1.state;
-			FixDrawRenderStateL1Pointers(state);
-			if (t_draw_state_l1.result) {
-				// Replay the per-draw BindRenderTarget side effects discovery
-				// performs (binding flags + m_bound_images tracking consumed by
-				// ResetBindings) and keep the images GC-live via GetImage().
-				for (uint32_t i = 0; i < state.color_count; i++) {
-					BindRenderTarget(state.color_info[i].image_id);
-				}
-				if (state.depth_info.image_id) {
-					BindRenderTarget(state.depth_info.image_id);
-				}
-			}
-			return t_draw_state_l1.result;
-		}
-	}
+	// Honest per-draw resolve.
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
@@ -1456,7 +1288,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
-		DrawRenderStateL1Store(t_draw_state_l1, l1_key, state, false);
 		return false;
 	}
 	uint32_t mrt_mask = 0;
@@ -1488,7 +1319,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
-		DrawRenderStateL1Store(t_draw_state_l1, l1_key, state, false);
 		return false;
 	}
 	// Shader outputs identify active attachments; finalize centroid after resolving them.
@@ -1520,7 +1350,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		                         state.depth_info, buffer.GetRegisters().GetAaConfig()));
 	}
 
-	DrawRenderStateL1Store(t_draw_state_l1, l1_key, state, true);
 	return true;
 }
 
@@ -1600,53 +1429,6 @@ static void CommitIndexBuffer(CommandBuffer& buffer, vk::CommandBuffer vk_buffer
 	if (buffer.BindIndexBufferCached(prepared.buffer, prepared.offset, prepared.type)) {
 		vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
 	}
-}
-
-[[nodiscard]] static bool DrawScissorIsEmpty(const CommandBuffer& buffer,
-                                      const DrawRenderState& state) {
-	// Zero-area scissor cull: the scissor test discards 100% of fragments, so
-	// skip command-buffer emission entirely. Mirrors SetGraphicsDynamicParams:
-	// slot 0 unless the VS can emit a viewport index, clamped to the draw's
-	// framebuffer extent. Uses the resolved color/depth extents (mip-aware)
-	// rather than re-resolving targets. Rasterizer-discard-equivalent draws
-	// with no color/depth work never reach here (PrepareDrawRenderState).
-	const auto& ctx = buffer.GetRegisters();
-	const auto& vp  = ctx.GetScreenViewport();
-	const auto& outputs =
-	    state.vertex_info[0].stage.program->info.outputs;
-	const bool indexed_viewports =
-	    std::any_of(outputs.begin(), outputs.end(), [](const auto& output) {
-		    return output.kind == ShaderRecompiler::IR::StageOutputKind::ViewportIndex;
-	    });
-	const uint32_t slot_count =
-	    indexed_viewports ? static_cast<uint32_t>(std::size(HW::ScreenViewport {}.viewports)) : 1u;
-	vk::Extent2D framebuffer_extent {0, 0};
-	for (uint32_t i = 0; i < state.color_count; i++) {
-		const auto extent = state.color_info[i].Extent();
-		framebuffer_extent.width =
-		    framebuffer_extent.width == 0 ? extent.width : std::min(framebuffer_extent.width, extent.width);
-		framebuffer_extent.height =
-		    framebuffer_extent.height == 0 ? extent.height : std::min(framebuffer_extent.height, extent.height);
-	}
-	if (state.depth_info.image_id &&
-	    state.depth_info.desc.view_info.format != vk::Format::eUndefined) {
-		const auto width = std::max(state.depth_info.desc.info.extent.width, 1u);
-		const auto height = std::max(state.depth_info.desc.info.extent.height, 1u);
-		framebuffer_extent.width =
-		    framebuffer_extent.width == 0 ? width : std::min(framebuffer_extent.width, width);
-		framebuffer_extent.height =
-		    framebuffer_extent.height == 0 ? height : std::min(framebuffer_extent.height, height);
-	}
-	if (framebuffer_extent.width == 0 || framebuffer_extent.height == 0) {
-		return false;
-	}
-	for (uint32_t i = 0; i < slot_count; i++) {
-		const auto scissor = calc_final_scissor(vp, ctx.GetScanModeControl(), framebuffer_extent, i);
-		if (scissor.right > scissor.left && scissor.bottom > scissor.top) {
-			return false;
-		}
-	}
-	return true;
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1784,9 +1566,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		m_context.GetGpu().GraphicsProcessor().TelemetryAddDrawBindings(
 		    CommandProcessor::TelemetryNowUs() - bindings_prepare_us);
 	}
-	// Zero-area scissor cull: geometry is 100% clipped, so skip buffer,
-	// pipeline and command-buffer work entirely. Memory-writing draws cannot
-	// be skipped: others may read what they write.
+	// Memory-writing draws cannot be deferred: others may read what they write.
 	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
 		return HasShaderBufferWrites(runtime) ||
 		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
@@ -1797,11 +1577,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
-	}
-	bool writes_any_memory = !may_defer;
-	if (!writes_any_memory && !mesh_active && DrawScissorIsEmpty(buffer, state)) {
-		ResetBindings();
-		return;
 	}
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;

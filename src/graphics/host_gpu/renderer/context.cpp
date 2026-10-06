@@ -375,9 +375,6 @@ void CommandBuffer::EndRendering() const {
 	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
-	// The pass's buffers are done: the L1 entry must not leak into the
-	// next pass or frame.
-	InvalidateDrawRenderStateL1();
 }
 
 bool CommandBuffer::IsRendering() const {

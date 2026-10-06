@@ -39,11 +39,6 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 
-// DrawRenderState L1 in renderDraw.cpp is scoped to the active render pass.
-// CommandBuffer pass transitions call this so a new pass/frame never reuses
-// the previous pass's resolved render targets.
-void InvalidateDrawRenderStateL1();
-
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
