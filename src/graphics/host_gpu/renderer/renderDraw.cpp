@@ -1762,7 +1762,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	KYTY_PROFILER_FUNCTION();
 
-	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& draw_scheduler = m_context.GetCommandScheduler();
+	draw_scheduler.PopPendingOperations();
+	// Draws are graphics work: the open submission stays on the graphics queue.
+	draw_scheduler.RouteGraphics();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1892,7 +1895,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	KYTY_PROFILER_FUNCTION();
 
-	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& auto_scheduler = m_context.GetCommandScheduler();
+	auto_scheduler.PopPendingOperations();
+	auto_scheduler.RouteGraphics();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 

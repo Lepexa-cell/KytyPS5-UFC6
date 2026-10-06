@@ -22,6 +22,16 @@ public:
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
+	// Async compute (PS5 ACE model): compute-only submissions run on the dedicated
+	// hardware queue in parallel with graphics. RouteCompute() marks the open command
+	// buffer compute-only once per submission; QueueSubmit() then targets
+	// graphics.compute_queue and chains the shared timeline (signal on compute,
+	// wait on the next graphics submit after it) so uploads->dispatch->draw stay ordered.
+	// Any mixed graphics/compute state resets the flag and the submit stays on graphics.
+	void           RouteCompute() noexcept { m_compute_only = true; }
+	void           RouteGraphics() noexcept { m_compute_only = false; }
+	[[nodiscard]] bool IsComputeOnly() const noexcept { return m_compute_only; }
+
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
@@ -102,7 +112,7 @@ public:
 private:
 	class CommandPool {
 	public:
-		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
+		CommandPool(GraphicContext& graphics, MasterSemaphore& master, uint32_t family);
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
@@ -134,6 +144,7 @@ private:
 		vk::CommandBuffer buffer = nullptr;
 		SubmitInfo        submit;
 		uint64_t          tick         = 0;
+		bool              compute_only = false;
 		uint32_t          debug_op     = 0;
 		uint64_t          debug_submit = 0;
 		uint32_t          debug_arg0   = 0;
@@ -156,6 +167,13 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// Set by RouteCompute()/RouteGraphics(): true only when the open submission holds
+	// dispatches and no graphics work. Reset on every Submit()/BeginNext().
+	bool                         m_compute_only = false;
+	// Last compute-only tick submitted to the async queue: the next graphics submit waits
+	// on it via the shared timeline (compute signal -> graphics wait), and vice versa.
+	uint64_t                     m_last_compute_tick = 0;
+	uint64_t                     m_last_graphics_tick = 0;
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;

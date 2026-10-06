@@ -78,6 +78,14 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Dedicated hardware async-compute queue (PS5 ACE model): compute dispatches are
+	// submitted here so the driver can overlap skinning/physics with rasterization.
+	// compute_queue_family == queue_family with compute_queue_index 0 means no separate
+	// queue exists and compute shares the graphics queue (graceful fallback).
+	Common::Mutex queue_compute_mutex;
+	uint32_t      compute_queue_family = static_cast<uint32_t>(-1);
+	uint32_t      compute_queue_index  = 0;
+	vk::Queue     compute_queue        = nullptr;
 	// Frames presented so far: the clock the caches age their entries by.
 	std::atomic<uint64_t>              presented_frames {0};
 

@@ -87,11 +87,12 @@ uint32_t FrameFlushBudget() {
 
 } // namespace
 
-CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
+CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master,
+                                            uint32_t family)
     : m_graphics(graphics), m_master(master) {
-	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
+	EXIT_IF(family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
-	create.queueFamilyIndex = graphics.queue_family;
+	create.queueFamilyIndex = family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
@@ -152,7 +153,7 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
-      m_command_pool(graphics, m_master), m_command(*this),
+      m_command_pool(graphics, m_master, graphics.queue_family), m_command(*this),
       m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
 
 CommandScheduler::~CommandScheduler() {
@@ -215,6 +216,8 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state) {
+	// Any graphics scope makes the open submission mixed: it must stay on graphics.
+	m_compute_only = false;
 	Current().BeginRendering(state);
 }
 
@@ -563,9 +566,24 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_command.End();
 	EXIT_IF(m_graphics.queue == nullptr);
 
+	// Async compute routing: a submission holding only dispatches runs on the dedicated
+	// queue. Cross-queue order uses the shared master timeline: a compute submit waits
+	// for the last graphics tick, a graphics submit after compute waits for the last
+	// compute tick. Same-queue fallback (no dedicated queue) needs no extra edges.
+	const bool dedicated_compute =
+	    m_graphics.compute_queue != nullptr && m_graphics.compute_queue != m_graphics.queue;
+	const bool compute_submit = m_compute_only && dedicated_compute;
+	if (compute_submit && m_last_graphics_tick != 0) {
+		submit.AddWait(m_master.Handle(), m_last_graphics_tick,
+		               vk::PipelineStageFlagBits::eComputeShader);
+	} else if (!compute_submit && dedicated_compute && m_last_compute_tick != 0) {
+		submit.AddWait(m_master.Handle(), m_last_compute_tick);
+	}
+
 	SubmitJob job {
 	    .buffer       = m_command.m_buffer,
 	    .submit       = submit,
+	    .compute_only = compute_submit,
 	    .debug_op     = m_command.m_debug_op,
 	    .debug_submit = m_command.m_debug_submit_id,
 	    .debug_arg0   = m_command.m_debug_arg0,
@@ -578,9 +596,15 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;
+	m_compute_only                    = false;
 
 	if (!m_async_submit) {
 		QueueSubmit(job);
+		if (job.compute_only) {
+			m_last_compute_tick = job.tick;
+		} else if (dedicated_compute) {
+			m_last_graphics_tick = job.tick;
+		}
 		return job.tick;
 	}
 	{
@@ -589,6 +613,11 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		std::lock_guard lock(m_submit_mutex);
 		job.tick = m_master.NextTick();
 		job.submit.AddSignal(m_master.Handle(), job.tick);
+		if (job.compute_only) {
+			m_last_compute_tick = job.tick;
+		} else if (dedicated_compute) {
+			m_last_graphics_tick = job.tick;
+		}
 		if (m_submit_head >= m_submit_jobs.size()) {
 			// Fully drained: restart at 0 and reuse capacity (no free).
 			m_submit_jobs.clear();
@@ -611,7 +640,36 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 void CommandScheduler::QueueSubmit(SubmitJob& job) {
 	auto&      graphics = m_graphics;
 	vk::Result result;
-	{
+	// Compute-only work targets the dedicated queue (own mutex: two queues can submit in
+	// parallel); mixed/graphics work keeps the graphics queue and its existing lock order.
+	if (job.compute_only && graphics.compute_queue != nullptr &&
+	    graphics.compute_queue != graphics.queue) {
+		Common::LockGuard lock(graphics.queue_compute_mutex);
+		if (!m_async_submit) {
+			job.tick = m_master.NextTick();
+			job.submit.AddSignal(m_master.Handle(), job.tick);
+		}
+		const auto& submit = job.submit;
+
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &job.buffer;
+		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+		result = graphics.compute_queue.submit(1, &submit_info, nullptr);
+		Timeline::Mark("vk-submit-compute", job.tick);
+	} else {
 		Common::LockGuard lock(graphics.queue_mutex);
 		if (!m_async_submit) {
 			job.tick = m_master.NextTick();
@@ -636,8 +694,8 @@ void CommandScheduler::QueueSubmit(SubmitJob& job) {
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
+		Timeline::Mark("vk-submit", job.tick);
 	}
-	Timeline::Mark("vk-submit", job.tick);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);

@@ -460,7 +460,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.PopPendingOperations();
+	// Async compute: a submission holding only dispatches can run on the dedicated queue.
+	// Any graphics work (BeginRendering/draw) clears the flag via RouteGraphics().
+	scheduler.RouteCompute();
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -719,9 +723,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	// The arguments are thread counts: IndirectDispatchGroups converts them on the GPU, and the
 	// shader bounds its threads by the counts it reads from the same memory.
+	auto& scheduler = m_context.GetCommandScheduler();
+	scheduler.PopPendingOperations();
+	scheduler.RouteCompute();
 	const bool use_thread_dimensions =
 	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
-	m_context.GetCommandScheduler().PopPendingOperations();
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);

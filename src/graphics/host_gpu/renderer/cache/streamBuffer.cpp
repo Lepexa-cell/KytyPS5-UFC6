@@ -65,6 +65,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// Async compute uses a second queue of the same family, so EXCLUSIVE sharing stays
+	// valid and no queue-family ownership transfer is needed. (A compute-only family
+	// would require CONCURRENT here; selection keeps that path on the shared queue.)
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	const VmaAllocationCreateFlags bda_flag =

@@ -129,7 +129,14 @@ static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
 	return (supported_features & features) == features;
 }
 
-static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR surface) {
+struct QueueFamilySelection {
+	uint32_t graphics       = static_cast<uint32_t>(-1);
+	uint32_t compute_family = static_cast<uint32_t>(-1);
+	uint32_t compute_index  = 0;
+};
+
+static QueueFamilySelection VulkanFindQueueFamilies(vk::PhysicalDevice device,
+                                                    vk::SurfaceKHR     surface) {
 	EXIT_IF(device == nullptr);
 	EXIT_IF(surface == nullptr);
 
@@ -139,6 +146,7 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	device.getQueueFamilyProperties(&queue_family_count, queue_families.data());
 
 	const auto required = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute;
+	QueueFamilySelection selection;
 	for (uint32_t family = 0; family < queue_family_count; family++) {
 		const auto& properties             = queue_families[family];
 		vk::Bool32  presentation_supported = VK_FALSE;
@@ -149,12 +157,37 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 		     vk::to_string(properties.queueFlags).c_str(), properties.queueCount,
 		     (presentation_supported == VK_TRUE ? "true" : "false"));
 		if (properties.queueCount != 0 && (properties.queueFlags & required) == required &&
-		    presentation_supported == VK_TRUE) {
+		    presentation_supported == VK_TRUE &&
+		    selection.graphics == static_cast<uint32_t>(-1)) {
 			LOGF("\tselected universal queue family %u\n", family);
-			return family;
+			selection.graphics = family;
+		}
+		// NVIDIA Ada exposes async overlap as a second queue of the universal family,
+		// which shares the graphics command pool. A compute-only family would need its
+		// own pool and cross-family ownership transfers, so leave it shared (fallback).
+		if (properties.queueCount != 0 &&
+		    (properties.queueFlags & vk::QueueFlagBits::eCompute) &&
+		    !(properties.queueFlags & vk::QueueFlagBits::eGraphics) &&
+		    selection.compute_family == static_cast<uint32_t>(-1)) {
+			LOGF("\tcompute-only queue family %u ignored: cross-family compute needs its own pool\n",
+			     family);
 		}
 	}
-	return static_cast<uint32_t>(-1);
+	if (selection.graphics == static_cast<uint32_t>(-1)) {
+		return selection;
+	}
+	// Fallback: a second queue from the universal family still allows async overlap
+	// on drivers that expose only one family (Ada exposes more than one queue here).
+	if (selection.compute_family == static_cast<uint32_t>(-1) &&
+	    queue_families[selection.graphics].queueCount >= 2) {
+		selection.compute_family = selection.graphics;
+		selection.compute_index  = 1;
+	}
+	if (selection.compute_family != static_cast<uint32_t>(-1)) {
+		LOGF("\tselected async compute queue family %u index %u\n", selection.compute_family,
+		     selection.compute_index);
+	}
+	return selection;
 }
 
 // On failure out_device is null and out_rejections says why each device was skipped.
@@ -163,6 +196,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
                                      const std::vector<const char*>& device_extensions,
                                      SurfaceCapabilities&            out_capabilities,
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
+                                     uint32_t& out_compute_family, uint32_t& out_compute_index,
                                      std::string& out_rejections) {
 	EXIT_IF(instance == nullptr);
 	EXIT_IF(surface == nullptr);
@@ -182,8 +216,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 	}
 
-	vk::PhysicalDevice  best_device       = nullptr;
-	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
+	vk::PhysicalDevice  best_device          = nullptr;
+	uint32_t            best_queue_family    = static_cast<uint32_t>(-1);
+	uint32_t            best_compute_family  = static_cast<uint32_t>(-1);
+	uint32_t            best_compute_index   = 0;
 	SurfaceCapabilities best_capabilities;
 
 	for (const auto& device: devices) {
@@ -240,8 +276,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		const auto required_features12 = WindowContext::RequiredVulkan12Features();
 		const auto required_features13 = WindowContext::RequiredVulkan13Features();
 
-		const auto queue_family = VulkanFindQueueFamily(device, surface);
-		if (queue_family == static_cast<uint32_t>(-1)) {
+		const auto queue_family = VulkanFindQueueFamilies(device, surface);
+		if (queue_family.graphics == static_cast<uint32_t>(-1)) {
 			reject("No universal graphics, compute, and presentation queue");
 		}
 
@@ -397,14 +433,18 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		if (best_device == nullptr ||
 		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
-			best_device       = device;
-			best_queue_family = queue_family;
-			best_capabilities = std::move(candidate_capabilities);
+			best_device         = device;
+			best_queue_family   = queue_family.graphics;
+			best_compute_family = queue_family.compute_family;
+			best_compute_index  = queue_family.compute_index;
+			best_capabilities   = std::move(candidate_capabilities);
 		}
 	}
 
-	out_device       = best_device;
-	out_queue_family = best_queue_family;
+	out_device         = best_device;
+	out_queue_family   = best_queue_family;
+	out_compute_family = best_compute_family;
+	out_compute_index  = best_compute_index;
 	if (best_device != nullptr) {
 		out_capabilities = std::move(best_capabilities);
 	}
@@ -420,10 +460,25 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
 	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
-	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	// A second priority value is required only when two queues come from one family.
+	const float               queue_priorities[2] = {1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo queue_create_infos[1] {};
+	uint32_t                  queue_create_count = 0;
+	queue_create_infos[0].queueFamilyIndex = queue_family;
+	if (graphics.compute_queue_family == queue_family && graphics.compute_queue_index == 1) {
+		// Second queue of the same family: valid for the shared graphics pool, allows
+		// driver-level overlap of compute-only submissions with graphics.
+		queue_create_infos[0].queueCount       = 2;
+		queue_create_infos[0].pQueuePriorities = queue_priorities;
+		queue_create_count                     = 1;
+	} else {
+		// Graceful fallback: no separate queue, compute shares the graphics queue.
+		graphics.compute_queue_family = queue_family;
+		graphics.compute_queue_index  = 0;
+		queue_create_infos[0].queueCount       = 1;
+		queue_create_infos[0].pQueuePriorities = &queue_priority;
+		queue_create_count                     = 1;
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -736,8 +791,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.device_fault_enabled = true;
 		}
 	}
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos;
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
@@ -1130,6 +1185,7 @@ void WindowContext::CreateVulkan() {
 	std::string rejected_devices;
 	VulkanFindPhysicalDevice(graphic_ctx.instance, surface, device_extensions, surface_capabilities,
 	                         graphic_ctx.physical_device, graphic_ctx.queue_family,
+	                         graphic_ctx.compute_queue_family, graphic_ctx.compute_queue_index,
 	                         rejected_devices);
 
 	if (graphic_ctx.physical_device == nullptr) {
@@ -1213,6 +1269,23 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	// Dedicated async-compute queue: a compute-only family, or index 1 of the universal
+	// family; otherwise fall back to sharing the graphics queue.
+	if (graphic_ctx.compute_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.compute_queue_family,
+		                            graphic_ctx.compute_queue_index, &graphic_ctx.compute_queue);
+	}
+	if (graphic_ctx.compute_queue == nullptr) {
+		graphic_ctx.compute_queue_family = graphic_ctx.queue_family;
+		graphic_ctx.compute_queue_index  = 0;
+		graphic_ctx.compute_queue        = graphic_ctx.queue;
+	}
+	LOGF("Vulkan async compute queue: family %u index %u (%s)\n",
+	     graphic_ctx.compute_queue_family, graphic_ctx.compute_queue_index,
+	     (graphic_ctx.compute_queue_family == graphic_ctx.queue_family &&
+	      graphic_ctx.compute_queue_index == 0)
+	         ? "shared with graphics"
+	         : "dedicated");
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
