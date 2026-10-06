@@ -1160,6 +1160,15 @@ struct DrawRenderStateL1Entry {
 	DrawRenderState     state {};
 };
 
+// Scoped to the active render pass: EndRendering invalidates it, so a new
+// pass or frame never reuses the previous pass's resolved targets.
+// (BeginRendering routes pass changes through EndRendering, and Submit/End
+// do the same at command-buffer boundaries.)
+thread_local DrawRenderStateL1Entry t_draw_state_l1;
+void                                InvalidateDrawRenderStateL1() {
+	t_draw_state_l1.valid = false;
+}
+
 static DrawRenderStateL1Key MakeDrawRenderStateL1Key(const HW::Context& ctx,
                                                      const HW::UserConfig& ucfg,
                                                      const HW::Shader& sh, uint32_t slice,
@@ -1401,8 +1410,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	// BindRenderTarget side effects (ResetBindings consumes them), and bails
 	// to the slow path if any cached image was recycled (needs_rebind).
 	// Skipped draws (false) are cached too: their callers ResetBindings
-	// and return the same way.
-	thread_local DrawRenderStateL1Entry t_draw_state_l1;
+	// and return the same way. The entry is scoped to the active render
+	// pass (invalidated on EndRendering), so a new pass or frame
+	// never renders into the previous pass's buffers.
 	const auto l1_key = MakeDrawRenderStateL1Key(buffer.GetRegisters(), buffer.GetUserConfig(),
 	                                             buffer.GetShaders(), render_target_slice_offset,
 	                                             draw.IsIndexed());

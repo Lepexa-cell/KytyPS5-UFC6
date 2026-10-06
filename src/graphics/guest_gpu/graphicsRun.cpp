@@ -945,17 +945,11 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				// Batch the end-of-submission submit with the RELEASE_MEM windows:
-				// guest fence writes are already guest-visible, so route this
-				// through the 512-write batch bound instead of paying one
-				// vkQueueSubmit per guest submission (~160/frame in UFC 5).
-				// Incomplete submissions still submit at suspend points and
-				// frame/flip boundaries; completion only reaps the leftovers.
-				if (complete) {
-					cp.CompleteReleaseMemWrite();
-				} else {
-					cp.BufferFlush();
-				}
+				// Fix-forward: immediate submit on completion. The octagon
+				// loading path waits synchronously for asset-load commands;
+				// batching the submit delays completion and times out the
+				// match transition.
+				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
@@ -981,14 +975,8 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
-				// Same batching as the graphics path above: completion only
-				// reaps leftovers, incomplete work still drains at suspend
-				// points and frame/flip boundaries.
-				if (complete) {
-					cp.CompleteReleaseMemWrite();
-				} else {
-					cp.BufferFlush();
-				}
+				// Fix-forward: same immediate submit as the graphics path.
+				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
 			}
