@@ -126,6 +126,9 @@ struct EmitterState {
 	// OpIsNan) then have the defined results the guest's IEEE instructions need.
 	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
 	uint32_t                                         lane_count              = 1;
+	// Execution scope of the barriers that keep one guest wave's LDS accesses in order across
+	// host invocations (WaveLdsScope in SpirvEmitter.cpp); 0 when none are emitted.
+	uint32_t                                         wave_lds_scope          = 0;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;

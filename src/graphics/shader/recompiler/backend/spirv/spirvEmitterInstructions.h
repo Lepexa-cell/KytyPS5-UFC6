@@ -198,6 +198,7 @@ inline constexpr auto EmitSendmsg      = EmitVoid;
 inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
+void                  EmitWaveLdsBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
 void                  EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);

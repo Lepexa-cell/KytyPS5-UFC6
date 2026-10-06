@@ -447,6 +447,47 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 }
 
 namespace {
+// The scope of the barriers that keep one guest wave's LDS accesses in order (EmitBlock). The
+// guest's lanes run in lockstep and its LDS accesses complete in program order; host invocations
+// need a barrier. It can be issued wherever the guest wave's control flow is uniform across the
+// barrier's scope, which holds everywhere at block level (divergence is emulated with EXEC):
+// - a single-wave workgroup gets the workgroup scope (on NVIDIA a subgroup-scope barrier did not
+//   make one lane's LDS writes visible to the others, as AnyPS5 found);
+// - otherwise the host subgroup scope, when one host subgroup holds exactly one guest wave;
+// - otherwise none (a barrier that other waves of the scope may not reach could hang).
+// Compute shaders that write LDS only. KYTY_WAVE_LDS_ORDER=0 turns it off.
+uint32_t WaveLdsScope(const IR::Program& program, const ShaderWorkgroupInputInfo* workgroup,
+                      uint32_t lane_count) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WAVE_LDS_ORDER");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled || program.stage != ShaderType::Compute || workgroup == nullptr) {
+		return 0;
+	}
+	bool writes = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = IR::SharedAccessOf(inst.GetOpcode());
+			writes |= access != IR::SharedAccess::None && access != IR::SharedAccess::Read;
+		}
+	}
+	if (!writes) {
+		return 0;
+	}
+	const auto threads = std::max(workgroup->threads_num[0], 1u) *
+	                     std::max(workgroup->threads_num[1], 1u) *
+	                     std::max(workgroup->threads_num[2], 1u);
+	if (threads <= program.wave_size) {
+		return spv::ScopeWorkgroup;
+	}
+	if (lane_count == 2u || (program.wave_size == workgroup->host_subgroup_size &&
+	                         workgroup->host_subgroup_size <= 32u)) {
+		return spv::ScopeSubgroup;
+	}
+	return 0;
+}
+
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint32_t g_device_clock_shift {3};
 std::atomic_bool     g_coherent_load_acquire {false};
@@ -508,6 +549,7 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	if (program.stage == ShaderType::Mesh) {
 		state.mesh_passes = std::max(input_info.vertex->mesh.passes, 1u);
 	}
+	state.wave_lds_scope = WaveLdsScope(program, workgroup, state.lane_count);
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
