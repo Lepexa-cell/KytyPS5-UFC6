@@ -82,6 +82,44 @@ float Value::F32Value() const {
 	return std::bit_cast<float>(imm_u32);
 }
 
+uint64_t Value::ImmediateBits() const {
+	switch (type) {
+		case Type::Void: return 0;
+		case Type::ScalarReg: return static_cast<uint16_t>(scalar_reg);
+		case Type::VectorReg: return static_cast<uint16_t>(vector_reg);
+		case Type::U1: return imm_u1 ? 1u : 0u;
+		case Type::U8: return imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32;
+		case Type::U64: return imm_u64;
+		default: EXIT("Value::ImmediateBits: not an immediate (type %u)\n", static_cast<uint32_t>(type));
+	}
+	return 0;
+}
+
+bool Value::FromImmediateBits(Type type, uint64_t bits, Value& result) {
+	const auto fits = [bits](uint64_t max) { return bits <= max; };
+	switch (type) {
+		case Type::Void: result = Value(); return bits == 0;
+		case Type::ScalarReg:
+			result = Value(static_cast<ScalarReg>(static_cast<uint16_t>(bits)));
+			return fits(UINT16_MAX);
+		case Type::VectorReg:
+			result = Value(static_cast<VectorReg>(static_cast<uint16_t>(bits)));
+			return fits(UINT16_MAX);
+		case Type::U1: result = Value(bits != 0); return fits(1);
+		case Type::U8: result = Value(static_cast<uint8_t>(bits)); return fits(UINT8_MAX);
+		case Type::U16: result = Value(static_cast<uint16_t>(bits)); return fits(UINT16_MAX);
+		case Type::F16: result = F16(static_cast<uint16_t>(bits)); return fits(UINT16_MAX);
+		case Type::U32: result = Value(static_cast<uint32_t>(bits)); return fits(UINT32_MAX);
+		case Type::F32: result = Value(Type::F32, bits); return fits(UINT32_MAX);
+		case Type::U64: result = Value(bits); return true;
+		default: return false;
+	}
+}
+
 bool Value::operator==(const Value& other) const {
 	if (type != other.type) {
 		return false;

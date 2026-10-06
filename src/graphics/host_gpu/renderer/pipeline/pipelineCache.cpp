@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -38,6 +39,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <spirv-tools/libspirv.hpp>
@@ -116,6 +118,12 @@ std::string PipelineCacheTitleId() {
 		return {};
 	}
 	return title_id;
+}
+
+// _ShaderCache/<title id>, next to _PipelineCache; empty without a title id.
+std::filesystem::path ShaderDiskCacheDirectory() {
+	const auto title_id = PipelineCacheTitleId();
+	return title_id.empty() ? std::filesystem::path() : std::filesystem::path("_ShaderCache") / title_id;
 }
 
 template <typename... Args>
@@ -666,40 +674,191 @@ struct PipelineCache::ProgramCache {
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
 
-	Permutation CompilePermutation(const char*                                  stage_name,
-	                               const ShaderRecompiler::CompileOptions&      options,
-	                               ShaderRecompiler::TranslateResult            translated,
-	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	struct Compiled {
+		std::vector<uint32_t>                    spirv;
+		ShaderRecompiler::IR::CompiledShaderInfo program;
+	};
+
+	Compiled CompileTranslated(const ShaderRecompiler::CompileOptions&             options,
+	                           ShaderRecompiler::TranslateResult                   translated,
+	                           const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                           uint32_t push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		last_spirv_words = result.spirv.size();
+		return {.spirv   = std::move(result.spirv),
+		        .program = std::move(result.program).TakeCompiledInfo()};
+	}
+
+	// A compiled (or cached) permutation of the source: its module, bound for this stage.
+	template <typename InputInfo>
+	ShaderProgram AddPermutation(SourceEntry& source, const char* stage_name,
+	                             const ShaderRecompiler::CompileOptions&  options,
+	                             const std::vector<uint32_t>&             spirv,
+	                             ShaderRecompiler::IR::CompiledShaderInfo program,
+	                             InputInfo& input_info, uint32_t& push_data_cursor) {
 		Profiler::Phases phases;
 		phases.SetText("%s 0x%016" PRIx64, stage_name, options.shader_hash);
 		KYTY_PROFILER_PHASE(phases, "Shader: SPIR-V validate", profiler::colors::Blue300);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
-			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, spirv)) {
+			DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
 		}
-		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
+		DumpShaderSpirv(stage_name, options.shader_hash, spirv);
 
 		KYTY_PROFILER_PHASE(phases, "Shader: module create", profiler::colors::Blue300);
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(spirv, device);
 		EXIT_IF(module == nullptr);
 		phases.End();
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
-			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
+			     static_cast<uint64_t>(spirv.size()), options.wave_size);
 		}
-		return {
-		    .specialization = std::move(specialization),
-		    .program        = std::move(result.program).TakeCompiledInfo(),
+		source.permutations.push_back({
+		    .specialization = source.specialization,
+		    .program        = std::move(program),
 		    .handle         = {.id          = ++next_shader_id,
 		                       .module      = module,
-		                       .spirv_words = static_cast<uint32_t>(result.spirv.size()),
+		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
 		                       .hash        = options.shader_hash},
-		};
+		});
+		const auto& permutation = source.permutations.back();
+		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
+		permutation.program.bindings.AdvancePushData(push_data_cursor);
+
+		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
+		for (const auto& [key, entry]: programs) {
+			counts[static_cast<size_t>(key.stage)] += entry.permutations.size();
+		}
+		// Guest geometry shaders are compiled through the host mesh stage.
+		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+		            counts[static_cast<size_t>(ShaderType::Vertex)],
+		            counts[static_cast<size_t>(ShaderType::Pixel)],
+		            counts[static_cast<size_t>(ShaderType::Compute)],
+		            counts[static_cast<size_t>(ShaderType::Mesh)],
+		            counts[static_cast<size_t>(ShaderType::Local)],
+		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
+		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+		return permutation.handle;
+	}
+
+	// The first materialization of a new source; a failure skips this draw (see Get).
+	static bool MaterializeFirstUse(SourceEntry&                           source,
+	                                const ShaderRecompiler::IR::SrtRuntime& runtime,
+	                                ShaderType stage, const char* stage_name, uint64_t hash) {
+		if (ShaderRecompiler::IR::MaterializeResources(source.resource_plan, runtime,
+		                                               source.resources, source.specialization)) {
+			return true;
+		}
+		if (!ShaderFailureNonFatal()) {
+			EXIT("shader resource materialization failed\n");
+		}
+		Profiler::Add(Profiler::Counter::SkippedResources);
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 16) {
+			LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+			     ": resource materialization failed on first use (materialization line %d)\n",
+			     static_cast<uint32_t>(stage), hash,
+			     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+			Profiler::Message(Profiler::MessageWarning,
+			                  "Resources unreadable on first use, draw skipped: %s 0x%016" PRIx64
+			                  " (materialization line %d; first 16 reported)",
+			                  stage_name, hash, ShaderRecompiler::IR::LastIndirectImageFailureLine());
+		}
+		return false;
+	}
+
+	static void ReportShaderClock(ShaderType stage, const char* stage_name, uint64_t hash) {
+		if (!ShaderFailureNonFatal()) {
+			EXIT("S_MEMREALTIME needs shaderDeviceClock\n");
+		}
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 16) {
+			LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+			     ": S_MEMREALTIME needs shaderDeviceClock\n",
+			     static_cast<uint32_t>(stage), hash);
+		}
+		Profiler::Add(Profiler::Counter::ShadersGaveUp);
+		Profiler::Message(Profiler::MessageFailure,
+		                  "Shader gave up: %s 0x%016" PRIx64 ": S_MEMREALTIME needs shaderDeviceClock",
+		                  stage_name, hash);
+	}
+
+	// The disk cache key of a source: the session key and everything TranslateProgram reads.
+	template <typename InputInfo>
+	void BuildSourceKey(std::vector<uint8_t>& key, std::span<const uint32_t> code,
+	                    const ShaderParams& params, const ShaderRecompiler::CompileOptions& options,
+	                    const InputInfo& input_info) {
+		if (disk_session_key.empty()) {
+			// Built at first use: the device layer has set the emitter's switches by then.
+			disk_session_key = ShaderDiskCache::SessionKey(disk_session);
+		}
+		ShaderDiskCache::ByteWriter writer;
+		writer.bytes.reserve(disk_session_key.size() + code.size_bytes() +
+		                     params.back_code.size_bytes() + 512u);
+		writer.PutBytes(disk_session_key);
+		writer.Put<uint8_t>('S');
+		writer.Put(static_cast<uint32_t>(options.stage));
+		writer.Put(options.shader_hash);
+		writer.Put(options.wave_size);
+		writer.Put(options.user_data_base);
+		writer.Put(static_cast<uint32_t>(options.user_data.size()));
+		writer.Put(options.bindless_images);
+		writer.Put(options.non_fatal);
+		writer.PutWords(code);
+		writer.PutWords(params.back_code);
+		ShaderDiskCache::AppendInputKey(writer, input_info);
+		key = std::move(writer.bytes);
+	}
+
+	static void BuildPermutationKey(std::vector<uint8_t>& key, std::span<const uint8_t> source_key,
+	                                const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                                uint32_t push_data_cursor) {
+		ShaderDiskCache::ByteWriter writer;
+		writer.bytes.reserve(source_key.size() + 256u);
+		writer.PutBytes(source_key);
+		writer.Put<uint8_t>('P');
+		ShaderDiskCache::AppendSpecialization(writer, specialization);
+		writer.Put(push_data_cursor);
+		key = std::move(writer.bytes);
+	}
+
+	// Stores a fresh entry; in verify mode compares it with the cached one first (`cached`, empty
+	// when there was none) and stores it only when they differ.
+	void StoreEntry(bool source, uint64_t hash, std::span<const uint8_t> key,
+	                std::span<const uint8_t> cached, std::span<const uint8_t> payload) {
+		const char* kind = source ? "source" : "permutation";
+		if (!(source ? ShaderDiskCache::SourceRecordRoundTrips(payload)
+		             : ShaderDiskCache::PermutationRecordRoundTrips(payload))) {
+			if (disk->counters.round_trip_failures++ < 16) {
+				LOGF("Shader disk cache: the %s entry of hash=0x%016" PRIx64
+				     " does not decode to itself; not cached\n",
+				     kind, hash);
+			}
+			return;
+		}
+		if (!cached.empty()) {
+			disk->counters.verified++;
+			if (std::ranges::equal(cached, payload)) {
+				return;
+			}
+			if (disk->counters.verify_mismatches++ < 32) {
+				LOGF("Shader disk cache: verify mismatch: %s entry of hash=0x%016" PRIx64
+				     " (%zu bytes cached, %zu fresh)\n",
+				     kind, hash, cached.size(), payload.size());
+				Profiler::Message(Profiler::MessageFailure,
+				                  "Shader disk cache: verify mismatch: %s entry of 0x%016" PRIx64,
+				                  kind, hash);
+			}
+		}
+		disk->Save(key, payload);
+	}
+
+	void CountDiskLookup() {
+		if (++disk_lookups % 4096u == 0) {
+			disk->LogTotals("so far");
+		}
 	}
 
 	template <typename InputInfo>
@@ -871,71 +1030,149 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
-		// The whole compile as one zone on the timeline, its phases below it.
-		Profiler::Phases compile_zone;
-		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
-		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
-		const auto compile_begin = std::chrono::steady_clock::now();
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
 		const auto compile_code = lookup_key.function_code.empty()
 		                              ? params.code
 		                              : std::span<const uint32_t>(lookup_key.function_code);
+		// The shader disk cache (shaderDiskCache.h): a source entry stands in for the translation
+		// of a source new to this session, a permutation entry for the compile. In verify mode
+		// both are only compared with a fresh translation. A hit is not a compile: it is not
+		// counted in ShadersCompiled or ShaderCompileTime.
+		std::vector<uint8_t> source_key;
+		std::vector<uint8_t> cached_source;
+		std::vector<uint8_t> permutation_key;
+		std::vector<uint8_t> cached_permutation;
+		if (disk != nullptr) {
+			Profiler::Phases disk_zone;
+			disk_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
+			KYTY_PROFILER_PHASE(disk_zone, "Shader disk cache", profiler::colors::CyanA700);
+			BuildSourceKey(source_key, compile_code, params, options, input_info);
+			if (entry == programs.end()) {
+				CountDiskLookup();
+				std::vector<uint8_t>          payload;
+				ShaderDiskCache::SourceRecord record;
+				if (!disk->Load(source_key, payload)) {
+					disk->counters.source_misses++;
+				} else if (disk_verify) {
+					disk->counters.source_hits++;
+					cached_source = std::move(payload);
+				} else if (!ShaderDiskCache::DecodeSourceRecord(payload, record)) {
+					disk->counters.rejected++;
+					disk->counters.source_misses++;
+				} else {
+					disk->counters.source_hits++;
+					if (record.unsupported) {
+						Profiler::Add(Profiler::Counter::ShadersGaveUp);
+						Profiler::Message(Profiler::MessageFailure,
+						                  "Shader gave up: %s 0x%016" PRIx64 ": in an earlier run (disk cache)",
+						                  stage_name, params.hash);
+						unsupported.insert(lookup_key);
+						return ShaderProgram {};
+					}
+					if (record.uses_clock && !shader_clock) {
+						ReportShaderClock(stage, stage_name, params.hash);
+						unsupported.insert(lookup_key);
+						return ShaderProgram {};
+					}
+					entry = programs.try_emplace(lookup_key, std::move(record.plan)).first;
+					if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
+						return ShaderProgram {};
+					}
+				}
+			}
+			if (entry != programs.end()) {
+				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
+				                    push_data_cursor);
+				std::vector<uint8_t>               payload;
+				ShaderDiskCache::PermutationRecord record;
+				if (!disk->Load(permutation_key, payload)) {
+					disk->counters.permutation_misses++;
+				} else if (disk_verify) {
+					disk->counters.permutation_hits++;
+					cached_permutation = std::move(payload);
+				} else if (!ShaderDiskCache::DecodePermutationRecord(payload, record)) {
+					disk->counters.rejected++;
+					disk->counters.permutation_misses++;
+				} else {
+					disk->counters.permutation_hits++;
+					Profiler::Message(Profiler::MessageInfo,
+					                  "Shader from the disk cache: %s 0x%016" PRIx64 ", %zu SPIR-V words",
+					                  stage_name, params.hash, record.spirv.size());
+					return AddPermutation(entry->second, stage_name, options, record.spirv,
+					                      std::move(record.program), input_info, push_data_cursor);
+				}
+			}
+		}
+
+		// The whole compile as one zone on the timeline, its phases below it.
+		Profiler::Phases compile_zone;
+		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
+		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
+		const auto compile_begin = std::chrono::steady_clock::now();
 		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
+			if (disk != nullptr && entry == programs.end()) {
+				std::vector<uint8_t> payload;
+				if (ShaderDiskCache::EncodeSourceRecord(true, false, nullptr, payload)) {
+					StoreEntry(true, params.hash, source_key, cached_source, payload);
+				}
+			}
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
-		if (!shader_clock && UsesShaderClock(translated.program)) {
-			if (!ShaderFailureNonFatal()) {
-				EXIT("S_MEMREALTIME needs shaderDeviceClock\n");
+		const bool uses_clock = UsesShaderClock(translated.program);
+		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		if (entry == programs.end()) {
+			plan.emplace(ShaderRecompiler::IR::ExtractResourcePlan(translated.program));
+			if (disk != nullptr) {
+				std::vector<uint8_t> payload;
+				if (ShaderDiskCache::EncodeSourceRecord(false, uses_clock, &*plan, payload)) {
+					StoreEntry(true, params.hash, source_key, cached_source, payload);
+				} else if (disk->counters.round_trip_failures++ < 16) {
+					LOGF("Shader disk cache: the resource plan of hash=0x%016" PRIx64
+					     " refers outside itself; not cached\n",
+					     params.hash);
+				}
 			}
-			static std::atomic<uint32_t> reported = 0;
-			if (reported.fetch_add(1) < 16) {
-				LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
-				     ": S_MEMREALTIME needs shaderDeviceClock\n",
-				     static_cast<uint32_t>(stage), params.hash);
-			}
-			Profiler::Add(Profiler::Counter::ShadersGaveUp);
-			Profiler::Message(Profiler::MessageFailure,
-			                  "Shader gave up: %s 0x%016" PRIx64 ": S_MEMREALTIME needs shaderDeviceClock",
-			                  stage_name, params.hash);
+		}
+		if (!shader_clock && uses_clock) {
+			ReportShaderClock(stage, stage_name, params.hash);
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
 		if (entry == programs.end()) {
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
-				if (!ShaderFailureNonFatal()) {
-					EXIT("shader resource materialization failed\n");
-				}
-				Profiler::Add(Profiler::Counter::SkippedResources);
-				static std::atomic<uint32_t> reported = 0;
-				if (reported.fetch_add(1) < 16) {
-					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
-					     ": resource materialization failed on first use (materialization line %d)\n",
-					     static_cast<uint32_t>(stage), params.hash,
-					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
-					Profiler::Message(Profiler::MessageWarning,
-					                  "Resources unreadable on first use, draw skipped: %s 0x%016" PRIx64
-					                  " (materialization line %d; first 16 reported)",
-					                  stage_name, params.hash,
-					                  ShaderRecompiler::IR::LastIndirectImageFailureLine());
-				}
+			entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
+			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 				return ShaderProgram {};
 			}
+			if (disk != nullptr) {
+				BuildPermutationKey(permutation_key, source_key, entry->second.specialization,
+				                    push_data_cursor);
+				if (disk_verify) {
+					std::vector<uint8_t> payload;
+					if (disk->Load(permutation_key, payload)) {
+						cached_permutation = std::move(payload);
+					}
+				}
+			}
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
-		const auto& permutation = entry->second.permutations.back();
+		auto compiled = CompileTranslated(options, std::move(translated),
+		                                  entry->second.specialization, push_data_cursor);
+		std::vector<uint8_t> permutation_payload;
+		if (disk != nullptr) {
+			ShaderDiskCache::EncodePermutationRecord(compiled.spirv, compiled.program,
+			                                         permutation_payload);
+		}
+		const auto handle = AddPermutation(entry->second, stage_name, options, compiled.spirv,
+		                                   std::move(compiled.program), input_info,
+		                                   push_data_cursor);
 		{
 			const auto us = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-		    std::chrono::steady_clock::now() - compile_begin).count());
+			                                         std::chrono::steady_clock::now() - compile_begin)
+			                                         .count());
 			Profiler::Add(Profiler::Counter::ShadersCompiled);
 			Profiler::Add(Profiler::Counter::ShaderCompileTime, us);
 			Profiler::Message(Profiler::MessageInfo,
@@ -944,28 +1181,32 @@ struct PipelineCache::ProgramCache {
 			                  last_spirv_words);
 		}
 		compile_zone.End();
-		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
-		permutation.program.bindings.AdvancePushData(push_data_cursor);
-
-		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
-		for (const auto& [key, source]: programs) {
-			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
+		if (disk != nullptr) {
+			// After AddPermutation: SPIR-V that fails validation is never stored.
+			StoreEntry(false, params.hash, permutation_key, cached_permutation,
+			           permutation_payload);
 		}
-		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
-		return permutation.handle;
+		return handle;
 	}
 
-	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images)
-	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images) {
+	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images,
+	             ShaderDiskCache::SessionInfo session, std::filesystem::path disk_directory)
+	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images),
+	      disk_session(session), disk_verify(ShaderDiskCache::VerifyEnabled()) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			// The dumps are written while translating: every shader has to be translated.
+			PipelineCacheLog("Shader disk cache: off (graphics debug dump)");
+		} else {
+			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
+		}
+	}
+
+	void FlushDisk() {
+		if (disk != nullptr) {
+			disk->Flush();
+			disk->LogTotals("saved");
+		}
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
@@ -1005,13 +1246,25 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 	// SPIR-V size of the last permutation compiled (for the profiler).
 	size_t                                                      last_spirv_words = 0;
+	// The shader disk cache (null when off) and its session key, built at first use.
+	ShaderDiskCache::SessionInfo                                disk_session;
+	std::vector<uint8_t>                                        disk_session_key;
+	bool                                                        disk_verify  = false;
+	uint64_t                                                    disk_lookups = 0;
+	std::unique_ptr<ShaderDiskCache::Store>                     disk;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(
           graphics.device, graphics.shader_device_clock_enabled,
-          graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
+          graphics.bindless_enabled && Config::BindlessImagesEnabled(),
+          ShaderDiskCache::SessionInfo {
+              .vendor_id           = graphics.GetPhysicalDeviceProperties().vendorID,
+              .device_id           = graphics.GetPhysicalDeviceProperties().deviceID,
+              .bindless_images     = graphics.bindless_enabled && Config::BindlessImagesEnabled(),
+              .float_image_atomics = Config::FloatImageAtomicsEnabled()},
+          ShaderDiskCacheDirectory())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 	if (g_async_pipelines) {
@@ -1120,6 +1373,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	m_program_cache->FlushDisk();
 	// No worker may use the driver cache once it is destroyed below; later pipelines are
 	// compiled on the GPU thread (FinishPending).
 	if (m_compiler != nullptr) {

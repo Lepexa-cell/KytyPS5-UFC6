@@ -19,6 +19,7 @@ struct DescriptorValue {
 
 enum class UniformFillKind { None, Buffer, Image };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct UniformFill {
 	UniformFillKind          kind         = UniformFillKind::None;
 	uint32_t                 resource     = 0;

@@ -54,6 +54,12 @@ public:
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
 
+	// The shader disk cache (shaderDiskCache.cpp): an immediate's bits, zero-extended from its
+	// type's width (0 for an empty value), and the immediate of a type made from them again.
+	// FromImmediateBits fails on a type no immediate has, or bits wider than the type.
+	[[nodiscard]] uint64_t ImmediateBits() const;
+	[[nodiscard]] static bool FromImmediateBits(Type type, uint64_t bits, Value& result);
+
 	bool operator==(const Value& other) const;
 	// Both name the same instruction (without resolving identities); inline, for hot paths.
 	[[nodiscard]] bool SameInstruction(const Value& other) const noexcept {

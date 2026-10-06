@@ -7,6 +7,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
 // ResourceSnapshot and therefore do not create shader permutations.
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ResourceSpecialization {
 	struct Buffer {
 		uint32_t               packed_stride                   = 0;

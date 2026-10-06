@@ -51,6 +51,7 @@ enum class ResourceKind {
 	       kind == ResourceKind::Scratch;
 }
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
 	uint32_t                resource                 = 0;
@@ -105,6 +106,7 @@ struct ExportInfo {
 	bool operator==(const ExportInfo& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct BufferResource {
 	static constexpr uint32_t NoImageAlias = UINT32_MAX;
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
@@ -133,6 +135,7 @@ enum class ImageMipMode { None, Dynamic };
 
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
@@ -163,6 +166,7 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct SamplerResource {
 	uint32_t source                = 0;
 	uint32_t first_use_pc          = 0;
@@ -180,6 +184,7 @@ struct SamplerResource {
 	bool operator==(const SamplerResource& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct SampledResourcePair {
 	uint32_t image        = 0;
 	uint32_t sampler      = 0;
@@ -284,6 +289,7 @@ inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
 	return result;
 }
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
 	uint32_t       location        = 0;
@@ -294,6 +300,7 @@ struct StageInput {
 	bool operator==(const StageInput& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct StageOutput {
 	StageOutputKind kind     = StageOutputKind::Parameter;
 	uint32_t        index    = 0;
@@ -437,6 +444,7 @@ DescriptorBindingForImage(const ImageResource& image) {
 	return static_cast<DescriptorBindingKind>(base + dimension);
 }
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct DescriptorBinding {
 	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
 	std::vector<uint32_t> resources;
@@ -444,6 +452,7 @@ struct DescriptorBinding {
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
@@ -470,6 +479,7 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 64;
 	static constexpr uint32_t MaxImages       = 64;
@@ -500,6 +510,7 @@ struct BlockInfo {
 	Value           indirect_target;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct DescriptorSource {
 	struct IndirectDescriptor {
 		uint32_t material_source = UINT32_MAX;
@@ -540,6 +551,7 @@ struct DescriptorSource {
 	bool operator==(const DescriptorSource& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct SrtRead {
 	Value    value;
 	uint32_t flat_offset = 0;
@@ -549,6 +561,7 @@ struct SrtRead {
 
 // A store or atomic on a written buffer whose address operands the host can bound: immediates,
 // values it evaluates, compute invocation IDs, and a few integer operations on them.
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct BufferWrite {
 	uint32_t buffer    = 0;
 	uint32_t immediate = 0;
@@ -561,6 +574,7 @@ struct BufferWrite {
 	bool operator==(const BufferWrite& other) const = default;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -570,6 +584,7 @@ struct ResourceBlock {
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct CompiledShaderInfo {
 	ShaderType                    stage               = ShaderType::Unknown;
 	uint64_t                      shader_hash         = 0;
@@ -583,6 +598,7 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct UniformFillPlan {
 	UniformFill          fill;
 	std::array<Value, 4> values;
@@ -593,6 +609,7 @@ struct UniformFillPlan {
 class SrtNativeCode;
 struct SrtTrace;
 
+// Serialized by the shader disk cache (shaderDiskCache.cpp, Visit): a new field goes there too.
 struct ResourcePlan {
 	struct EvaluationContext {
 		struct Entry {

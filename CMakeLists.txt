@@ -355,6 +355,62 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
+# The shader disk cache's source version (src/shader_cache_version.cmake): a hash over the files
+# the shader recompiler is built from and the project headers they include, computed at build
+# time whenever one of them may have changed.
+file(GLOB_RECURSE shader_cache_seeds CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/*.inc"
+)
+list(APPEND shader_cache_seeds
+	"${KYTY_SOURCE_DIR}/graphics/shader/shader.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.h"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderBindings.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderDiskCache.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderDiskCache.h"
+)
+list(SORT shader_cache_seeds)
+# Headers the seeds may include: the step reruns when one of them changes, and fails when the
+# recompiler includes a header outside these directories.
+set(shader_cache_roots
+	"${KYTY_SOURCE_DIR}/graphics"
+	"${KYTY_SOURCE_DIR}/common"
+	"${KYTY_SOURCE_DIR}/kernel"
+)
+# "|"-separated: a ";" would split the custom command's argument.
+list(JOIN shader_cache_roots "|" shader_cache_roots_arg)
+file(GLOB_RECURSE shader_cache_headers CONFIGURE_DEPENDS
+	"${KYTY_SOURCE_DIR}/graphics/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/*.inc"
+	"${KYTY_SOURCE_DIR}/common/*.h"
+	"${KYTY_SOURCE_DIR}/kernel/*.h"
+)
+set(shader_cache_seeds_file "${PROJECT_BINARY_DIR}/shaderCacheSeeds.txt")
+list(JOIN shader_cache_seeds "\n" shader_cache_seeds_text)
+file(CONFIGURE OUTPUT "${shader_cache_seeds_file}" CONTENT "${shader_cache_seeds_text}\n" @ONLY)
+set(shader_cache_version_header "${PROJECT_BINARY_DIR}/shaderCacheVersion.h")
+set(shader_cache_version_stamp "${PROJECT_BINARY_DIR}/shaderCacheVersion.stamp")
+add_custom_command(
+	OUTPUT "${shader_cache_version_stamp}"
+	BYPRODUCTS "${shader_cache_version_header}"
+	COMMAND ${CMAKE_COMMAND}
+	        "-DSOURCE_DIR=${KYTY_SOURCE_DIR}"
+	        "-DSEEDS_FILE=${shader_cache_seeds_file}"
+	        "-DROOTS=${shader_cache_roots_arg}"
+	        "-DEXTRA=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_BUILD_TYPE} ${CMAKE_SYSTEM_PROCESSOR}"
+	        "-DOUTPUT=${shader_cache_version_header}"
+	        "-DSTAMP=${shader_cache_version_stamp}"
+	        -P "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
+	DEPENDS ${shader_cache_seeds} ${shader_cache_headers} "${shader_cache_seeds_file}"
+	        "${KYTY_SOURCE_DIR}/shader_cache_version.cmake"
+	COMMENT "Hashing the shader recompiler sources for the shader disk cache"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${shader_cache_version_stamp}" "${shader_cache_version_header}")
+
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
 	"${KYTY_SOURCE_DIR}/emulator.cpp"
