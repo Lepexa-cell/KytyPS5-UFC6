@@ -360,6 +360,37 @@ void VisitPlanFields(Io& io, T& v) {
 	io(v.uniform_fill);
 }
 
+// Tripwires (Windows x64, the layout the sizes were taken from): a field added to a serialized
+// structure changes its size and stops the build here, so that the field gets added to its Visit
+// above as well (Visit lists every field; a field it leaves out is silently lost on a cache hit).
+// After updating the Visit, update the size. ResourcePlan's covers its scratch members too.
+#if defined(_MSC_VER) && defined(_M_X64)
+static_assert(sizeof(IR::MemoryInfo) == 72);
+static_assert(sizeof(IR::BufferResource) == 72);
+static_assert(sizeof(IR::ImageResource) == 88);
+static_assert(sizeof(IR::SamplerResource) == 24);
+static_assert(sizeof(IR::SampledResourcePair) == 12);
+static_assert(sizeof(IR::StageInput) == 56);
+static_assert(sizeof(IR::StageOutput) == 48);
+static_assert(sizeof(IR::ShaderInfo) == 192);
+static_assert(sizeof(IR::DescriptorBinding) == 32);
+static_assert(sizeof(IR::BindingLayout) == 64);
+static_assert(sizeof(IR::CompiledShaderInfo) == 296);
+static_assert(sizeof(IR::DescriptorSource::IndirectDescriptor) == 120);
+static_assert(sizeof(IR::DescriptorSource::BindlessSampler) == 4);
+static_assert(sizeof(IR::DescriptorSource) == 272);
+static_assert(sizeof(IR::ResourceBlock) == 88);
+static_assert(sizeof(IR::SrtRead) == 24);
+static_assert(sizeof(IR::BufferWrite) == 72);
+static_assert(sizeof(IR::UniformFill) == 28);
+static_assert(sizeof(IR::UniformFillPlan) == 96);
+static_assert(sizeof(IR::ResourceSpecialization::Buffer) == 28);
+static_assert(sizeof(IR::ResourceSpecialization::Image) == 36);
+static_assert(sizeof(IR::ResourceSpecialization::Sampler) == 8);
+static_assert(sizeof(IR::ResourceSpecialization) == 72);
+static_assert(sizeof(IR::ResourcePlan) == 832);
+#endif
+
 struct Writer {
 	ByteWriter&                                    out;
 	const std::unordered_map<const IR::Inst*, uint32_t>* index = nullptr;
