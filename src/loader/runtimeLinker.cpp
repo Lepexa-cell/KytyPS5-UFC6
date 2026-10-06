@@ -132,6 +132,7 @@ struct StubbedImportRecord {
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::mutex                         g_unresolved_stub_log_mutex;
+static std::atomic_uint32_t               g_unresolved_stub_call_log_count {0};
 static std::unordered_set<uint64_t>       g_unresolved_stub_logged;
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
@@ -1430,6 +1431,10 @@ void RuntimeLinker::Clear() {
 	g_unresolved_stub_thunk_offset = 0;
 	g_stubbed_imports.clear();
 	g_unresolved_stub_call_log_count.store(0);
+	{
+		std::lock_guard lock(g_unresolved_stub_log_mutex);
+		g_unresolved_stub_logged.clear();
+	}
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
