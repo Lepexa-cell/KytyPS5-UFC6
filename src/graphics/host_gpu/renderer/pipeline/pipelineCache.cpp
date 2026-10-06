@@ -96,8 +96,12 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// No emulator revision: the driver keys every pipeline by its whole create info, SPIR-V
+	// included, so a new build reuses the pipelines whose shaders did not change. Keying on the
+	// revision threw the whole cache away at every rebuild and release, and the first start then
+	// compiled everything behind a black screen.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
@@ -1047,16 +1051,6 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
-	const std::string_view git_hash     = KYTY_GIT_HASH;
-	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -1071,8 +1065,9 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		// Pipelines of older builds stay in the file; past 1 GiB it starts over.
+		constexpr uint64_t max_file_size = uint64_t {1} << 30u;
+		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= max_file_size) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
