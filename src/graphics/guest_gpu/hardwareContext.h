@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HARDWARECONTEXT_H_
 
 #include "common/abi.h"
+#include "common/assert.h"
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
@@ -602,8 +603,9 @@ struct UserSgprInfo {
 // update, instead of per-register setter dispatch per dword.
 inline void SetUserSgprRange(UserSgprInfo& info, uint32_t first, const uint32_t* values,
                              uint32_t count, UserSgprType type) {
-	EXIT_IF(values == nullptr);
-	EXIT_IF(first + count > static_cast<uint32_t>(UserSgprInfo::SGPRS_MAX));
+	if (values == nullptr || first + count > static_cast<uint32_t>(UserSgprInfo::SGPRS_MAX)) {
+		return;
+	}
 	std::memcpy(&info.value[first], values, static_cast<size_t>(count) * sizeof(uint32_t));
 	for (uint32_t i = 0; i < count; i++) {
 		info.type[first + i] = type;
