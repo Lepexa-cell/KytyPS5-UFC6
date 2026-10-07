@@ -191,6 +191,7 @@ void CommandScheduler::EndRendering() {
 }
 
 void CommandScheduler::Flush() {
+	TelemetryCountFlush();
 	SubmitInfo submit;
 	Flush(submit);
 }

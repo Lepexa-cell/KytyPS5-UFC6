@@ -1211,6 +1211,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	const auto telemetry_bind_begin_us = TelemetryNowUs();
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1225,6 +1226,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	TelemetryAddDrawBindings(TelemetryNowUs() - telemetry_bind_begin_us);
+	const auto telemetry_vertex_begin_us = TelemetryNowUs();
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	if (!mesh_active) {
@@ -1232,6 +1235,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	TelemetryAddDrawVertex(TelemetryNowUs() - telemetry_vertex_begin_us);
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1249,6 +1253,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
 	}
+	const auto telemetry_pipe_begin_us = TelemetryNowUs();
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
@@ -1256,6 +1261,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (deferred_pipeline == nullptr) {
 		return;
 	}
+	TelemetryAddDrawPipe(TelemetryNowUs() - telemetry_pipe_begin_us);
 	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
@@ -1267,13 +1273,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// memory. Recorded through the recording thread when it runs.
 	const auto vk_buffer = buffer.Recorder();
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
+	const auto telemetry_commit_vertex_begin_us = TelemetryNowUs();
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
 	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
+	TelemetryAddDrawVertex(TelemetryNowUs() - telemetry_commit_vertex_begin_us);
+	const auto telemetry_commit_bind_begin_us = TelemetryNowUs();
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+	TelemetryAddDrawBindings(TelemetryNowUs() - telemetry_commit_bind_begin_us);
+	const auto telemetry_index_begin_us = TelemetryNowUs();
 	if (mesh_active) {
 		// GPU arguments: dword 3 = 0xFFFFFFFF tells the fast-launch entry to read the start vertex
 		// at dwords 4-5's address + 8 (the shader's other draw dwords are unused then).
@@ -1296,6 +1307,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
+	TelemetryAddDrawVertex(TelemetryNowUs() - telemetry_index_begin_us);
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
@@ -1413,6 +1425,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		gpu_zone = GpuProfiler::Begin(m_context, buffer, name, static_cast<size_t>(size), 0x4e79a7);
 		Profiler::CommandZone::Annotate("%s", name);
 	}
+	const auto telemetry_emit_begin_us = TelemetryNowUs();
 	if (mesh_active) {
 		if (mesh_indirect_buffer) {
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect_buffer, mesh_indirect_offset, 1, 16u);
@@ -1446,6 +1459,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
+	TelemetryAddDrawEmit(TelemetryNowUs() - telemetry_emit_begin_us);
 	Profiler::Add(Profiler::Counter::Draws);
 	GpuProfiler::End(buffer, gpu_zone);
 	GpuTiming::After(m_context, buffer,
@@ -1567,11 +1581,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
+	const auto telemetry_state_begin_us = TelemetryNowUs();
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
 	}
+	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
@@ -1653,10 +1669,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	DrawRenderState state {};
+	const auto telemetry_state_begin_us = TelemetryNowUs();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
 	}
+	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
 
 	// Counts read on the GPU work for fast-launch mesh draws and vertex-pipeline draws with one
 	// draw call; others read the guest arguments here (waiting for the GPU when it wrote them).

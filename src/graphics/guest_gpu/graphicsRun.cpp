@@ -985,8 +985,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 				command_zone.emplace(location);
 			}
 		}
+		const auto telemetry_packet_begin_us = TelemetryNowUs();
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		TelemetryAddPm4Op(static_cast<uint8_t>(opcode & 0xFFu),
+		                  TelemetryNowUs() - telemetry_packet_begin_us);
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			return;
@@ -1087,6 +1090,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 }
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
+	const auto telemetry_draw_begin_us = TelemetryNowUs();
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -1096,6 +1100,8 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	TelemetryAddDrawRecord(TelemetryNowUs() - telemetry_draw_begin_us);
+	TelemetryCountDraw();
 	CompleteDraw();
 }
 
@@ -1340,6 +1346,7 @@ uint32_t CommandProcessor::NumInstances() {
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
+	const auto telemetry_draw_begin_us = TelemetryNowUs();
 	if (args.instance_count == 0 && args.gpu_args_address == 0) {
 		if (m_num_instances_args != 0 && GpuIndirectDraws()) {
 			// The instance count a DRAW_INDIRECT read on the GPU left: the GPU reads it too
@@ -1352,14 +1359,18 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		}
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	TelemetryAddDrawRecord(TelemetryNowUs() - telemetry_draw_begin_us);
+	TelemetryCountDraw();
 	CompleteDraw();
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
+	const auto telemetry_wait_flip_begin_us = TelemetryNowUs();
 	BufferFlush();
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
+	TelemetryAddWaitFlip(TelemetryNowUs() - telemetry_wait_flip_begin_us);
 }
 
 template <typename T>
@@ -1704,6 +1715,7 @@ void CommandProcessor::Flip() {
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
 	GetScheduler().Flush();
+	TelemetryEndFrame();
 }
 
 void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
@@ -1723,6 +1735,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
 	GetScheduler().Flush();
+	TelemetryEndFrame();
 }
 
 void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache_action,
@@ -1748,6 +1761,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
 	GetScheduler().Flush();
+	TelemetryEndFrame();
 }
 
 void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
@@ -1765,10 +1779,59 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
+	TelemetryEndFrame();
 }
 
 void CommandProcessor::SynchronizeGpu() {
 	GetScheduler().Finish();
+}
+
+void TelemetryEndFrame() {
+	auto& telemetry = GetFrameTelemetry();
+	static uint32_t frame_counter = 0;
+	frame_counter++;
+
+	uint64_t total_pm4_us = 0;
+	uint32_t top_op0 = 0;
+	uint32_t top_op1 = 0;
+	uint64_t top_us0 = 0;
+	uint64_t top_us1 = 0;
+	for (uint32_t op = 0; op < 256; op++) {
+		const uint64_t value_us = telemetry.pm4_op_us[op];
+		total_pm4_us += value_us;
+		if (value_us > top_us0) {
+			top_us1 = top_us0;
+			top_op1 = top_op0;
+			top_us0 = value_us;
+			top_op0 = op;
+		} else if (value_us > top_us1) {
+			top_us1 = value_us;
+			top_op1 = op;
+		}
+	}
+
+	const double us_to_ms = 1.0 / 1000.0;
+	const uint64_t pure_pm4_us =
+	    total_pm4_us >= telemetry.draw_record_us ? total_pm4_us - telemetry.draw_record_us : 0;
+
+	if (frame_counter % 60 == 0) {
+		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms, Bind: %.2f ms, Vtx: %.2f ms, Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | TopPM4: [op 0x%02X: %.2f ms, op 0x%02X: %.2f ms] | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | Draws: %u\n",
+		     static_cast<double>(total_pm4_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_record_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_state_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_bindings_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_vertex_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_pipe_us) * us_to_ms,
+		     static_cast<double>(telemetry.draw_emit_us) * us_to_ms,
+		     static_cast<double>(pure_pm4_us) * us_to_ms, static_cast<unsigned>(top_op0),
+		     static_cast<double>(top_us0) * us_to_ms, static_cast<unsigned>(top_op1),
+		     static_cast<double>(top_us1) * us_to_ms,
+		     static_cast<double>(telemetry.wait_readmem_us) * us_to_ms,
+		     static_cast<double>(telemetry.wait_flip_us) * us_to_ms,
+		     static_cast<double>(telemetry.wait_gc_us) * us_to_ms, telemetry.flushes,
+		     telemetry.draws);
+		telemetry = FrameTelemetry {};
+	}
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

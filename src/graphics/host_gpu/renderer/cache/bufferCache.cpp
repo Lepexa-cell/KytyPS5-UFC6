@@ -374,7 +374,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (wait_tick == 0) {
 			return;
 		}
+		const auto telemetry_wait_begin_us = TelemetryNowUs();
 		m_scheduler.WaitPriorityOperations(wait_tick);
+		TelemetryAddWaitReadMem(TelemetryNowUs() - telemetry_wait_begin_us);
 	}
 }
 
@@ -1189,7 +1191,9 @@ void BufferCache::RunGarbageCollector() {
 	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
 	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
+	const auto telemetry_gc_wait_begin_us = TelemetryNowUs();
 	m_scheduler.Wait(completion_tick);
+	TelemetryAddWaitGC(TelemetryNowUs() - telemetry_gc_wait_begin_us);
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];

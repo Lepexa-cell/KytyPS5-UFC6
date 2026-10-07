@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/platform/sysTimer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -15,6 +16,88 @@ namespace Libs::Graphics {
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
 
 enum class Pm4ProcessResult { Complete, Blocked };
+
+// Microsecond frame telemetry (QPC-based). GPU thread only: no atomics by design.
+struct FrameTelemetry {
+	uint64_t pm4_op_us[256] = {};
+	uint64_t draw_record_us = 0;
+	uint64_t draw_state_us = 0;
+	uint64_t draw_bindings_us = 0;
+	uint64_t draw_vertex_us = 0;
+	uint64_t draw_pipe_us = 0;
+	uint64_t draw_emit_us = 0;
+	uint64_t wait_readmem_us = 0;
+	uint64_t wait_flip_us = 0;
+	uint64_t wait_gc_us = 0;
+	uint32_t draws = 0;
+	uint32_t flushes = 0;
+};
+
+inline FrameTelemetry& GetFrameTelemetry() {
+	static thread_local FrameTelemetry instance;
+	return instance;
+}
+
+inline uint64_t TelemetryNowUs() {
+	uint64_t counter = 0;
+	uint64_t frequency = 0;
+	SysQueryPerformanceCounter(&counter);
+	SysQueryPerformanceFrequency(&frequency);
+	if (frequency == 0) {
+		return 0;
+	}
+	return counter * 1000000ull / frequency;
+}
+
+inline void TelemetryAddPm4Op(uint8_t opcode, uint64_t delta_us) {
+	GetFrameTelemetry().pm4_op_us[opcode] += delta_us;
+}
+
+inline void TelemetryAddDrawRecord(uint64_t delta_us) {
+	GetFrameTelemetry().draw_record_us += delta_us;
+}
+
+inline void TelemetryAddDrawState(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_us += delta_us;
+}
+
+inline void TelemetryAddDrawBindings(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bindings_us += delta_us;
+}
+
+inline void TelemetryAddDrawVertex(uint64_t delta_us) {
+	GetFrameTelemetry().draw_vertex_us += delta_us;
+}
+
+inline void TelemetryAddDrawPipe(uint64_t delta_us) {
+	GetFrameTelemetry().draw_pipe_us += delta_us;
+}
+
+inline void TelemetryAddDrawEmit(uint64_t delta_us) {
+	GetFrameTelemetry().draw_emit_us += delta_us;
+}
+
+inline void TelemetryAddWaitReadMem(uint64_t delta_us) {
+	GetFrameTelemetry().wait_readmem_us += delta_us;
+}
+
+inline void TelemetryAddWaitFlip(uint64_t delta_us) {
+	GetFrameTelemetry().wait_flip_us += delta_us;
+}
+
+inline void TelemetryAddWaitGC(uint64_t delta_us) {
+	GetFrameTelemetry().wait_gc_us += delta_us;
+}
+
+inline void TelemetryCountDraw() {
+	GetFrameTelemetry().draws++;
+}
+
+inline void TelemetryCountFlush() {
+	GetFrameTelemetry().flushes++;
+}
+
+void TelemetryEndFrame();
 
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
