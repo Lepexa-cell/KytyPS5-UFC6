@@ -1025,8 +1025,13 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (image.info.data.Empty()) {
 		return;
 	}
+	// Idempotent: successive draws in one render pass re-bind the same targets and textures.
+	// m_bound_images is the reset set for ResetBindings(); pushing duplicates would grow the
+	// reset scan and the CommitBindings written-range scan quadratically across a pass.
 	if (image.binding.is_bound) {
 		image.binding.force_general |= image.binding.shader_write != storage;
+		image.binding.shader_write |= storage;
+		return;
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
@@ -1035,9 +1040,10 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
-	if (!image.binding.is_target) {
-		NoteBindlessStateChange(image);
+	if (image.binding.is_target) {
+		return;
 	}
+	NoteBindlessStateChange(image);
 	image.binding.is_target = true;
 	m_bound_images.push_back(id);
 }

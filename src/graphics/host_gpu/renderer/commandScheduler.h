@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstring>
 #include <deque>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -64,6 +65,13 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// Fast-path gate for the per-draw PopPendingOperations() calls: DeferRelease sets it when
+	// an operation is queued, PopPendingOperations clears it when the queue drains. Draws read
+	// it lock-free first so the 99.9% empty-queue case skips the semaphore refresh, mutex and
+	// condition-variable traffic entirely.
+	[[nodiscard]] bool        HasPendingOperations() const noexcept {
+		return m_pending_operations_count.load(std::memory_order_acquire) != 0;
+	}
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
@@ -216,6 +224,7 @@ private:
 	uint32_t                     m_recorded_draws                  = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	std::atomic<uint32_t>        m_pending_operations_count {0};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
