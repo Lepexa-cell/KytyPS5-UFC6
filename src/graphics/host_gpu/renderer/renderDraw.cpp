@@ -1009,18 +1009,133 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
 }
 
+struct DrawStateKey {
+	uint64_t vs_addr = 0; // sh.GetVs().es_regs.data_addr
+	uint64_t ps_addr = 0; // sh.GetPs().ps_regs.data_addr
+	uint64_t rt_base[RENDER_COLOR_ATTACHMENTS_MAX] = {}; // m_render_targets bases
+	uint32_t rt_view_base[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t rt_view_last[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint32_t depth_override_bits = 0; // GetDepthRenderOverride() packed
+	uint32_t color_output_mask   = 0; // DrawColorOutputMask
+	uint32_t prim_type           = 0; // ucfg.GetPrimType()
+	uint32_t slice_offset        = 0; // render_target_slice_offset
+	uint32_t is_indexed          = 0; // draw.IsIndexed()
+	int32_t  vtx_buffers_num     = 0; // vertex_info[0].buffers_num (2D-font safety)
+	int32_t  vtx_fetch_buffer    = 0; // vertex_info[0].fetch_buffer_reg
+
+	bool operator==(const DrawStateKey&) const = default;
+};
+
+struct DrawStateCacheEntry {
+	bool            valid = false;
+	DrawStateKey    key {};
+	DrawRenderState state {};
+};
+
+static thread_local DrawStateCacheEntry g_draw_state_cache;
+
+void InvalidateDrawStateCache() {
+	// Scoped to the current render pass / frame: drop at pass/frame boundaries
+	// so the cache never leaks into a foreign frame.
+	g_draw_state_cache.valid = false;
+}
+
+static DrawStateKey BuildDrawStateKeyPre(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                         uint32_t render_target_slice_offset,
+                                         uint32_t color_output_mask) {
+	DrawStateKey key {};
+	const auto&  regs = buffer.GetRegisters();
+	const auto&  sh   = buffer.GetShaders();
+	key.vs_addr = sh.GetVs().es_regs.data_addr;
+	key.ps_addr = sh.GetPs().ps_regs.data_addr;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		const auto& rt        = regs.GetRenderTarget(slot);
+		key.rt_base[slot]      = rt.base.addr;
+		key.rt_view_base[slot] = rt.view.base_array_slice_index;
+		key.rt_view_last[slot] = rt.view.last_array_slice_index;
+	}
+	const auto& depth_override = regs.GetDepthRenderOverride();
+	key.depth_override_bits    = (depth_override.force_z_valid ? 1u : 0u) |
+                              (depth_override.force_z_dirty ? 2u : 0u) |
+                              (depth_override.force_stencil_valid ? 4u : 0u) |
+                              (depth_override.force_stencil_dirty ? 8u : 0u);
+	key.color_output_mask      = color_output_mask;
+	key.prim_type              = static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType());
+	key.slice_offset           = render_target_slice_offset;
+	key.is_indexed             = draw.IsIndexed() ? 1u : 0u;
+	return key;
+}
+
+static bool DrawStateKeyPreEqual(const DrawStateKey& a, const DrawStateKey& b) {
+	if (a.vs_addr != b.vs_addr || a.ps_addr != b.ps_addr ||
+	    a.depth_override_bits != b.depth_override_bits ||
+	    a.color_output_mask != b.color_output_mask || a.prim_type != b.prim_type ||
+	    a.slice_offset != b.slice_offset || a.is_indexed != b.is_indexed) {
+		return false;
+	}
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if (a.rt_base[slot] != b.rt_base[slot] ||
+		    a.rt_view_base[slot] != b.rt_view_base[slot] ||
+		    a.rt_view_last[slot] != b.rt_view_last[slot]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool CachedTargetIdsReady(const DrawRenderState& cached) {
+	for (uint32_t i = 0; i < cached.color_count; i++) {
+		if (!cached.color_info[i].image_id) {
+			return false;
+		}
+	}
+	return true;
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	// Fast L1: compare cheap pre-Refresh inputs first. A full hit replays the
+	// BindRenderTarget side effects for cached targets and skips the repeated
+	// RefreshShaders + Resolve* work. Vertex layout (buffers_num/fetch_buffer_reg)
+	// is verified post-Refresh before the cached color/depth state is reused, so
+	// 2D UI fonts never observe 3D model state.
+	const DrawStateKey pre_key =
+	    BuildDrawStateKeyPre(buffer, draw, render_target_slice_offset, color_output_mask);
+	DrawStateKey post_check = pre_key;
+	bool         pre_hit =
+	    g_draw_state_cache.valid && DrawStateKeyPreEqual(pre_key, g_draw_state_cache.key);
+	if (pre_hit && !CachedTargetIdsReady(g_draw_state_cache.state)) {
+		g_draw_state_cache.valid = false;
+		pre_hit                   = false;
+	}
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		g_draw_state_cache.valid = false;
 		return false;
+	}
+	post_check.vtx_buffers_num  = state.vertex_info[0].buffers_num;
+	post_check.vtx_fetch_buffer = state.vertex_info[0].fetch_buffer_reg;
+	if (pre_hit && post_check.vtx_buffers_num == g_draw_state_cache.key.vtx_buffers_num &&
+	    post_check.vtx_fetch_buffer == g_draw_state_cache.key.vtx_fetch_buffer) {
+		state.color_count = g_draw_state_cache.state.color_count;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			state.color_info[i] = g_draw_state_cache.state.color_info[i];
+			BindRenderTarget(state.color_info[i].image_id);
+		}
+		state.depth_info = g_draw_state_cache.state.depth_info;
+		if (state.depth_info.image_id) {
+			BindRenderTarget(state.depth_info.image_id);
+		}
+		// DrawRenderState has no pixel_input member in this tree; downstream
+		// selects state.ps_input_info via state.ps_active directly.
+		return !(state.color_count == 0 && !state.depth_info.image_id && !state.ps_active);
 	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
@@ -1051,9 +1166,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
+		g_draw_state_cache.valid = false;
 		return false;
 	}
 
+	// Miss: publish the fresh state. post_check already carries the pre-key plus
+	// the verified vertex layout, so the next identical draw hits O(1).
+	g_draw_state_cache.key   = post_check;
+	g_draw_state_cache.state = state;
+	g_draw_state_cache.valid = true;
 	return true;
 }
 

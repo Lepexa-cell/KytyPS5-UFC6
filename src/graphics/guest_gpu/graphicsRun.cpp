@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
@@ -1811,27 +1812,31 @@ void TelemetryEndFrame() {
 	}
 
 	const double us_to_ms = 1.0 / 1000.0;
+	constexpr double kFrames   = 60.0;
+	const double     frame_avg = us_to_ms / kFrames;
 	const uint64_t pure_pm4_us =
 	    total_pm4_us >= telemetry.draw_record_us ? total_pm4_us - telemetry.draw_record_us : 0;
 
 	if (frame_counter % 60 == 0) {
 		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms, Bind: %.2f ms, Vtx: %.2f ms, Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | TopPM4: [op 0x%02X: %.2f ms, op 0x%02X: %.2f ms] | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | Draws: %u\n",
-		     static_cast<double>(total_pm4_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_record_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_state_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_bindings_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_vertex_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_pipe_us) * us_to_ms,
-		     static_cast<double>(telemetry.draw_emit_us) * us_to_ms,
-		     static_cast<double>(pure_pm4_us) * us_to_ms, static_cast<unsigned>(top_op0),
-		     static_cast<double>(top_us0) * us_to_ms, static_cast<unsigned>(top_op1),
-		     static_cast<double>(top_us1) * us_to_ms,
-		     static_cast<double>(telemetry.wait_readmem_us) * us_to_ms,
-		     static_cast<double>(telemetry.wait_flip_us) * us_to_ms,
-		     static_cast<double>(telemetry.wait_gc_us) * us_to_ms, telemetry.flushes,
+		     static_cast<double>(total_pm4_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_record_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_bindings_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_vertex_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_pipe_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_emit_us) * frame_avg,
+		     static_cast<double>(pure_pm4_us) * frame_avg, static_cast<unsigned>(top_op0),
+		     static_cast<double>(top_us0) * frame_avg, static_cast<unsigned>(top_op1),
+		     static_cast<double>(top_us1) * frame_avg,
+		     static_cast<double>(telemetry.wait_readmem_us) * frame_avg,
+		     static_cast<double>(telemetry.wait_flip_us) * frame_avg,
+		     static_cast<double>(telemetry.wait_gc_us) * frame_avg, telemetry.flushes,
 		     telemetry.draws);
 		telemetry = FrameTelemetry {};
 	}
+	// Draw-state L1 scope: never leak into a foreign frame.
+	InvalidateDrawStateCache();
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

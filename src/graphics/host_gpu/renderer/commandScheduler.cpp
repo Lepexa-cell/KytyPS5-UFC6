@@ -6,6 +6,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
@@ -188,6 +189,8 @@ void CommandScheduler::EndRendering() {
 	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
+	// Draw-state L1 scope: never leak across render passes.
+	InvalidateDrawStateCache();
 }
 
 void CommandScheduler::Flush() {

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -141,6 +142,8 @@ void CommandBuffer::EndRendering() const {
 	Recorder().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
+	// Draw-state L1 scope: never leak across render passes.
+	InvalidateDrawStateCache();
 }
 
 } // namespace Libs::Graphics
