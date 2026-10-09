@@ -1197,6 +1197,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	g_draw_state_cache.valid = true;
 	return true;
 }
+}
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
                                               const DrawIndexBufferSource& source) {
