@@ -181,6 +181,10 @@ public:
 	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
 	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
 	                    ShaderPixelInputInfo& pixel_info);
+	// Версия ProgramCache: бампается при вставке новой SourceEntry (rehash
+	// двигает entry) и при push_back permutations (realloc двигает program).
+	// Draw-кэш хранит поколение вместо доверия сырым указателям program/resources.
+	[[nodiscard]] uint64_t ProgramVersion() const;
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);

@@ -36,14 +36,16 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 }
 
 // KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
-// Defaults to 16 -- validated against real gameplay, where it cut the fraction of the main thread
-// spent in MasterSemaphore::Wait from dominating the frame to under 10%. Explicitly setting it to
-// 0 disables the flush entirely, same as before this had a default.
+// UFC-октагон: 2350 draw/кадр при дефолте 16 дают ~147 сабмитов — драйвер NVIDIA
+// тонет в переключениях контекста. Дефолт 384 даёт ~6 сабмитов/кадр (в целевом
+// коридоре 4-8 крупных пачек); transient-память командных буферов при этом не
+// растёт (переиспользование пула), потолок VRAM 8.5-9.5 ГБ не задет.
+// KYTY_DRAW_FLUSH_INTERVAL переопределяет при нужде; 0 — как раньше (выкл).
 uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
 		if (v == nullptr) {
-			return 16u;
+			return 384u;
 		}
 		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 	}();

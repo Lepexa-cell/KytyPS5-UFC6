@@ -723,6 +723,9 @@ struct PipelineCache::ProgramCache {
 		                       .spirv_words = static_cast<uint32_t>(spirv.size()),
 		                       .hash        = options.shader_hash},
 		});
+		// push_back может реаллоцировать permutations и сдвинуть все program-
+		// указатели, выданные ранее. Бампаем поколение для draw-кэша.
+		version.fetch_add(1, std::memory_order_relaxed);
 		const auto& permutation = source.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &source.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -1076,6 +1079,9 @@ struct PipelineCache::ProgramCache {
 						return ShaderProgram {};
 					}
 					entry = programs.try_emplace(lookup_key, std::move(record.plan)).first;
+					// Новая entry может перехешировать programs и сдвинуть SourceEntry
+					// (а с ними resources-указатели, выданные ранее).
+					version.fetch_add(1, std::memory_order_relaxed);
 					if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 						return ShaderProgram {};
 					}
@@ -1145,6 +1151,9 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key, std::move(*plan)).first;
+			// Новая entry может перехешировать programs и сдвинуть SourceEntry
+			// (а с ними resources-указатели, выданные ранее).
+			version.fetch_add(1, std::memory_order_relaxed);
 			if (!MaterializeFirstUse(entry->second, runtime, stage, stage_name, params.hash)) {
 				return ShaderProgram {};
 			}
@@ -1240,6 +1249,13 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
 	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
 	ProgramKey                                                     lookup_key;
+	// Поколение указателей program/resources: +1 при try_emplace SourceEntry
+	// (rehash двигает entry) и при push_back permutations (realloc двигает
+	// program). Draw-кэш сверяет поколение перед reuse вместо доверия указателям.
+	// Атомарное: фоновый PipelineCompiler может вставлять пермутации, пока GPU-
+	// поток читает ProgramVersion(). relaxed достаточно: нужна только
+	// монотонность (несовпадение = честный miss), порядок с указателями не нужен.
+	std::atomic<uint64_t> version {0};
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;
@@ -1370,6 +1386,10 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+}
+
+uint64_t PipelineCache::ProgramVersion() const {
+	return m_program_cache->version.load(std::memory_order_relaxed);
 }
 
 void PipelineCache::Save() {

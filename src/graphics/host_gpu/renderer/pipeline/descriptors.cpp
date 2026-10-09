@@ -1390,10 +1390,18 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	// UFC-октагон: PrepareBindings идёт на каждом из 2350 draw. Диагностика
+	// KYTY_WATCH_SHADER дёргала presented_frames (atomic load) и getenv-кэш на
+	// каждом вызове. Выносим ранний выход: когда вотч выключен (норма), сразу
+	// идём в подготовку без лишних atomic/static-инициализаций в горячем пути.
+	// Поведение при включённом вотче не меняется. DiagShaderScope остаётся
+	// безусловным: BufferCache::s_diag_shader_hash читает KYTY_WATCH_GPU_WRITE.
+	const uint64_t          watch_shader = WatchedShaderHash();
+	const bool              watch_active = watch_shader != 0;
+	const DiagShaderScope   diag_shader_scope(program.shader_hash);
+	if (watch_active) {
 	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
 	// bound with (first few uses; KYTY_WATCH_SHADER_EVERY=<n> adds every n-th use, up to 8 more).
-	const uint64_t        watch_shader = WatchedShaderHash();
 	static const uint32_t watch_every = [] {
 		const char* value = std::getenv("KYTY_WATCH_SHADER_EVERY");
 		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
@@ -1488,6 +1496,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			     r.Base48(), words.size() * 4u});
 		}
 	}
+	} // if (watch_active): диагностика только при включённом KYTY_WATCH_SHADER.
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -1772,6 +1781,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// The written ranges are gathered once, and a reader's reads are compared one by one only
 	// against a range that meets their span: a per-read scan of every bound image and written
 	// buffer cost the jungle 1.6 fps (11.1 against 12.7, warm).
+	// UFC-октагон: 2350 draw/кадр, у большинства specialization_reads пусты —
+	// пропускаем сбор written_ranges целиком (O(1) вместо O(N) по m_bound_images).
+	// Инвариант сохранён: при непустых reads выполняется штатная проверка ниже;
+	// vkCmdBindPipeline/DescriptorSets остаются безусловными в конце функции.
+	bool any_specialization_reads = false;
+	for (const auto* reader: prepared_bindings) {
+		if (!reader->runtime->resources->specialization_reads.empty()) {
+			any_specialization_reads = true;
+			break;
+		}
+	}
+	if (any_specialization_reads) {
 	struct WrittenRange {
 		uint64_t                                address = 0;
 		uint64_t                                size    = 0;
@@ -1873,6 +1894,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 	}
+	} // if (any_specialization_reads): иначе written_ranges не нужны вообще.
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();
