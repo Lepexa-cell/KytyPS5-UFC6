@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
 #include <atomic>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -61,6 +62,10 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	// subgroupSizeControl is enabled: the device has more than one subgroup size.
 	bool                               subgroup_size_control_enabled         = false;
+	// NVIDIA Ada (RTX 4070, vendor 0x10DE): Warp32 native, robustBufferAccess
+	// выключен (уже в дереве), subgroup форсируется в 32. KYTY_NVIDIA_WARP32=0
+	// отключает форсирование (is_nvidia_gpu остаётся для диагностики).
+	bool                               is_nvidia_gpu                         = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
@@ -133,8 +138,26 @@ struct GraphicContext {
 	// wave, or 0 when the default already is or the device cannot require it for the stage. On
 	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
 	// another wave, and its ballots, lane reads and reductions would mix the two.
+	// NVIDIA Ada (RTX 4070): SM исполняет варпы строго по 32 потока (Warp32).
+	// Для wave64 жёстко форсируем 32 через VK_EXT_subgroup_size_control, чтобы
+	// убрать эмуляцию 64-поточных кросс-варповых операций через Shared Memory.
+	// Выключается флагом KYTY_NVIDIA_WARP32=0; 2D UI не задет (размер сабгруппы
+	// не меняет пиксельную логику, только мэппинг волн на варпы).
 	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
 	                                            uint32_t                wave_size) const noexcept {
+		// KYTY_NVIDIA_WARP32=0: форсирование выкл (диагностика is_nvidia_gpu остаётся).
+		static const bool nvidia_warp32 = [] {
+			const char* v = std::getenv("KYTY_NVIDIA_WARP32");
+			return v == nullptr || v[0] != '0';
+		}();
+		// NVIDIA Warp32: wave64 никогда не отдаём как есть, только 32 — и в штатной
+		// ветке, и когда дефолт устройства уже совпал (иначе 64-поточный кросс-варп
+		// эмулируется через Shared Memory).
+		if (is_nvidia_gpu && nvidia_warp32 && wave_size == 64u &&
+		    (required_subgroup_size_stages & stage) != vk::ShaderStageFlags {} &&
+		    32u >= min_subgroup_size && 32u <= max_subgroup_size) {
+			return 32u;
+		}
 		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
 		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
 		    wave_size > max_subgroup_size) {

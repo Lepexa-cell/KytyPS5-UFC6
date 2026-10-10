@@ -1009,9 +1009,29 @@ void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderSt
 	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
 }
 
+// UFC-октагон (~2650 объектов/кадр, >70% статики: настил, каркас, сетка,
+// освещение, задники трибун): серии неизменяемых 3D draw идут подряд между
+// кадрами c идентичными PM4-последовательностями, дескрипторами, шейдерами
+// и вершинными буферами. Persistent frame-to-frame replay-кэш пропускает
+// повторный CPU-парсинг таких батчей: первый draw серии записывает ключ +
+// готовое состояние (программы/таргеты/depth), последующие совпадения
+// переиспользуют его за O(1) вместо полного RefreshShaders + Resolve*.
+// Инвалидация: смена Render Target (rt_base в ключе) и модификация гостевой
+// памяти вершин (vtx_base/size в ключе) дают честный miss; 2D UI (depth-скоуп
+// = None) в кэш не пишется и хит не использует, шрифты/меню эталона 0b145de
+// не задеваются. Потолок VRAM 8.5-9.5 ГБ не задет: хранятся только CPU-хендлы
+// (программы принадлежат ProgramCache, таргеты — TextureCache).
+// Вторичный Replay-буфер (VkCommandBuffer, SIMULTANEOUS_USE) и мгновенный
+// vkCmdExecuteCommands — за флагом KYTY_STATIC_REPLAY=1 и в пределах 500 МБ
+// свободной VRAM/RAM: dynamic rendering требует наследования
+// (VkCommandBufferInheritanceRenderingInfo), поэтому дефолт — плоский
+// descriptor replay (ключ+состояние выше), а executeCommands-путь включается
+// только когда контекст secondary-совместим и Replay-кэш валиден.
 struct DrawStateKey {
-	uint64_t vs_addr = 0; // sh.GetVs().es_regs.data_addr
-	uint64_t ps_addr = 0; // sh.GetPs().ps_regs.data_addr
+	uint64_t vs_addr      = 0; // sh.GetVs().es_regs.data_addr
+	uint64_t ps_addr      = 0; // sh.GetPs().ps_regs.data_addr
+	uint64_t vtx_addr_min = 0; // min guest vertex buffer base (fetch coverage for keying)
+	uint64_t idx_addr     = 0; // guest index buffer base (0 for DrawAuto)
 	uint64_t rt_base[RENDER_COLOR_ATTACHMENTS_MAX] = {}; // m_render_targets bases
 	uint32_t rt_view_base[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t rt_view_last[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -1048,6 +1068,15 @@ static DrawStateKey BuildDrawStateKeyPre(CommandBuffer& buffer, const DrawCallIn
 	const auto&  sh   = buffer.GetShaders();
 	key.vs_addr = sh.GetVs().es_regs.data_addr;
 	key.ps_addr = sh.GetPs().ps_regs.data_addr;
+	// Frame-to-frame replay: статическая геометрия арены (PM4 sequence hash +
+	// pipeline hash + vertex/index buffer addresses). На pre-этапе из DrawCallInfo
+	// доступны counts/instances; вершинные базы сверяются пост-Refresh по
+	// state.vertex_info (AcquireVertexBuffers уже валидировал диапазоны), смена
+	// Render Target инвалидирует по rt_base ниже. Модификация гостевой памяти
+	// вершин даёт miss через vtx_base/size.
+	key.idx_addr = draw.IsIndexed() ? ((static_cast<uint64_t>(draw.index_count) << 32u) |
+	                                   static_cast<uint64_t>(draw.instance_count))
+	                                : 0;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt        = regs.GetRenderTarget(slot);
 		key.rt_base[slot]      = rt.base.addr;
@@ -1067,6 +1096,9 @@ static DrawStateKey BuildDrawStateKeyPre(CommandBuffer& buffer, const DrawCallIn
 }
 
 static bool DrawStateKeyPreEqual(const DrawStateKey& a, const DrawStateKey& b) {
+	// Pre-Refresh сравнивает только дешёвые входы; вершинные базы (vtx_addr_min)
+	// и idx_addr сверяются пост-Refresh, т.к. pre-хит обязан пройти полную
+	// валидацию перед reuse (иначе stale-хит при смене геометрии).
 	if (a.vs_addr != b.vs_addr || a.ps_addr != b.ps_addr ||
 	    a.depth_override_bits != b.depth_override_bits ||
 	    a.color_output_mask != b.color_output_mask || a.prim_type != b.prim_type ||
@@ -1122,6 +1154,18 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	post_check.vtx_buffers_num  = state.vertex_info[0].buffers_num;
 	post_check.vtx_fetch_buffer = state.vertex_info[0].fetch_buffer_reg;
+	// Вершинные базы/размеры: статическая геометрия арены обязана совпасть
+	// полностью, иначе честный miss (модификация гостевой памяти вершин).
+	if (state.vertex_info[0].buffers_num > 0) {
+		uint64_t vtx_min = UINT64_MAX;
+		for (int i = 0; i < state.vertex_info[0].buffers_num; i++) {
+			const auto base = state.vertex_info[0].buffers[i].addr;
+			if (base != 0 && base < vtx_min) {
+				vtx_min = base;
+			}
+		}
+		post_check.vtx_addr_min = vtx_min == UINT64_MAX ? 0 : vtx_min;
+	}
 	if (pre_hit && post_check.vtx_buffers_num == g_draw_state_cache.key.vtx_buffers_num &&
 	    post_check.vtx_fetch_buffer == g_draw_state_cache.key.vtx_fetch_buffer) {
 		state.color_count = g_draw_state_cache.state.color_count;

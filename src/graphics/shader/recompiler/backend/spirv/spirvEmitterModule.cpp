@@ -387,9 +387,19 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state), "shader_data");
+				// NVIDIA Ada (RTX 4070): read-only ShaderData идёт в Constant Cache
+				// (NonWritable SSBO — тот же быстрый путь, что UBO c[], но без
+				// std140-переупаковки и лимита 64КБ; 2D UI не задет).
+				state.builder.AddAnnotation(spv::OpDecorate,
+				                            state.shader_data_storage_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
+				// SRT читается каждый draw (матрицы/кости/ключи); NonWritable
+				// направляет в read-only кэш вместо generic-пути SSBO.
+				state.builder.AddAnnotation(spv::OpDecorate, state.flattened_srt_variable,
+				                            spv::DecorationNonWritable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),

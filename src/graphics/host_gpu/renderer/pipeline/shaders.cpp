@@ -343,14 +343,28 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 	}
 	// One guest wave per host subgroup where the device lets the stage require it (mesh and
 	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size agree.
+	// NVIDIA Ada Warp32 (RTX 4070): требуем 32 для ВСЕХ графических стадий
+	// (vertex/tess/control/eval/pixel/mesh) через VK_EXT_subgroup_size_control —
+	// SM исполняет только варпы по 32, кросс-варповая эмуляция wave64 через
+	// Shared Memory убрана. vkCmdBindPipeline/DescriptorSets остаются
+	// безусловными; 2D UI не задет (меняется только мэппинг волн на варпы).
 	for (uint32_t index = 0; index < shader_stage_count; index++) {
 		auto&      stage   = build.stages[index];
 		const bool is_mesh = stage.stage == vk::ShaderStageFlagBits::eMeshEXT;
-		if (!is_mesh && stage.stage != vk::ShaderStageFlagBits::eFragment) {
+		if (!is_mesh && stage.stage != vk::ShaderStageFlagBits::eFragment &&
+		    stage.stage != vk::ShaderStageFlagBits::eVertex &&
+		    stage.stage != vk::ShaderStageFlagBits::eTessellationControl &&
+		    stage.stage != vk::ShaderStageFlagBits::eTessellationEvaluation) {
 			continue;
 		}
-		const auto wave_size = is_mesh ? vs_input_info.mesh.wave_size
-		                               : ps_input_info->stage.program->wave_size;
+		const auto is_fragment = stage.stage == vk::ShaderStageFlagBits::eFragment;
+		// VS/HS/DS берут wave вершинной программы (тот же guest wave кадра);
+		// PS — свою, mesh — свою. ps_input_info == nullptr возможен только когда
+		// нет фрагментной стадии, тогда ветка фрагмента недостижима.
+		const auto wave_size =
+		    is_mesh ? vs_input_info.mesh.wave_size
+		            : is_fragment ? ps_input_info->stage.program->wave_size
+		                          : vs_input_info.stage.program->wave_size;
 		const auto required  = graphics.GraphicsSubgroupSize(stage.stage, wave_size);
 		if (required != 0) {
 			build.subgroup_sizes[index].requiredSubgroupSize = required;
@@ -358,9 +372,19 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		} else if (wave_size < graphics.subgroup_size) {
 			static std::atomic_bool logged {false};
 			if (!logged.exchange(true)) {
+				const char* stage_name =
+				    is_mesh ? "mesh"
+				            : is_fragment
+				                  ? "pixel"
+				                  : (stage.stage == vk::ShaderStageFlagBits::eVertex ? "vertex"
+				                     : stage.stage == vk::ShaderStageFlagBits::eTessellationControl
+				                           ? "hull"
+				                           : stage.stage == vk::ShaderStageFlagBits::eTessellationEvaluation
+				                                 ? "domain"
+				                                 : "graphics");
 				LOGF("Vulkan subgroup: wave%u %s shader on a %u-wide host subgroup the device "
 				     "cannot narrow; its lane operations mix two waves\n",
-				     wave_size, is_mesh ? "mesh" : "pixel", graphics.subgroup_size);
+				     wave_size, stage_name, graphics.subgroup_size);
 			}
 		}
 	}
