@@ -617,7 +617,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
-	device_features.robustBufferAccess       = VK_TRUE;
+	const bool is_nvidia_gpu = properties2.properties.vendorID == 0x10DEu;
+	device_features.robustBufferAccess       = is_nvidia_gpu ? VK_FALSE : VK_TRUE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
 	device_features.depthClamp  = VK_TRUE;
@@ -663,7 +664,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	robustness2.pNext                              = &fragment_barycentric;
 #endif
 	if (robustness2_ext_enabled) {
-		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
+		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2 == VK_TRUE &&
+		                                      !is_nvidia_gpu
+		                                          ? VK_TRUE
+		                                          : VK_FALSE;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}

@@ -1114,26 +1114,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-
-	// Safe RefreshShaders bypass for consecutive identical draws: when EVERY scalar
-	// in pre_key matched (same shader addresses, render targets, depth override,
-	// MRT config, etc.) the cached DrawRenderState is reused and the expensive
-	// RefreshShaders + Resolve* calls are skipped. This only fires for strictly
-	// consecutive 3D draws of the same batch - 2D UI font draws always differ in
-	// shader address, render target, or vertex layout, so they are never shortcut.
-	// The cached vertex_info[0] is valid because the same (vs_addr, ps_addr) pair
-	// deterministically produces the same vertex layout.
-	if (pre_hit) {
-		state = g_draw_state_cache.state;
-		LogDrawCensus(buffer, draw, state);
-		for (uint32_t i = 0; i < state.color_count; i++) {
-			BindRenderTarget(state.color_info[i].image_id);
-		}
-		if (state.depth_info.image_id) {
-			BindRenderTarget(state.depth_info.image_id);
-		}
-		return !(state.color_count == 0 && !state.depth_info.image_id && !state.ps_active);
-
 	RefreshShaders(buffer, draw, color_output_mask, state);
 	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
@@ -1196,7 +1176,6 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	g_draw_state_cache.state = state;
 	g_draw_state_cache.valid = true;
 	return true;
-}
 }
 
 static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffer,
