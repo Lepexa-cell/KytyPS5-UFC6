@@ -1098,8 +1098,13 @@ void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	const auto tick = m_scheduler.CurrentTick();
+	const auto gpusync_texture_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 	m_scheduler.Wait(tick);
 	m_scheduler.WaitPriorityOperations(tick);
+	if (TelemetrySubcountersEnabled()) {
+		TelemetryAddReadmemFenceWait(TelemetryNowUs() - gpusync_texture_begin_us);
+		TelemetryCountGpusyncTexture();
+	}
 	for (const auto& [begin, bytes]: downloaded) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
 	}
@@ -1208,7 +1213,10 @@ void BufferCache::RunGarbageCollector() {
 	const auto completion_tick = m_scheduler.CurrentTick();
 	const auto telemetry_gc_wait_begin_us = TelemetryNowUs();
 	m_scheduler.Wait(completion_tick);
-	TelemetryAddWaitGC(TelemetryNowUs() - telemetry_gc_wait_begin_us);
+	if (TelemetrySubcountersEnabled()) {
+		TelemetryAddWaitGC(TelemetryNowUs() - telemetry_gc_wait_begin_us);
+		TelemetryCountGpusyncOther();
+	}
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];

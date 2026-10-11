@@ -1843,7 +1843,7 @@ void TelemetryEndFrame() {
 		     static_cast<double>(telemetry.flushes) * inv_frames,
 		     static_cast<double>(telemetry.draws) * inv_frames);
 		if (TelemetrySubcountersEnabled()) {
-			LOGF("[FRAME_TELEMETRY_TARGETS] Targets: %.2f ms (Color: %.2f ms, Depth: %.2f ms) | L1: hits %.1f miss %.1f | Resolves: color %.1f depth %.1f | Cache: lookups %.1f same %.1f overlap %.1f inserts %.1f expands %.1f refresh %.1f clears %.1f | Candidates: avg %.1f max %u | Images: %u | CacheTime: lookup %.2f ms insert %.2f ms overlap %.2f ms expand %.2f ms refresh %.2f ms clear %.2f ms (tracker %.2f ms gpuwait %.2f ms flush %.2f ms fence %.2f ms copy %.2f ms readback %.2f ms writeback %.2f ms) clears %u waits %u bind %.2f ms\n",
+			LOGF("[FRAME_TELEMETRY_TARGETS] Targets: %.2f ms (Color: %.2f ms, Depth: %.2f ms) | L1: hits %.1f miss %.1f | Resolves: color %.1f depth %.1f | Cache: lookups %.1f same %.1f overlap %.1f inserts %.1f expands %.1f refresh %.1f clears %.1f | Candidates: avg %.1f max %u | Images: %u | CacheTime: lookup %.2f ms insert %.2f ms overlap %.2f ms expand %.2f ms refresh %.2f ms clear %.2f ms (tracker %.2f ms gpuwait %.2f ms flush %.2f ms fence %.2f ms copy %.2f ms readback %.2f ms writeback %.2f ms) clears %u waits %u gpusync: clear %u texture %u buffer %u other %u bind %.2f ms\n",
 			     static_cast<double>(telemetry.draw_state_targets_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_color_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_depth_us) * frame_avg,
@@ -1872,6 +1872,10 @@ void TelemetryEndFrame() {
 			     static_cast<double>(telemetry.draw_targets_clear_gpu_wait_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_readback_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_writeback_us) * frame_avg,
+			     static_cast<double>(telemetry.gpusync_clear_count) * inv_frames,
+			     static_cast<double>(telemetry.gpusync_texture_count) * inv_frames,
+			     static_cast<double>(telemetry.gpusync_buffer_count) * inv_frames,
+			     static_cast<double>(telemetry.gpusync_other_count) * inv_frames,
 			     static_cast<double>(telemetry.draw_targets_bind_us) * frame_avg);
 		}
 		telemetry = FrameTelemetry {};

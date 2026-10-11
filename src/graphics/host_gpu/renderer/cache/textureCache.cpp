@@ -1315,6 +1315,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	uint32_t   clear_skip_all_of = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
 		TelemetryCountClearGpuWait();
+		TelemetryCountGpusyncClear();
 		// Experimental: skip the synchronous readback to measure the FPS ceiling.
 		if (skip_clear_wait) {
 			return;

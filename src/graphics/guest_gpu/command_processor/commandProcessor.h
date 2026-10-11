@@ -64,6 +64,10 @@ struct FrameTelemetry {
 	uint64_t wait_readmem_us = 0;
 	uint64_t wait_flip_us = 0;
 	uint64_t wait_gc_us = 0;
+	uint32_t gpusync_clear_count = 0;
+	uint32_t gpusync_texture_count = 0;
+	uint32_t gpusync_buffer_count = 0;
+	uint32_t gpusync_other_count = 0;
 	uint32_t draws = 0;
 	uint32_t flushes = 0;
 	uint32_t draw_state_l1_hits = 0;
@@ -206,6 +210,22 @@ inline void TelemetryAddReadmemCopyReadback(uint64_t delta_us) {
 
 inline void TelemetryCountClearGpuWait() {
 	GetFrameTelemetry().draw_targets_clear_wait_count++;
+}
+
+inline void TelemetryCountGpusyncClear() {
+	GetFrameTelemetry().gpusync_clear_count++;
+}
+
+inline void TelemetryCountGpusyncTexture() {
+	GetFrameTelemetry().gpusync_texture_count++;
+}
+
+inline void TelemetryCountGpusyncBuffer() {
+	GetFrameTelemetry().gpusync_buffer_count++;
+}
+
+inline void TelemetryCountGpusyncOther() {
+	GetFrameTelemetry().gpusync_other_count++;
 }
 
 inline void TelemetryAddDrawTargetsBind(uint64_t delta_us) {
