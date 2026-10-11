@@ -1367,7 +1367,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearWriteback(TelemetryNowUs() - writeback_begin_us);
 			}
-			}
 	}
 	// Measurement only: no logic changes. Log per-GPU-wait clear outcomes under KYTY_LOG_CLEAR_WAIT=1.
 	if (gpu_wait_log && gpu_wait_start_us != 0) {
@@ -1380,18 +1379,19 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			                   : clear_skip_all_of > 0    ? "skip all_of"
 			                   :                            "no slices";
 			LOGF("ClearWait: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%u "
-			     "image=%u,%u,%u current_tick=%llu wait=%llu us=%llu result=%s\n",
+			     "image=%u,%u,%u current_tick=%llu wait_us=%llu result=%s\n",
 			     range.address, range.size, static_cast<uint32_t>(view.format),
 			     image_extent.width, image_extent.height, image_extent.depth,
 			     static_cast<unsigned long long>(current_tick),
-			     static_cast<unsigned long long>(current_tick),
 			     static_cast<unsigned long long>(wait_us), result);
-			session_logged++;
 		}
 	}
 }
+}
+
 void TextureCache::RefreshImage(ImageId id) {
 	// Measurement only: the refresh runs identically with or without subcounters.
+
 	const bool subcounters = TelemetrySubcountersEnabled();
 	const auto refresh_begin_us = subcounters ? TelemetryNowUs() : 0;
 	auto& image = m_slot_images[id];
