@@ -52,6 +52,10 @@ struct FrameTelemetry {
 	uint64_t draw_targets_clear_gpu_wait_us = 0;
 	uint64_t draw_targets_clear_readback_us = 0;
 	uint64_t draw_targets_clear_writeback_us = 0;
+	uint64_t draw_targets_clear_flush_submit_us = 0;
+	uint64_t draw_targets_clear_fence_wait_us = 0;
+	uint64_t draw_targets_clear_copy_readback_us = 0;
+	uint32_t draw_targets_clear_wait_count = 0;
 	uint64_t draw_targets_bind_us = 0;
 	uint64_t draw_bindings_us = 0;
 	uint64_t draw_vertex_us = 0;
@@ -186,6 +190,22 @@ inline void TelemetryAddDrawTargetsClearReadback(uint64_t delta_us) {
 
 inline void TelemetryAddDrawTargetsClearWriteback(uint64_t delta_us) {
 	GetFrameTelemetry().draw_targets_clear_writeback_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearFlushSubmit(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_flush_submit_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearFenceWait(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_fence_wait_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearCopyReadback(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_copy_readback_us += delta_us;
+}
+
+inline void TelemetryCountClearGpuWait() {
+	GetFrameTelemetry().draw_targets_clear_wait_count++;
 }
 
 inline void TelemetryAddDrawTargetsBind(uint64_t delta_us) {

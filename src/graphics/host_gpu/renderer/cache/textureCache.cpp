@@ -71,6 +71,12 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return enabled;
 }
 
+// KYTY_LOG_CLEAR_WAIT=1 logs one line per color-clear GPU wait (measurements only).
+[[nodiscard]] bool ClearWaitLogEnabled() {
+	const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
+	return value != nullptr && value[0] == '1';
+}
+
 // Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
 [[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
 	constexpr uint64_t   Chunk = 64 * 1024;
@@ -1294,8 +1300,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
+	const bool gpu_wait_log = ClearWaitLogEnabled();
+	uint64_t   gpu_wait_start_us = 0;
+	uint32_t   clear_materialized = 0;
+	uint32_t   clear_skip_decode = 0;
+	uint32_t   clear_skip_all_of = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		TelemetryCountClearGpuWait();
 		const auto gpu_wait_begin_us = subcounters ? TelemetryNowUs() : 0;
+		if (gpu_wait_log) {
+			gpu_wait_start_us = TelemetryNowUs();
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 		if (subcounters) {
 			TelemetryAddDrawTargetsClearGpuWait(TelemetryNowUs() - gpu_wait_begin_us);
@@ -1314,6 +1329,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
 			}
+			clear_skip_decode++;
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
@@ -1324,6 +1340,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
 			}
+			clear_skip_all_of++;
 			continue;
 		}
 		if (subcounters) {
@@ -1337,6 +1354,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			// Measurement only: counts actual color-clear materializations per frame.
 			if (TelemetrySubcountersEnabled()) {
 				TelemetryCountCacheClear();
+				clear_materialized++;
 			}
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
@@ -1349,10 +1367,29 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearWriteback(TelemetryNowUs() - writeback_begin_us);
 			}
+			}
+	}
+	// Measurement only: no logic changes. Log per-GPU-wait clear outcomes under KYTY_LOG_CLEAR_WAIT=1.
+	if (gpu_wait_log && gpu_wait_start_us != 0) {
+		static uint32_t session_logged = 0;
+		if (session_logged < 200) {
+			const auto wait_us = TelemetryNowUs() - gpu_wait_start_us;
+			const auto image_extent = desc.info.extent;
+			const char* result = clear_materialized > 0   ? "clear materialized"
+			                   : clear_skip_decode > 0    ? "skip decode"
+			                   : clear_skip_all_of > 0    ? "skip all_of"
+			                   :                            "no slices";
+			LOGF("ClearWait: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%u "
+			     "image=%u,%u,%u current_tick=%llu wait=%llu us=%llu result=%s\n",
+			     range.address, range.size, static_cast<uint32_t>(view.format),
+			     image_extent.width, image_extent.height, image_extent.depth,
+			     static_cast<unsigned long long>(current_tick),
+			     static_cast<unsigned long long>(current_tick),
+			     static_cast<unsigned long long>(wait_us), result);
+			session_logged++;
 		}
 	}
 }
-
 void TextureCache::RefreshImage(ImageId id) {
 	// Measurement only: the refresh runs identically with or without subcounters.
 	const bool subcounters = TelemetrySubcountersEnabled();
