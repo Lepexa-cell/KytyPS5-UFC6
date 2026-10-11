@@ -1842,6 +1842,38 @@ void TelemetryEndFrame() {
 		     static_cast<double>(telemetry.wait_gc_us) * frame_avg,
 		     static_cast<double>(telemetry.flushes) * inv_frames,
 		     static_cast<double>(telemetry.draws) * inv_frames);
+		if (TelemetrySubcountersEnabled()) {
+			LOGF("[FRAME_TELEMETRY_TARGETS] Targets: %.2f ms (Color: %.2f ms, Depth: %.2f ms) | L1: hits %.1f miss %.1f | Resolves: color %.1f depth %.1f | Cache: lookups %.1f same %.1f overlap %.1f inserts %.1f expands %.1f refresh %.1f clears %.1f | Candidates: avg %.1f max %u | Images: %u | CacheTime: lookup %.2f ms insert %.2f ms overlap %.2f ms expand %.2f ms refresh %.2f ms clear %.2f ms (tracker %.2f ms gpuwait %.2f ms readback %.2f ms writeback %.2f ms) bind %.2f ms\n",
+			     static_cast<double>(telemetry.draw_state_targets_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_color_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_depth_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_state_l1_hits) * inv_frames,
+			     static_cast<double>(telemetry.draw_state_l1_misses) * inv_frames,
+			     static_cast<double>(telemetry.color_resolves) * inv_frames,
+			     static_cast<double>(telemetry.depth_resolves) * inv_frames,
+			     static_cast<double>(telemetry.cache_lookups) * inv_frames,
+			     static_cast<double>(telemetry.cache_same_backing_hits) * inv_frames,
+			     static_cast<double>(telemetry.cache_overlap_hits) * inv_frames,
+			     static_cast<double>(telemetry.cache_inserts) * inv_frames,
+			     static_cast<double>(telemetry.cache_expands) * inv_frames,
+			     static_cast<double>(telemetry.cache_refreshes) * inv_frames,
+			     static_cast<double>(telemetry.cache_clears) * inv_frames,
+			     telemetry.cache_lookups != 0
+			         ? static_cast<double>(telemetry.cache_candidates_total) / static_cast<double>(telemetry.cache_lookups)
+			         : 0.0,
+			     telemetry.cache_candidates_max, telemetry.cache_images,
+			     static_cast<double>(telemetry.draw_targets_cache_lookup_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_cache_insert_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_overlap_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_expand_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_refresh_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_clear_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_clear_tracker_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_clear_gpu_wait_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_clear_readback_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_clear_writeback_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_targets_bind_us) * frame_avg);
+		}
 		telemetry = FrameTelemetry {};
 	}
 	// Draw-state L1 scope: never leak into a foreign frame.

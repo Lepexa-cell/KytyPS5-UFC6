@@ -1180,9 +1180,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		if (state.depth_info.image_id) {
 			BindRenderTarget(state.depth_info.image_id);
 		}
+		if (subcounters) {
+			TelemetryCountDrawStateL1Hit();
+		}
 		// DrawRenderState has no pixel_input member in this tree; downstream
 		// selects state.ps_input_info via state.ps_active directly.
 		return !(state.color_count == 0 && !state.depth_info.image_id && !state.ps_active);
+	}
+	if (subcounters) {
+		TelemetryCountDrawStateL1Miss();
 	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
@@ -1194,11 +1200,15 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	}
 	mrt_mask &= color_output_mask;
 	const auto targets_begin_us = subcounters ? TelemetryNowUs() : 0;
+	const auto color_begin_us = subcounters ? TelemetryNowUs() : 0;
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if ((mrt_mask & (1u << slot)) != 0) {
+			if (subcounters) {
+				TelemetryCountColorResolve();
+			}
 			ResolveRenderColorTarget(buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
@@ -1206,11 +1216,19 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			}
 		}
 	}
+	if (subcounters) {
+		TelemetryAddDrawTargetsColor(TelemetryNowUs() - color_begin_us);
+	}
+	const auto depth_begin_us = subcounters ? TelemetryNowUs() : 0;
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
+	if (subcounters) {
+		TelemetryCountDepthResolve();
+	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
 	if (subcounters) {
+		TelemetryAddDrawTargetsDepth(TelemetryNowUs() - depth_begin_us);
 		TelemetryAddDrawStateTargets(TelemetryNowUs() - targets_begin_us);
 	}
 

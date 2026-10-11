@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -985,6 +986,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	// Measurement only: the expansion runs identically with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
+	const auto expand_begin_us = subcounters ? TelemetryNowUs() : 0;
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
@@ -1001,6 +1005,10 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		CopyImage(expanded_id, source_id);
 	}
 	FreeImage(source_id);
+	if (subcounters) {
+		TelemetryAddDrawTargetsExpand(TelemetryNowUs() - expand_begin_us);
+		TelemetryCountCacheExpand();
+	}
 	return expanded_id;
 }
 
@@ -1232,12 +1240,15 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	const auto range        = desc.info.metadata.range;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const auto layers       = desc.info.TransferLayers();
+	// Measurement only: same clear path with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
 	const auto  first          = volume_texture ? 0u : metadata_base_layer;
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
 	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	{
+		const auto tracker_begin_us = subcounters ? TelemetryNowUs() : 0;
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
@@ -1263,8 +1274,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.dcc_clear_checked_tick  = current_tick;
 		image.dcc_clear_checked_first = first;
 		image.dcc_clear_checked_count = count;
-		if (already_resolved_this_tick &&
-		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+		const bool cpu_modified = already_resolved_this_tick &&
+		                          m_buffer_cache.IsRegionCpuModified(range.address, range.size);
+		if (subcounters) {
+			TelemetryAddDrawTargetsClearTracker(TelemetryNowUs() - tracker_begin_us);
+		}
+		if (already_resolved_this_tick && !cpu_modified) {
 			return;
 		}
 	}
@@ -1280,17 +1295,25 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		const auto gpu_wait_begin_us = subcounters ? TelemetryNowUs() : 0;
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		if (subcounters) {
+			TelemetryAddDrawTargetsClearGpuWait(TelemetryNowUs() - gpu_wait_begin_us);
+		}
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
+		const auto readback_begin_us = subcounters ? TelemetryNowUs() : 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeColorClear(desc, code, clear.color)) {
+			if (subcounters) {
+				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+			}
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
@@ -1298,25 +1321,42 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+			if (subcounters) {
+				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+			}
 			continue;
+		}
+		if (subcounters) {
+			TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
 		}
 		{
 			std::scoped_lock lock {m_lock};
 			ClearImage(m_scheduler.Current(), id, view.format,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
+			// Measurement only: counts actual color-clear materializations per frame.
+			if (TelemetrySubcountersEnabled()) {
+				TelemetryCountCacheClear();
+			}
 		}
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
+			const auto writeback_begin_us = subcounters ? TelemetryNowUs() : 0;
 			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
 			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			if (subcounters) {
+				TelemetryAddDrawTargetsClearWriteback(TelemetryNowUs() - writeback_begin_us);
+			}
 		}
 	}
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	// Measurement only: the refresh runs identically with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
+	const auto refresh_begin_us = subcounters ? TelemetryNowUs() : 0;
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1343,6 +1383,10 @@ void TextureCache::RefreshImage(ImageId id) {
 		return;
 	}
 	InitializeImage(id);
+	if (subcounters) {
+		TelemetryAddDrawTargetsRefresh(TelemetryNowUs() - refresh_begin_us);
+		TelemetryCountCacheRefresh();
+	}
 }
 
 ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
@@ -1380,6 +1424,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
+	// Measurement only: same lookup path with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
+	const auto lookup_begin_us = subcounters ? TelemetryNowUs() : 0;
+	if (subcounters) {
+		TelemetryCountCacheLookup();
+	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
 		std::scoped_lock lock {m_lock};
@@ -1388,10 +1438,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	uint32_t candidate_count = 0;
+	bool same_backing_hit = false;
+	bool overlap_hit = false;
+	bool inserted = false;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		candidate_count = static_cast<uint32_t>(candidates.size());
 
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
@@ -1399,10 +1454,12 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = id;
 			}
 		}
+		same_backing_hit = static_cast<bool>(result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			const auto overlap_begin_us = subcounters ? TelemetryNowUs() : 0;
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
@@ -1414,6 +1471,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					view_layer = overlap.layer;
 				}
 			}
+			if (subcounters) {
+				TelemetryAddDrawTargetsOverlap(TelemetryNowUs() - overlap_begin_us);
+			}
+			overlap_hit = static_cast<bool>(result);
 		}
 
 		if (result) {
@@ -1426,12 +1487,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			const auto insert_begin_us = subcounters ? TelemetryNowUs() : 0;
 			result         = InsertImage(desc.info);
-			auto& inserted = m_slot_images[result];
-			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
-			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+			auto& inserted_image = m_slot_images[result];
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted_image.info.data.address,
+			                                    inserted_image.info.data.size)) {
+				inserted_image.MarkBufferModified();
 			}
+			if (subcounters) {
+				TelemetryAddDrawTargetsCacheInsert(TelemetryNowUs() - insert_begin_us);
+			}
+			inserted = true;
 		}
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
@@ -1442,8 +1508,25 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		if (subcounters) {
+			TelemetryAddDrawTargetsCacheLookup(TelemetryNowUs() - lookup_begin_us);
+			TelemetryAddCacheCandidates(candidate_count);
+			if (same_backing_hit) {
+				TelemetryCountCacheSameBackingHit();
+			} else if (overlap_hit) {
+				TelemetryCountCacheOverlapHit();
+			}
+			if (inserted) {
+				TelemetryCountCacheInsert();
+			}
+			TelemetrySetCacheImages(static_cast<uint32_t>(m_slot_images.size()));
+		}
 	}
+	const auto clear_begin_us = subcounters ? TelemetryNowUs() : 0;
 	MaterializeColorClear(result, desc, metadata_base_layer);
+	if (subcounters) {
+		TelemetryAddDrawTargetsClear(TelemetryNowUs() - clear_begin_us);
+	}
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};

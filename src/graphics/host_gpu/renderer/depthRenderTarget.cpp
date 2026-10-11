@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
@@ -348,7 +349,14 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	}
 	auto& cache = m_context.GetTextureCache();
 	r.image_id = cache.FindImage(r.desc);
-	BindRenderTarget(r.image_id);
+	// Measurement only: binding runs identically with or without subcounters.
+	if (TelemetrySubcountersEnabled()) {
+		const auto bind_begin_us = TelemetryNowUs();
+		BindRenderTarget(r.image_id);
+		TelemetryAddDrawTargetsBind(TelemetryNowUs() - bind_begin_us);
+	} else {
+		BindRenderTarget(r.image_id);
+	}
 }
 
 bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {

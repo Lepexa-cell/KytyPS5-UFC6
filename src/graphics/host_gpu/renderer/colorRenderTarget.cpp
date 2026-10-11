@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -336,7 +337,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);
 	r.export_mapping           = target_format.export_mapping;
-	BindRenderTarget(r.image_id);
+	// Measurement only: binding runs identically with or without subcounters.
+	if (TelemetrySubcountersEnabled()) {
+		const auto bind_begin_us = TelemetryNowUs();
+		BindRenderTarget(r.image_id);
+		TelemetryAddDrawTargetsBind(TelemetryNowUs() - bind_begin_us);
+	} else {
+		BindRenderTarget(r.image_id);
+	}
 }
 
 } // namespace Libs::Graphics

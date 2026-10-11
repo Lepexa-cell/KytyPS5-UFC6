@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <span>
@@ -39,6 +40,19 @@ struct FrameTelemetry {
 	uint64_t draw_state_materialize_us = 0;
 	uint64_t draw_state_permutation_us = 0;
 	uint64_t draw_state_targets_us = 0;
+	uint64_t draw_targets_color_us = 0;
+	uint64_t draw_targets_depth_us = 0;
+	uint64_t draw_targets_cache_lookup_us = 0;
+	uint64_t draw_targets_cache_insert_us = 0;
+	uint64_t draw_targets_overlap_us = 0;
+	uint64_t draw_targets_expand_us = 0;
+	uint64_t draw_targets_refresh_us = 0;
+	uint64_t draw_targets_clear_us = 0;
+	uint64_t draw_targets_clear_tracker_us = 0;
+	uint64_t draw_targets_clear_gpu_wait_us = 0;
+	uint64_t draw_targets_clear_readback_us = 0;
+	uint64_t draw_targets_clear_writeback_us = 0;
+	uint64_t draw_targets_bind_us = 0;
 	uint64_t draw_bindings_us = 0;
 	uint64_t draw_vertex_us = 0;
 	uint64_t draw_pipe_us = 0;
@@ -48,6 +62,20 @@ struct FrameTelemetry {
 	uint64_t wait_gc_us = 0;
 	uint32_t draws = 0;
 	uint32_t flushes = 0;
+	uint32_t draw_state_l1_hits = 0;
+	uint32_t draw_state_l1_misses = 0;
+	uint32_t color_resolves = 0;
+	uint32_t depth_resolves = 0;
+	uint32_t cache_lookups = 0;
+	uint32_t cache_same_backing_hits = 0;
+	uint32_t cache_overlap_hits = 0;
+	uint32_t cache_inserts = 0;
+	uint32_t cache_expands = 0;
+	uint32_t cache_refreshes = 0;
+	uint32_t cache_clears = 0;
+	uint32_t cache_candidates_total = 0;
+	uint32_t cache_candidates_max = 0;
+	uint32_t cache_images = 0;
 };
 
 inline FrameTelemetry& GetFrameTelemetry() {
@@ -110,6 +138,112 @@ inline void TelemetryAddDrawStatePermutation(uint64_t delta_us) {
 
 inline void TelemetryAddDrawStateTargets(uint64_t delta_us) {
 	GetFrameTelemetry().draw_state_targets_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsColor(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_color_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsDepth(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_depth_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsCacheLookup(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_cache_lookup_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsCacheInsert(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_cache_insert_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsOverlap(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_overlap_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsExpand(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_expand_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsRefresh(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_refresh_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClear(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearTracker(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_tracker_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearGpuWait(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_gpu_wait_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearReadback(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_readback_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsClearWriteback(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_clear_writeback_us += delta_us;
+}
+
+inline void TelemetryAddDrawTargetsBind(uint64_t delta_us) {
+	GetFrameTelemetry().draw_targets_bind_us += delta_us;
+}
+
+inline void TelemetryCountDrawStateL1Hit() {
+	GetFrameTelemetry().draw_state_l1_hits++;
+}
+
+inline void TelemetryCountDrawStateL1Miss() {
+	GetFrameTelemetry().draw_state_l1_misses++;
+}
+
+inline void TelemetryCountColorResolve() {
+	GetFrameTelemetry().color_resolves++;
+}
+
+inline void TelemetryCountDepthResolve() {
+	GetFrameTelemetry().depth_resolves++;
+}
+
+inline void TelemetryCountCacheLookup() {
+	GetFrameTelemetry().cache_lookups++;
+}
+
+inline void TelemetryCountCacheSameBackingHit() {
+	GetFrameTelemetry().cache_same_backing_hits++;
+}
+
+inline void TelemetryCountCacheOverlapHit() {
+	GetFrameTelemetry().cache_overlap_hits++;
+}
+
+inline void TelemetryCountCacheInsert() {
+	GetFrameTelemetry().cache_inserts++;
+}
+
+inline void TelemetryCountCacheExpand() {
+	GetFrameTelemetry().cache_expands++;
+}
+
+inline void TelemetryCountCacheRefresh() {
+	GetFrameTelemetry().cache_refreshes++;
+}
+
+inline void TelemetryCountCacheClear() {
+	GetFrameTelemetry().cache_clears++;
+}
+
+inline void TelemetryAddCacheCandidates(uint32_t count) {
+	auto& telemetry = GetFrameTelemetry();
+	telemetry.cache_candidates_total += count;
+	telemetry.cache_candidates_max = std::max(telemetry.cache_candidates_max, count);
+}
+
+inline void TelemetrySetCacheImages(uint32_t count) {
+	GetFrameTelemetry().cache_images = count;
 }
 
 inline void TelemetryAddDrawBindings(uint64_t delta_us) {
