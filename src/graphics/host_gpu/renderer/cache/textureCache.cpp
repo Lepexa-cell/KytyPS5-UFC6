@@ -1319,7 +1319,6 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (skip_clear_wait) {
 			return;
 		}
-		TelemetryCountClearGpuWait();
 		const auto gpu_wait_begin_us = subcounters ? TelemetryNowUs() : 0;
 		if (gpu_wait_log) {
 			gpu_wait_start_us = TelemetryNowUs();
@@ -1400,9 +1399,11 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     static_cast<unsigned long long>(current_tick),
 			     static_cast<unsigned long long>(completed_tick),
 			     static_cast<unsigned long long>(wait_us), result);
+			session_logged++;
+		}
 	}
 }
-	}
+
 
 void TextureCache::RefreshImage(ImageId id) {
 	// Measurement only: the refresh runs identically with or without subcounters.
