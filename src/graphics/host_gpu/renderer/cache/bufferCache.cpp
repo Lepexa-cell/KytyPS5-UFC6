@@ -252,24 +252,24 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
 		}
 	};
-		if constexpr (async) {
+	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
-		const auto submit_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
+		const auto readmem_submit_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 		const auto tick = m_scheduler.CurrentTick();
 		if (TelemetrySubcountersEnabled()) {
-			TelemetryAddDrawTargetsClearFlushSubmit(TelemetryNowUs() - submit_begin_us);
+			TelemetryAddReadmemFlushSubmit(TelemetryNowUs() - readmem_submit_begin_us);
 		}
-		const auto fence_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
+		const auto readmem_fence_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		if (TelemetrySubcountersEnabled()) {
-			TelemetryAddDrawTargetsClearFenceWait(TelemetryNowUs() - fence_begin_us);
+			TelemetryAddReadmemFenceWait(TelemetryNowUs() - readmem_fence_begin_us);
 		}
-		const auto publish_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
+		const auto readmem_publish_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 		publish();
 		if (TelemetrySubcountersEnabled()) {
-			TelemetryAddDrawTargetsClearCopyReadback(TelemetryNowUs() - publish_begin_us);
+			TelemetryAddReadmemCopyReadback(TelemetryNowUs() - readmem_publish_begin_us);
 		}
 	}
 }

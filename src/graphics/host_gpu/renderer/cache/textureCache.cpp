@@ -77,6 +77,13 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return value != nullptr && value[0] == '1';
 }
 
+// KYTY_EXPERIMENT_SKIP_CLEAR_WAIT=1 skips the synchronous readback in MaterializeColorClear.
+// Experimental: measures the FPS ceiling without the GPU wait. Clear artifacts expected.
+[[nodiscard]] bool SkipClearWaitEnabled() {
+	const auto* value = std::getenv("KYTY_EXPERIMENT_SKIP_CLEAR_WAIT");
+	return value != nullptr && value[0] == '1';
+}
+
 // Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
 [[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
 	constexpr uint64_t   Chunk = 64 * 1024;
@@ -1301,11 +1308,17 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
 	const bool gpu_wait_log = ClearWaitLogEnabled();
+	const bool skip_clear_wait = SkipClearWaitEnabled();
 	uint64_t   gpu_wait_start_us = 0;
 	uint32_t   clear_materialized = 0;
 	uint32_t   clear_skip_decode = 0;
 	uint32_t   clear_skip_all_of = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		TelemetryCountClearGpuWait();
+		// Experimental: skip the synchronous readback to measure the FPS ceiling.
+		if (skip_clear_wait) {
+			return;
+		}
 		TelemetryCountClearGpuWait();
 		const auto gpu_wait_begin_us = subcounters ? TelemetryNowUs() : 0;
 		if (gpu_wait_log) {
@@ -1367,6 +1380,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearWriteback(TelemetryNowUs() - writeback_begin_us);
 			}
+		}
 	}
 	// Measurement only: no logic changes. Log per-GPU-wait clear outcomes under KYTY_LOG_CLEAR_WAIT=1.
 	if (gpu_wait_log && gpu_wait_start_us != 0) {
@@ -1374,20 +1388,21 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (session_logged < 200) {
 			const auto wait_us = TelemetryNowUs() - gpu_wait_start_us;
 			const auto image_extent = desc.info.extent;
+			const auto completed_tick = m_scheduler.IsFree(current_tick - 1) ? (current_tick - 1) : 0;
 			const char* result = clear_materialized > 0   ? "clear materialized"
 			                   : clear_skip_decode > 0    ? "skip decode"
 			                   : clear_skip_all_of > 0    ? "skip all_of"
 			                   :                            "no slices";
 			LOGF("ClearWait: addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%u "
-			     "image=%u,%u,%u current_tick=%llu wait_us=%llu result=%s\n",
+			     "image=%u,%u,%u last_gpu_tick=%llu completed_tick=%llu wait_us=%llu result=%s\n",
 			     range.address, range.size, static_cast<uint32_t>(view.format),
 			     image_extent.width, image_extent.height, image_extent.depth,
 			     static_cast<unsigned long long>(current_tick),
+			     static_cast<unsigned long long>(completed_tick),
 			     static_cast<unsigned long long>(wait_us), result);
-		}
 	}
 }
-}
+	}
 
 void TextureCache::RefreshImage(ImageId id) {
 	// Measurement only: the refresh runs identically with or without subcounters.
