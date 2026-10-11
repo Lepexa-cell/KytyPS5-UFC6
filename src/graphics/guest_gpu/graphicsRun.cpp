@@ -531,6 +531,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
 	// the page, draining the GPU; WriteClean writes both copies instead.
+	// Step 3a (measurement only): tag the write so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op    = GpuWriteOp::WriteData,
+	    .value = dw_num != 0 ? static_cast<uint64_t>(src[write_one_address ? dw_num - 1 : 0]) : 0u,
+	    .size  = static_cast<uint64_t>(dw_num) * sizeof(uint32_t),
+	});
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
@@ -603,6 +609,12 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
 	if (src_sel == 2) {
+		// Step 3a (measurement only): tag the fill so the ClearWait writer lookup names it.
+		const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+		    .op    = GpuWriteOp::DmaFill,
+		    .value = static_cast<uint64_t>(src_address_or_offset_or_immediate & 0xffffffffu),
+		    .size  = num_bytes,
+		});
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
@@ -615,6 +627,12 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (src_gds && dst_gds) {
 		EXIT("unsupported dmaData GDS-to-GDS copy\n");
 	}
+	// Step 3a (measurement only): tag the copy so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op    = GpuWriteOp::DmaCopy,
+	    .value = src_address_or_offset_or_immediate,
+	    .size  = num_bytes,
+	});
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
 }
@@ -1092,6 +1110,12 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	const auto telemetry_draw_begin_us = TelemetryNowUs();
+	// Step 3a (measurement only): tag the draw so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op          = GpuWriteOp::Draw,
+	    .shader_hash = BufferCache::s_diag_shader_hash,
+	    .frame_draw  = GetFrameTelemetry().draws,
+	});
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
 		args.instance_count = NumInstances();
@@ -1292,6 +1316,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
                                       uint32_t thread_group_z, uint32_t mode) {
+	// Step 3a (measurement only): tag the dispatch so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op          = GpuWriteOp::Dispatch,
+	    .shader_hash = m_sh_ctx.GetCs().cs_regs.data_addr,
+	});
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
@@ -1322,6 +1351,11 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
+	// Step 3a (measurement only): tag the dispatch so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op          = GpuWriteOp::Dispatch,
+	    .shader_hash = m_sh_ctx.GetCs().cs_regs.data_addr,
+	});
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	// Thread counts are converted on the GPU. Reading them here drained the GPU for every
 	// dispatch, since the previous dispatch writes them; KYTY_INDIRECT_THREADS_ON_CPU=1 restores
@@ -1348,6 +1382,12 @@ uint32_t CommandProcessor::NumInstances() {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	const auto telemetry_draw_begin_us = TelemetryNowUs();
+	// Step 3a (measurement only): tag the draw so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op          = GpuWriteOp::Draw,
+	    .shader_hash = BufferCache::s_diag_shader_hash,
+	    .frame_draw  = GetFrameTelemetry().draws,
+	});
 	if (args.instance_count == 0 && args.gpu_args_address == 0) {
 		if (m_num_instances_args != 0 && GpuIndirectDraws()) {
 			// The instance count a DRAW_INDIRECT read on the GPU left: the GPU reads it too
@@ -1382,6 +1422,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
                                         uint32_t interrupt_context_id) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
+	// Step 3a (measurement only): tag the write so the ClearWait writer lookup names it.
+	const BufferCache::DiagWriteScope write_scope(GpuWriteOrigin {
+	    .op    = GpuWriteOp::EndOfPipe,
+	    .value = static_cast<uint64_t>(value),
+	    .size  = sizeof(T),
+	});
 	auto& command = CurrentBuffer();
 
 	if (GraphicsRunDebugDumpEnabled()) {

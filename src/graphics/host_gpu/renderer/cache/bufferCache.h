@@ -26,6 +26,30 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+// Step 3a (measurement only): the last guest-GPU operation that marked a range
+// GPU-written. Recorded under KYTY_LOG_CLEAR_WAIT=1 only; writers that do not set the
+// scope below log as "unknown".
+enum class GpuWriteOp : uint8_t {
+	Unknown,
+	Draw,
+	Dispatch,
+	DmaFill,
+	DmaCopy,
+	WriteData,
+	EndOfPipe,
+};
+struct GpuWriteOrigin {
+	GpuWriteOp op = GpuWriteOp::Unknown;
+	// DmaFill/WriteData/EndOfPipe: fill value. DmaCopy: source address.
+	uint64_t value = 0;
+	// DmaFill/DmaCopy: byte size. WriteData/EndOfPipe: dword count / 4-or-8 size.
+	uint64_t size = 0;
+	uint64_t shader_hash = 0;
+	uint64_t tick = 0;
+	uint32_t frame_draw = 0;
+	uint32_t frame_dispatch = 0;
+};
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -115,6 +139,20 @@ public:
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;
+
+	// Step 3a (measurement only): the current guest-GPU operation on this (GPU) thread, if any.
+	inline static thread_local GpuWriteOrigin s_diag_write_origin;
+	struct DiagWriteScope {
+		explicit DiagWriteScope(GpuWriteOrigin origin): m_prev(s_diag_write_origin) {
+			s_diag_write_origin = origin;
+		}
+		~DiagWriteScope() { s_diag_write_origin = m_prev; }
+		KYTY_CLASS_NO_COPY(DiagWriteScope);
+		GpuWriteOrigin m_prev;
+	};
+	void                          RecordGpuWriteOrigin(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static GpuWriteOrigin FindGpuWriteOrigin(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static const char*    GpuWriteOpName(GpuWriteOp op) noexcept;
 
 private:
 	friend struct BufferCacheTestAccess;

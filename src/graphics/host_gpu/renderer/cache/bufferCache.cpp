@@ -17,6 +17,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <fmt/format.h>
 #include <atomic>
 #include <cinttypes>
@@ -35,6 +36,33 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// Step 3a (measurement only): KYTY_LOG_CLEAR_WAIT=1 records the last guest-GPU operation
+// that marked a range GPU-written, so the color-clear wait can name its writer.
+[[nodiscard]] bool ClearWaitOriginLogEnabled() {
+	const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
+	return value != nullptr && value[0] == '1';
+}
+
+struct GpuWriteJournalEntry {
+	uint64_t                      address = 0;
+	uint64_t                      size    = 0;
+	GpuWriteOrigin   origin {};
+};
+// Bounded: ClearWait looks up one entry per wait (200 lines/session), marks are hot.
+constexpr size_t kGpuWriteJournalSize = 256;
+std::array<GpuWriteJournalEntry, kGpuWriteJournalSize>& GpuWriteJournal() {
+	static std::array<GpuWriteJournalEntry, kGpuWriteJournalSize> journal {};
+	return journal;
+}
+std::atomic<size_t>& GpuWriteJournalNext() {
+	static std::atomic<size_t> next {0};
+	return next;
+}
+std::mutex& GpuWriteJournalMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
 
 } // namespace
 
@@ -924,12 +952,64 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+void BufferCache::RecordGpuWriteOrigin(uint64_t vaddr, uint64_t size) {
+	// Measurement only: journal the last guest-GPU op that marked a range GPU-written.
+	// Only when the ClearWait log is on; the hot path stays a single getenv-cached check.
+	if (!ClearWaitOriginLogEnabled() || size == 0) {
+		return;
+	}
+	auto origin = s_diag_write_origin;
+	origin.tick = m_scheduler.CurrentTick();
+	std::scoped_lock lock(GpuWriteJournalMutex());
+	const auto slot = GpuWriteJournalNext().fetch_add(1, std::memory_order_relaxed);
+	auto&      entry = GpuWriteJournal()[slot % kGpuWriteJournalSize];
+	entry.address   = vaddr;
+	entry.size      = size;
+	entry.origin    = origin;
+}
+
+GpuWriteOrigin BufferCache::FindGpuWriteOrigin(uint64_t vaddr, uint64_t size) {
+	// Measurement only: newest journal entry fully covering the range, else unknown.
+	GpuWriteOrigin found {};
+	if (size == 0) {
+		return found;
+	}
+	std::scoped_lock lock(GpuWriteJournalMutex());
+	const auto next = GpuWriteJournalNext().load(std::memory_order_relaxed);
+	const auto used = std::min<size_t>(next, kGpuWriteJournalSize);
+	for (size_t i = 0; i < used; i++) {
+		const auto& entry = GpuWriteJournal()[(next - 1 - i) % kGpuWriteJournalSize];
+		if (entry.size == 0 || vaddr < entry.address ||
+		    size > entry.size - (vaddr - entry.address)) {
+			continue;
+		}
+		found = entry.origin;
+		break;
+	}
+	return found;
+}
+
+const char* BufferCache::GpuWriteOpName(GpuWriteOp op) noexcept {
+	switch (op) {
+		case GpuWriteOp::Draw: return "draw";
+		case GpuWriteOp::Dispatch: return "dispatch";
+		case GpuWriteOp::DmaFill: return "dma_fill";
+		case GpuWriteOp::DmaCopy: return "dma_copy";
+		case GpuWriteOp::WriteData: return "write_data";
+		case GpuWriteOp::EndOfPipe: return "end_of_pipe";
+		case GpuWriteOp::Unknown: break;
+	}
+	return "unknown";
+}
+
 void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
+	// Step 3a (measurement only): journal the writer so ClearWait can name it.
+	RecordGpuWriteOrigin(vaddr, size);
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
 	// the bindings that mark bytes of those ranges GPU-written: the first write of each
 	// (range, shader), with a host stack when no shader is being bound (copies, fills).

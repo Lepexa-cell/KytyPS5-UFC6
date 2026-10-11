@@ -1401,6 +1401,19 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			     static_cast<unsigned long long>(current_tick),
 			     static_cast<unsigned long long>(completed_tick),
 			     static_cast<unsigned long long>(wait_us), result);
+			// Step 3a: the last guest-GPU op that marked this range GPU-written, plus
+			// the first code byte read after the wait. 8 specifiers, 8 arguments.
+			const auto origin = BufferCache::FindGpuWriteOrigin(range.address, range.size);
+			uint8_t    first_code = 0;
+			(void)LibKernel::Memory::TryReadBacking(range.address, &first_code, sizeof(first_code));
+			LOGF("ClearWaitWriter: op=%s value=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " shader=0x%016" PRIx64 " tick=%llu draw=%u dispatch=%u code=0x%02x\n",
+			     BufferCache::GpuWriteOpName(origin.op),
+			     static_cast<uint64_t>(origin.value), static_cast<uint64_t>(origin.size),
+			     static_cast<uint64_t>(origin.shader_hash),
+			     static_cast<unsigned long long>(origin.tick),
+			     static_cast<unsigned>(origin.frame_draw),
+			     static_cast<unsigned>(origin.frame_dispatch), first_code);
 			session_logged++;
 		}
 	}
