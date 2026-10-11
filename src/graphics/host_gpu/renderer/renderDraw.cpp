@@ -1129,6 +1129,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                                        DrawRenderState& state) {
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	// KYTY_OPT_TELEMETRY_SUBCOUNTERS=0 skips the extra QPC reads. Telemetry-only change:
+	// all draws resolve targets on the same path with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
 	// Fast L1: compare cheap pre-Refresh inputs first. A full hit replays the
 	// BindRenderTarget side effects for cached targets and skips the repeated
 	// RefreshShaders + Resolve* work. Vertex layout (buffers_num/fetch_buffer_reg)
@@ -1190,6 +1193,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		}
 	}
 	mrt_mask &= color_output_mask;
+	const auto targets_begin_us = subcounters ? TelemetryNowUs() : 0;
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -1206,6 +1210,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
 	ResolveRenderDepthTarget(buffer, state.depth_info);
+	if (subcounters) {
+		TelemetryAddDrawStateTargets(TelemetryNowUs() - targets_begin_us);
+	}
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1748,11 +1755,15 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                        args.instance_count, args.first_instance};
 	const auto telemetry_state_begin_us = TelemetryNowUs();
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	const bool state_ok =
+	    PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	// State is always inside DrawRecord: failed prepares are counted too, otherwise
+	// skips bias the average down while their cost stays in the PM4 total.
+	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
+	if (!state_ok) {
 		ResetBindings();
 		return;
 	}
-	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
@@ -1835,11 +1846,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 	DrawRenderState state {};
 	const auto telemetry_state_begin_us = TelemetryNowUs();
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	const bool state_ok =
+	    PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state);
+	// State is always inside DrawRecord: failed prepares are counted too, otherwise
+	// skips bias the average down while their cost stays in the PM4 total.
+	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
+	if (!state_ok) {
 		ResetBindings();
 		return;
 	}
-	TelemetryAddDrawState(TelemetryNowUs() - telemetry_state_begin_us);
 
 	// Counts read on the GPU work for fast-launch mesh draws and vertex-pipeline draws with one
 	// draw call; others read the guest arguments here (waiting for the GPU when it wrote them).

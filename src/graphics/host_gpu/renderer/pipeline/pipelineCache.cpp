@@ -883,6 +883,12 @@ struct PipelineCache::ProgramCache {
 			                                params.hash);
 			return ShaderProgram {};
 		}
+		// KYTY_OPT_TELEMETRY_SUBCOUNTERS=0 skips the extra QPC reads. Telemetry-only change:
+		// all draws take the same lookup path with or without subcounters. Compute dispatches
+		// share this lookup but never run inside a draw: their cost must not land in draw_state.
+		const bool subcounters =
+		    TelemetrySubcountersEnabled() && !std::is_same_v<InputInfo, ShaderComputeInputInfo>;
+		const auto sub_begin_us = subcounters ? TelemetryNowUs() : 0;
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -902,6 +908,9 @@ struct PipelineCache::ProgramCache {
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		auto                                         entry = programs.find(lookup_key);
+		if (subcounters) {
+			TelemetryAddDrawStateKeyFind(TelemetryNowUs() - sub_begin_us);
+		}
 		// Scoped to this call only: see GuestPageReadCache.
 		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -938,9 +947,13 @@ struct PipelineCache::ProgramCache {
 					runtime.gpu_fills   = &entry->second.resources.gpu_fills;
 				}
 				t_srt_shader_hash = params.hash;
+				const auto materialize_begin_us = subcounters ? TelemetryNowUs() : 0;
 				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 				    entry->second.resource_plan, runtime, entry->second.resources,
 				    entry->second.specialization);
+				if (subcounters) {
+					TelemetryAddDrawStateMaterialize(TelemetryNowUs() - materialize_begin_us);
+				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
 				runtime.gpu_fills   = nullptr;
@@ -976,6 +989,7 @@ struct PipelineCache::ProgramCache {
 					return ShaderProgram {};
 				}
 			}
+			const auto permutation_begin_us = subcounters ? TelemetryNowUs() : 0;
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -988,7 +1002,13 @@ struct PipelineCache::ProgramCache {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				if (subcounters) {
+					TelemetryAddDrawStatePermutation(TelemetryNowUs() - permutation_begin_us);
+				}
 				return permutation->handle;
+			}
+			if (subcounters) {
+				TelemetryAddDrawStatePermutation(TelemetryNowUs() - permutation_begin_us);
 			}
 		}
 
@@ -1463,6 +1483,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
+	// KYTY_OPT_TELEMETRY_SUBCOUNTERS=0 skips the extra QPC reads. Telemetry-only change:
+	// all draws take the same prepare path with or without subcounters.
+	const bool subcounters = TelemetrySubcountersEnabled();
 	if (tess_active) {
 		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
 			if (!ShaderFailureNonFatal()) {
@@ -1471,7 +1494,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			return {};
 		}
 	} else {
+		const auto prepare_vs_begin_us = subcounters ? TelemetryNowUs() : 0;
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+		if (subcounters) {
+			TelemetryAddDrawStatePrepareVs(TelemetryNowUs() - prepare_vs_begin_us);
+		}
 	}
 	const bool mesh_active = vertex_info[0].logical_stage == ShaderType::Mesh;
 	if (mesh_active) {
@@ -1504,7 +1531,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
+		const auto prepare_ps_begin_us = subcounters ? TelemetryNowUs() : 0;
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		if (subcounters) {
+			TelemetryAddDrawStatePreparePs(TelemetryNowUs() - prepare_ps_begin_us);
+		}
 		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
 		// In particular, 32-bit exports can carry raw integer material data.
 		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {

@@ -1818,10 +1818,18 @@ void TelemetryEndFrame() {
 	    total_pm4_us >= telemetry.draw_record_us ? total_pm4_us - telemetry.draw_record_us : 0;
 
 	if (frame_counter % 60 == 0) {
-		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms, Bind: %.2f ms, Vtx: %.2f ms, Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | TopPM4: [op 0x%02X: %.2f ms, op 0x%02X: %.2f ms] | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %u | Draws: %u\n",
+		// Per-frame averages: all us counters cover 60 frames, so counts are divided too.
+		const double inv_frames = 1.0 / kFrames;
+		LOGF("[FRAME_TELEMETRY] Total: %.2f ms | DrawRecord: %.2f ms (State: %.2f ms [PrepVS: %.2f ms, PrepPS: %.2f ms, KeyFind: %.2f ms, Mat: %.2f ms, Perm: %.2f ms, Targets: %.2f ms], Bind: %.2f ms, Vtx: %.2f ms, Pipe: %.2f ms, Emit: %.2f ms) | PurePM4: %.2f ms | TopPM4: [op 0x%02X: %.2f ms, op 0x%02X: %.2f ms] | Waits: (ReadMem: %.2f ms, Flip: %.2f ms, GC: %.2f ms) | Flushes: %.1f | Draws: %.1f\n",
 		     static_cast<double>(total_pm4_us) * frame_avg,
 		     static_cast<double>(telemetry.draw_record_us) * frame_avg,
 		     static_cast<double>(telemetry.draw_state_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_prepare_vs_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_prepare_ps_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_key_find_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_materialize_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_permutation_us) * frame_avg,
+		     static_cast<double>(telemetry.draw_state_targets_us) * frame_avg,
 		     static_cast<double>(telemetry.draw_bindings_us) * frame_avg,
 		     static_cast<double>(telemetry.draw_vertex_us) * frame_avg,
 		     static_cast<double>(telemetry.draw_pipe_us) * frame_avg,
@@ -1831,8 +1839,9 @@ void TelemetryEndFrame() {
 		     static_cast<double>(top_us1) * frame_avg,
 		     static_cast<double>(telemetry.wait_readmem_us) * frame_avg,
 		     static_cast<double>(telemetry.wait_flip_us) * frame_avg,
-		     static_cast<double>(telemetry.wait_gc_us) * frame_avg, telemetry.flushes,
-		     telemetry.draws);
+		     static_cast<double>(telemetry.wait_gc_us) * frame_avg,
+		     static_cast<double>(telemetry.flushes) * inv_frames,
+		     static_cast<double>(telemetry.draws) * inv_frames);
 		telemetry = FrameTelemetry {};
 	}
 	// Draw-state L1 scope: never leak into a foreign frame.

@@ -8,12 +8,23 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+
+// KYTY_OPT_TELEMETRY_SUBCOUNTERS=0 restores the single State timer. Telemetry-only change:
+// all draws take the same code path with or without subcounters.
+[[nodiscard]] inline bool TelemetrySubcountersEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_TELEMETRY_SUBCOUNTERS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -22,6 +33,12 @@ struct FrameTelemetry {
 	uint64_t pm4_op_us[256] = {};
 	uint64_t draw_record_us = 0;
 	uint64_t draw_state_us = 0;
+	uint64_t draw_state_prepare_vs_us = 0;
+	uint64_t draw_state_prepare_ps_us = 0;
+	uint64_t draw_state_key_find_us = 0;
+	uint64_t draw_state_materialize_us = 0;
+	uint64_t draw_state_permutation_us = 0;
+	uint64_t draw_state_targets_us = 0;
 	uint64_t draw_bindings_us = 0;
 	uint64_t draw_vertex_us = 0;
 	uint64_t draw_pipe_us = 0;
@@ -38,15 +55,25 @@ inline FrameTelemetry& GetFrameTelemetry() {
 	return instance;
 }
 
+inline uint64_t TelemetryFrequencyHz() {
+	static const uint64_t frequency = [] {
+		uint64_t value = 0;
+		SysQueryPerformanceFrequency(&value);
+		return value;
+	}();
+	return frequency;
+}
+
 inline uint64_t TelemetryNowUs() {
 	uint64_t counter = 0;
-	uint64_t frequency = 0;
 	SysQueryPerformanceCounter(&counter);
-	SysQueryPerformanceFrequency(&frequency);
+	const uint64_t frequency = TelemetryFrequencyHz();
 	if (frequency == 0) {
 		return 0;
 	}
-	return counter * 1000000ull / frequency;
+	// 64-bit only: lld-link has no __udivti3 for 128-bit division. The remainder term
+	// stays below frequency (~10 MHz), so its scaled value never overflows.
+	return (counter / frequency) * 1000000ull + ((counter % frequency) * 1000000ull) / frequency;
 }
 
 inline void TelemetryAddPm4Op(uint8_t opcode, uint64_t delta_us) {
@@ -59,6 +86,30 @@ inline void TelemetryAddDrawRecord(uint64_t delta_us) {
 
 inline void TelemetryAddDrawState(uint64_t delta_us) {
 	GetFrameTelemetry().draw_state_us += delta_us;
+}
+
+inline void TelemetryAddDrawStatePrepareVs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_prepare_vs_us += delta_us;
+}
+
+inline void TelemetryAddDrawStatePreparePs(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_prepare_ps_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateKeyFind(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_key_find_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateMaterialize(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_materialize_us += delta_us;
+}
+
+inline void TelemetryAddDrawStatePermutation(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_permutation_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateTargets(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_targets_us += delta_us;
 }
 
 inline void TelemetryAddDrawBindings(uint64_t delta_us) {
