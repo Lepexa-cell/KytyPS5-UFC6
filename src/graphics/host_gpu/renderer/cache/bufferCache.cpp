@@ -265,6 +265,7 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		m_scheduler.WaitPriorityOperations(tick);
 		if (TelemetrySubcountersEnabled()) {
 			TelemetryAddReadmemFenceWait(TelemetryNowUs() - readmem_fence_begin_us);
+			TelemetryCountGpusyncBuffer();
 		}
 		const auto readmem_publish_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 		publish();

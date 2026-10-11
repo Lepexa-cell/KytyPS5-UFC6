@@ -1314,12 +1314,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	uint32_t   clear_skip_decode = 0;
 	uint32_t   clear_skip_all_of = 0;
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
-		TelemetryCountClearGpuWait();
-		TelemetryCountGpusyncClear();
 		// Experimental: skip the synchronous readback to measure the FPS ceiling.
 		if (skip_clear_wait) {
 			return;
 		}
+		// Exactly one wait counter per real GPU wait (skipped waits are not waits).
+		TelemetryCountClearGpuWait();
+		TelemetryCountGpusyncClear();
 		const auto gpu_wait_begin_us = subcounters ? TelemetryNowUs() : 0;
 		if (gpu_wait_log) {
 			gpu_wait_start_us = TelemetryNowUs();
