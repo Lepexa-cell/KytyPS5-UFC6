@@ -14,6 +14,9 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "gpu_tiler_shaders/clear_predicate_check_spv.h"
+#include "gpu_tiler_shaders/clear_predicate_fill_vert_spv.h"
+#include "gpu_tiler_shaders/clear_predicate_fill_frag_spv.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
@@ -73,8 +76,11 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 
 // KYTY_LOG_CLEAR_WAIT=1 logs one line per color-clear GPU wait (measurements only).
 [[nodiscard]] bool ClearWaitLogEnabled() {
-	const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
-	return value != nullptr && value[0] == '1';
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 // KYTY_EXPERIMENT_SKIP_CLEAR_WAIT=1 skips the synchronous readback in MaterializeColorClear.
@@ -82,6 +88,15 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 [[nodiscard]] bool SkipClearWaitEnabled() {
 	const auto* value = std::getenv("KYTY_EXPERIMENT_SKIP_CLEAR_WAIT");
 	return value != nullptr && value[0] == '1';
+}
+
+// Step 3: KYTY_OPT_CLEAR_GPU_PREDICATE=0 restores the synchronous CPU readback path.
+[[nodiscard]] bool ClearGpuPredicateEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OPT_CLEAR_GPU_PREDICATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
 }
 
 // Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
@@ -232,11 +247,108 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 }
 
 TextureCache::~TextureCache() {
+	for (const auto& cached: m_clear_fill_pipelines) {
+		if (cached.handle != nullptr) {
+			m_graphics.device.destroyPipeline(cached.handle, nullptr);
+		}
+	}
+	if (m_clear_fill_vert != nullptr) {
+		m_graphics.device.destroyShaderModule(m_clear_fill_vert, nullptr);
+	}
+	if (m_clear_fill_frag != nullptr) {
+		m_graphics.device.destroyShaderModule(m_clear_fill_frag, nullptr);
+	}
+	if (m_clear_fill_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_clear_fill_layout, nullptr);
+	}
+	if (m_clear_fill_desc_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_clear_fill_desc_layout, nullptr);
+	}
+	if (m_clear_predicate_pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_clear_predicate_pipeline, nullptr);
+	}
+	if (m_clear_predicate_layout != nullptr) {
+		m_graphics.device.destroyPipelineLayout(m_clear_predicate_layout, nullptr);
+	}
+	if (m_clear_predicate_desc_layout != nullptr) {
+		m_graphics.device.destroyDescriptorSetLayout(m_clear_predicate_desc_layout, nullptr);
+	}
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
 		}
 	});
+}
+
+// Step 3: persistent resources for the color-clear predicate check shader, created on
+// first GPU-predicate use. Returns false on any allocation failure (caller falls back).
+bool TextureCache::ClearPredicateEnsureResources() {
+	if (m_clear_predicate_pipeline != nullptr) {
+		return m_clear_predicate_buffer != nullptr;
+	}
+	const vk::DescriptorSetLayoutBinding bindings[] {
+	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+	};
+	vk::DescriptorSetLayoutCreateInfo layout_info {};
+	layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	layout_info.bindingCount = std::size(bindings);
+	layout_info.pBindings    = bindings;
+	if (m_graphics.device.createDescriptorSetLayout(&layout_info, nullptr,
+	                                                &m_clear_predicate_desc_layout) !=
+	    vk::Result::eSuccess) {
+		return false;
+	}
+	struct ClearPredicatePush {
+		uint32_t meta_base_dword;
+		uint32_t slice_stride_dword;
+		uint32_t slice_dwords;
+		uint32_t slice_count;
+		uint32_t code_count;
+		uint32_t code0;
+		uint32_t code1;
+		uint32_t code2;
+		uint32_t code3;
+	};
+	static_assert(sizeof(ClearPredicatePush) == 36);
+	const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eCompute, 0,
+	                                        sizeof(ClearPredicatePush)};
+	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+	pipeline_layout_info.setLayoutCount         = 1;
+	pipeline_layout_info.pSetLayouts            = &m_clear_predicate_desc_layout;
+	pipeline_layout_info.pushConstantRangeCount = 1;
+	pipeline_layout_info.pPushConstantRanges    = &push_range;
+	if (m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+	                                           &m_clear_predicate_layout) !=
+	    vk::Result::eSuccess) {
+		return false;
+	}
+	const auto module =
+	    CompileSPV({CLEAR_PREDICATE_CHECK_SPV, std::size(CLEAR_PREDICATE_CHECK_SPV)},
+	               m_graphics.device);
+	vk::PipelineShaderStageCreateInfo stage {};
+	stage.stage  = vk::ShaderStageFlagBits::eCompute;
+	stage.module = module;
+	stage.pName  = "main";
+	vk::ComputePipelineCreateInfo pipeline_info {};
+	pipeline_info.stage  = stage;
+	pipeline_info.layout = m_clear_predicate_layout;
+	vk::Pipeline pipeline = nullptr;
+	const auto   result =
+	    m_graphics.device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline);
+	m_graphics.device.destroyShaderModule(module, nullptr);
+	if (result != vk::Result::eSuccess) {
+		return false;
+	}
+	m_clear_predicate_pipeline = pipeline;
+	SetVulkanObjectNameF(m_graphics.device, m_clear_predicate_pipeline, "Clear Predicate Check");
+	// One predicate dword per candidate code (up to 4) per slice; 64 slices of headroom.
+	m_clear_predicate_buffer = std::make_unique<Buffer>(
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+	    vk::BufferUsageFlagBits::eStorageBuffer |
+	        vk::BufferUsageFlagBits::eConditionalRenderingEXT,
+	    64 * 4 * sizeof(uint32_t));
+	return m_clear_predicate_buffer != nullptr;
 }
 
 bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
@@ -1244,8 +1356,339 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+// Step 3: GPU predicate replacing the synchronous metadata readback. Computes the
+// decodable (code, clear color) pairs on the CPU, runs the check shader over the buffer
+// cache's GPU copy, then issues one conditional clear per matching slice. Keeps the
+// range GPU-modified so a later CPU reader downloads it lazily. False on any unsupported
+// case (caller takes the old synchronous path).
+bool TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc,
+                                              uint32_t first, uint32_t count,
+                                              uint64_t slice_size, uint64_t range_address,
+                                              uint64_t range_size) {
+	if (!m_graphics.conditional_rendering_enabled || !ClearPredicateEnsureResources()) {
+		return false;
+	}
+	if (desc.type == BindingType::VideoOut || desc.info.IsVolume() ||
+	    desc.info.resources.levels != 1 || slice_size == 0 || count == 0 || count > 64 ||
+	    slice_size > UINT32_MAX || range_size != slice_size * count ||
+	    (range_address & 3u) != 0 || (slice_size & 3u) != 0) {
+		return false;
+	}
+	(void)first;
+	// Candidate (code, clear color) pairs decodable for this image. Per step-3 data the
+	// guest writes 0xFF (fast clear) or 0x00 (register clear); enumerate all 256 codes so
+	// any decodable code is covered, capped at the shader's 4 predicate slots.
+	std::vector<ClearPredicateCandidate> candidates;
+	for (uint32_t code = 0; code < 256; code++) {
+		ClearPredicateCandidate candidate {};
+		candidate.code = static_cast<uint8_t>(code);
+		if (DecodeColorClear(desc, candidate.code, candidate.clear)) {
+			candidates.push_back(candidate);
+			if (candidates.size() > 4) {
+				return false;
+			}
+		}
+	}
+	if (candidates.empty()) {
+		return false;
+	}
+	return TryMaterializeColorClearGpuDispatch(id, desc, count, slice_size, range_address,
+	                                          range_size, candidates.data(), candidates.size());
+}
+
+// Step 3 dispatch half: binds the metadata GPU copy and the predicate buffer, runs the
+// check compute. Conditional clears follow in the second half below.
+bool TextureCache::TryMaterializeColorClearGpuDispatch(
+    ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
+    uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
+    size_t candidate_count) {
+	(void)id;
+	(void)desc;
+	// ObtainBuffer with is_written=false never uploads stale CPU bytes over GPU-written
+	// ranges (sync only uploads CPU-modified ranges), so the check reads the guest
+	// dispatch's metadata writes.
+	const auto [meta, meta_offset] =
+	    m_buffer_cache.ObtainBuffer(range_address, range_size, false, false);
+	if (meta == nullptr) {
+		return false;
+	}
+	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_align = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t meta_desc_offset = Common::AlignDown(meta_offset, descriptor_align);
+	const uint64_t meta_base        = meta_offset - meta_desc_offset;
+	const uint64_t meta_range       = Common::AlignUp(meta_base + range_size, 4);
+	if (meta_range > limits.maxStorageBufferRange) {
+		return false;
+	}
+	struct ClearPredicatePush {
+		uint32_t meta_base_dword;
+		uint32_t slice_stride_dword;
+		uint32_t slice_dwords;
+		uint32_t slice_count;
+		uint32_t code_count;
+		uint32_t code0;
+		uint32_t code1;
+		uint32_t code2;
+		uint32_t code3;
+	};
+	ClearPredicatePush push {};
+	push.meta_base_dword    = static_cast<uint32_t>(meta_base / 4);
+	push.slice_stride_dword = static_cast<uint32_t>(slice_size / 4);
+	push.slice_dwords       = static_cast<uint32_t>(slice_size / 4);
+	push.slice_count        = count;
+	push.code_count         = static_cast<uint32_t>(candidate_count);
+	uint32_t codes[4]       = {};
+	for (size_t i = 0; i < candidate_count; i++) {
+		const uint32_t byte = candidates[i].code;
+		codes[i]            = byte | (byte << 8) | (byte << 16) | (byte << 24);
+	}
+	push.code0 = codes[0];
+	push.code1 = candidate_count > 1 ? codes[1] : 0;
+	push.code2 = candidate_count > 2 ? codes[2] : 0;
+	push.code3 = candidate_count > 3 ? codes[3] : 0;
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	auto native = command.Recorder();
+	vk::BufferMemoryBarrier pre[2] {};
+	pre[0].srcAccessMask       = vk::AccessFlagBits::eMemoryWrite;
+	pre[0].dstAccessMask       = vk::AccessFlagBits::eShaderRead;
+	pre[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	pre[0].buffer              = meta->Handle();
+	pre[0].offset              = meta_offset;
+	pre[0].size                = range_size;
+	pre[1]                     = pre[0];
+	pre[1].dstAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	pre[1].buffer              = m_clear_predicate_buffer->Handle();
+	pre[1].offset              = 0;
+	pre[1].size                = count * 4 * sizeof(uint32_t);
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, pre, 0,
+	                       nullptr);
+	const vk::DescriptorBufferInfo infos[] {
+	    {meta->Handle(), meta_desc_offset, meta_range},
+	    {m_clear_predicate_buffer->Handle(), 0, count * 4 * sizeof(uint32_t)},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); i++) {
+		writes[i].dstBinding      = i;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[i].pBufferInfo     = &infos[i];
+	}
+	native.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_clear_predicate_layout, 0,
+	                            writes);
+	native.bindPipeline(vk::PipelineBindPoint::eCompute, m_clear_predicate_pipeline);
+	native.pushConstants(m_clear_predicate_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                     sizeof(push), &push);
+	native.dispatch((count + 63u) / 64u, 1, 1);
+	vk::BufferMemoryBarrier mid {};
+	mid.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	mid.dstAccessMask       = vk::AccessFlagBits::eConditionalRenderingReadEXT;
+	mid.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	mid.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	mid.buffer              = m_clear_predicate_buffer->Handle();
+	mid.offset              = 0;
+	mid.size                = count * 4 * sizeof(uint32_t);
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                       vk::PipelineStageFlagBits::eConditionalRenderingEXT, {}, 0, nullptr, 1,
+	                       &mid, 0, nullptr);
+	// The check shader also wrote 0xFFFFFFFF over matched metadata slices; order that
+	// write before the later image uses (a readback would download it lazily).
+	vk::BufferMemoryBarrier meta_after {};
+	meta_after.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	meta_after.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	meta_after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	meta_after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	meta_after.buffer              = meta->Handle();
+	meta_after.offset              = meta_offset;
+	meta_after.size                = range_size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &meta_after, 0,
+	                       nullptr);
+	return TryMaterializeColorClearGpuDraw(id, desc, count, candidates, candidate_count);
+}
+
+// Step 3 draw half: predicated fullscreen-triangle draws write the clear color. One
+// (slice, candidate) section each; the predicate dword gates the draw. The check shader
+// already wrote 0xFFFFFFFF over matched slices in the metadata GPU copy (the old CPU
+// WriteBacking), so the range stays GPU-modified for a later lazy download.
+bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& desc,
+                                                  uint32_t count,
+                                                  const ClearPredicateCandidate* candidates,
+                                                  size_t candidate_count) {
+	const auto& view  = desc.view_info;
+	auto&       image = m_slot_images[id];
+	if (image.depth_id || image.info.IsDepth() || image.info.samples != 1 ||
+	    desc.info.resources.levels != 1 || view.level_count != 1) {
+		return false;
+	}
+	const auto pipeline = ClearFillPipelineFor(view.format);
+	if (pipeline == nullptr) {
+		return false;
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	auto native = command.Recorder();
+	TrackImage(id);
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentWrite, {}, native);
+	for (uint32_t slice = 0; slice < count; slice++) {
+		ImageViewInfo layer_view {};
+		layer_view.format      = view.format;
+		layer_view.type        = view.layer_count == 1 ? vk::ImageViewType::e2D
+		                                               : vk::ImageViewType::e2DArray;
+		layer_view.base_level  = view.base_level;
+		layer_view.base_layer  = view.base_layer + slice;
+		layer_view.layer_count = 1;
+		layer_view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		const auto attachment_view = image.FindView(layer_view);
+		for (size_t c = 0; c < candidate_count; c++) {
+			vk::ConditionalRenderingBeginInfoEXT begin {};
+			begin.buffer = m_clear_predicate_buffer->Handle();
+			begin.offset = (slice * 4 + c) * sizeof(uint32_t);
+			native.beginConditionalRendering(begin);
+			vk::RenderingAttachmentInfo attachment {};
+			attachment.imageView   = attachment_view;
+			attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+			attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+			attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+			vk::RenderingInfo rendering {};
+			rendering.renderArea.extent = {std::max(image.info.extent.width >> view.base_level, 1u),
+			                               std::max(image.info.extent.height >> view.base_level,
+			                                        1u)};
+			rendering.layerCount           = 1;
+			rendering.colorAttachmentCount = 1;
+			rendering.pColorAttachments    = &attachment;
+			native.beginRendering(rendering);
+			native.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+			native.pushConstants(m_clear_fill_layout, vk::ShaderStageFlagBits::eFragment, 0,
+			                     sizeof(candidates[c].clear.float32),
+			                     &candidates[c].clear.float32);
+			const vk::Viewport viewport {0.0f, 0.0f,
+			                             static_cast<float>(std::max(image.info.extent.width >>
+			                                                         view.base_level,
+			                                                         1u)),
+			                             static_cast<float>(std::max(image.info.extent.height >>
+			                                                         view.base_level,
+			                                                         1u)),
+			                             0.0f, 1.0f};
+			const vk::Rect2D scissor {{0, 0},
+			                          {std::max(image.info.extent.width >> view.base_level, 1u),
+			                           std::max(image.info.extent.height >> view.base_level,
+			                                    1u)}};
+			native.setViewportWithCount(1, &viewport);
+			native.setScissorWithCount(1, &scissor);
+			native.draw(3, 1, 0, 0);
+			native.endRendering();
+			native.endConditionalRendering();
+		}
+	}
+	CommitGpuWrite(image);
+	if (TelemetrySubcountersEnabled()) {
+		for (uint32_t slice = 0; slice < count; slice++) {
+			(void)slice;
+			TelemetryCountCacheClear();
+		}
+	}
+	return true;
+}
+
+// Step 3 fill pipeline: fullscreen-triangle vertex shader plus a fragment shader writing
+// the push-constant clear color. Dynamic rendering with the image's own color format.
+vk::Pipeline TextureCache::ClearFillPipelineFor(vk::Format format) {
+	for (const auto& cached: m_clear_fill_pipelines) {
+		if (cached.format == format) {
+			return cached.handle;
+		}
+	}
+	if (m_clear_fill_layout == nullptr) {
+		const vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+		if (m_graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+		                                                &m_clear_fill_desc_layout) !=
+		    vk::Result::eSuccess) {
+			return nullptr;
+		}
+		struct ClearFillPush {
+			float color[4];
+		};
+		static_assert(sizeof(ClearFillPush) == 16);
+		const vk::PushConstantRange push_range {vk::ShaderStageFlagBits::eFragment, 0,
+		                                        sizeof(ClearFillPush)};
+		vk::PipelineLayoutCreateInfo layout_info {};
+		layout_info.setLayoutCount         = 1;
+		layout_info.pSetLayouts            = &m_clear_fill_desc_layout;
+		layout_info.pushConstantRangeCount = 1;
+		layout_info.pPushConstantRanges    = &push_range;
+		if (m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_clear_fill_layout) !=
+		    vk::Result::eSuccess) {
+			return nullptr;
+		}
+		m_clear_fill_vert =
+		    CompileSPV({CLEAR_PREDICATE_FILL_VERT_SPV, std::size(CLEAR_PREDICATE_FILL_VERT_SPV)},
+		               m_graphics.device);
+		m_clear_fill_frag =
+		    CompileSPV({CLEAR_PREDICATE_FILL_FRAG_SPV, std::size(CLEAR_PREDICATE_FILL_FRAG_SPV)},
+		               m_graphics.device);
+	}
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = m_clear_fill_vert;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = m_clear_fill_frag;
+	stages[1].pName  = "main";
+	vk::PipelineVertexInputStateCreateInfo vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
+	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineDepthStencilStateCreateInfo depth_stencil {};
+	vk::PipelineColorBlendAttachmentState blend_attachment {};
+	blend_attachment.colorWriteMask =
+	    vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	    vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+	vk::PipelineColorBlendStateCreateInfo blend {};
+	blend.attachmentCount = 1;
+	blend.pAttachments    = &blend_attachment;
+	std::array<vk::DynamicState, 2> dynamics {vk::DynamicState::eViewport,
+	                                          vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamics.size());
+	dynamic.pDynamicStates    = dynamics.data();
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &format;
+	vk::GraphicsPipelineCreateInfo create {};
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &input_assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pDepthStencilState  = &depth_stencil;
+	create.pColorBlendState    = &blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = m_clear_fill_layout;
+	create.pNext               = &rendering;
+	vk::Pipeline pipeline = nullptr;
+	if (m_graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline) !=
+	    vk::Result::eSuccess) {
+		return nullptr;
+	}
+	SetVulkanObjectNameF(m_graphics.device, pipeline, "Clear Predicate Fill");
+	m_clear_fill_pipelines.push_back({format, pipeline});
+	return pipeline;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
-                                       uint32_t metadata_base_layer) {
+                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
@@ -1317,6 +1760,18 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Experimental: skip the synchronous readback to measure the FPS ceiling.
 		if (skip_clear_wait) {
 			return;
+		}
+		// Step 3: replace the synchronous wait with a GPU predicate when possible.
+		if (ClearGpuPredicateEnabled() && TryMaterializeColorClearGpu(id, desc, first, count,
+		                                                              range.size / layers,
+		                                                              range.address, range.size)) {
+			if (subcounters) {
+				TelemetryCountClearGpuPredicate();
+			}
+			return;
+		}
+		if (ClearGpuPredicateEnabled() && subcounters) {
+			TelemetryCountClearGpuPredicateFallback();
 		}
 		// Exactly one wait counter per real GPU wait (skipped waits are not waits).
 		TelemetryCountClearGpuWait();

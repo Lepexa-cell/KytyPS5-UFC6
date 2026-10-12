@@ -40,8 +40,11 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 // Step 3a (measurement only): KYTY_LOG_CLEAR_WAIT=1 records the last guest-GPU operation
 // that marked a range GPU-written, so the color-clear wait can name its writer.
 [[nodiscard]] bool ClearWaitOriginLogEnabled() {
-	const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
-	return value != nullptr && value[0] == '1';
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_LOG_CLEAR_WAIT");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 struct GpuWriteJournalEntry {

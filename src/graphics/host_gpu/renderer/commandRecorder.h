@@ -315,6 +315,20 @@ public:
 		                                             info.pStencilAttachment != nullptr ? 1u : 0u);
 		m_scheduler->Record([copy](vk::CommandBuffer command) { command.beginRendering(copy); });
 	}
+	// Step 3: VK_EXT_conditional_rendering. Each predicate dword gates one conditional
+	// section; the predicate buffer carries eConditionalRenderingEXT usage.
+	void beginConditionalRendering(const vk::ConditionalRenderingBeginInfoEXT& info) const {
+		if (!Threaded()) {
+			m_direct.beginConditionalRenderingEXT(&info);
+			return;
+		}
+		const auto copy = *m_scheduler->Stash(&info, 1);
+		m_scheduler->Record(
+		    [copy](vk::CommandBuffer command) { command.beginConditionalRenderingEXT(&copy); });
+	}
+	void endConditionalRendering() const {
+		Run([](vk::CommandBuffer command) { command.endConditionalRenderingEXT(); });
+	}
 	void endRendering() const {
 		Run([](vk::CommandBuffer command) { command.endRendering(); });
 	}

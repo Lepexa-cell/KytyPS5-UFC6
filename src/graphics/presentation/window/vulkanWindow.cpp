@@ -698,6 +698,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.pNext = graphics.attachment_feedback_loop_enabled
 	                        ? static_cast<void*>(&feedback_layout)
 	                        : feedback_dynamic.pNext;
+	// Step 3: enable VK_EXT_conditional_rendering when the extension was requested.
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional {};
+		vk::PhysicalDeviceFeatures2 conditional_query {};
+		conditional_query.pNext = &supported_conditional;
+		physical_device.getFeatures2(&conditional_query);
+		if (supported_conditional.conditionalRendering == VK_TRUE) {
+			conditional_rendering.conditionalRendering = VK_TRUE;
+			conditional_rendering.pNext = const_cast<void*>(create_info.pNext);
+			create_info.pNext           = &conditional_rendering;
+		} else {
+			graphics.conditional_rendering_enabled = false;
+		}
+	}
+	LOGF("Vulkan conditional rendering: %s\n",
+	     graphics.conditional_rendering_enabled ? "enabled" : "unsupported");
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
@@ -1266,6 +1283,12 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		// Step 3: VK_EXT_conditional_rendering for the color-clear predicate. Optional:
+		// without it the clear falls back to the synchronous CPU path.
+		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+			graphic_ctx.conditional_rendering_enabled = true;
 		}
 	}
 

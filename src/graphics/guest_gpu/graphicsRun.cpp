@@ -1922,7 +1922,7 @@ void TelemetryEndFrame() {
 			     static_cast<double>(telemetry.draw_targets_clear_gpu_wait_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_readback_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_writeback_us) * frame_avg);
-			LOGF("[FRAME_TELEMETRY_GPUSYNC] ReadMem: flush %.2f ms fence %.2f ms copy %.2f ms | clears %u waits %u | gpusync: clear %u texture %u buffer %u other %u\n",
+			LOGF("[FRAME_TELEMETRY_GPUSYNC] ReadMem: flush %.2f ms fence %.2f ms copy %.2f ms | clears %u waits %u | gpusync: clear %u texture %u buffer %u other %u | gpu_predicate %u fallback %u\n",
 			     static_cast<double>(telemetry.readmem_flush_submit_us) * frame_avg,
 			     static_cast<double>(telemetry.readmem_fence_wait_us) * frame_avg,
 			     static_cast<double>(telemetry.readmem_copy_readback_us) * frame_avg,
@@ -1931,7 +1931,9 @@ void TelemetryEndFrame() {
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_clear_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_texture_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_buffer_count) * inv_frames + 0.5),
-			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_other_count) * inv_frames + 0.5));
+			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_other_count) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_count) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_fallback_count) * inv_frames + 0.5));
 		}
 		telemetry = FrameTelemetry {};
 	}

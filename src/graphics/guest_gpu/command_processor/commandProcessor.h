@@ -68,6 +68,8 @@ struct FrameTelemetry {
 	uint32_t gpusync_texture_count = 0;
 	uint32_t gpusync_buffer_count = 0;
 	uint32_t gpusync_other_count = 0;
+	uint32_t clear_gpu_predicate_count = 0;
+	uint32_t clear_gpu_predicate_fallback_count = 0;
 	uint32_t draws = 0;
 	uint32_t flushes = 0;
 	uint32_t draw_state_l1_hits = 0;
@@ -226,6 +228,14 @@ inline void TelemetryCountGpusyncBuffer() {
 
 inline void TelemetryCountGpusyncOther() {
 	GetFrameTelemetry().gpusync_other_count++;
+}
+
+inline void TelemetryCountClearGpuPredicate() {
+	GetFrameTelemetry().clear_gpu_predicate_count++;
+}
+
+inline void TelemetryCountClearGpuPredicateFallback() {
+	GetFrameTelemetry().clear_gpu_predicate_fallback_count++;
 }
 
 inline void TelemetryAddDrawTargetsBind(uint64_t delta_us) {

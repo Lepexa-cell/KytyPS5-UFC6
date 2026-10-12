@@ -328,6 +328,47 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
+
+set(clear_predicate_shader_source "${gpu_tiler_shader_dir}/clear_predicate_check.comp")
+set(clear_predicate_shader_spv "${gpu_tiler_generated_dir}/clear_predicate_check.spv")
+set(clear_predicate_shader_header
+	"${gpu_tiler_generated_dir}/clear_predicate_check_spv.h")
+add_custom_command(
+	OUTPUT "${clear_predicate_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${clear_predicate_shader_spv}" "${clear_predicate_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_shader_spv}
+	        -DOUTPUT=${clear_predicate_shader_header}
+	        -DSYMBOL=CLEAR_PREDICATE_CHECK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${clear_predicate_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${clear_predicate_shader_header}")
+
+set(clear_predicate_fill_vert_source "${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert")
+set(clear_predicate_fill_frag_source "${gpu_tiler_shader_dir}/clear_predicate_fill.frag")
+set(clear_predicate_fill_vert_spv "${gpu_tiler_generated_dir}/clear_predicate_fill.vert.spv")
+set(clear_predicate_fill_frag_spv "${gpu_tiler_generated_dir}/clear_predicate_fill.frag.spv")
+set(clear_predicate_fill_vert_header "${gpu_tiler_generated_dir}/clear_predicate_fill_vert_spv.h")
+set(clear_predicate_fill_frag_header "${gpu_tiler_generated_dir}/clear_predicate_fill_frag_spv.h")
+add_custom_command(
+	OUTPUT "${clear_predicate_fill_vert_header}" "${clear_predicate_fill_frag_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${clear_predicate_fill_vert_spv}" "${clear_predicate_fill_vert_source}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${clear_predicate_fill_frag_spv}" "${clear_predicate_fill_frag_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_vert_spv}
+	        -DOUTPUT=${clear_predicate_fill_vert_header}
+	        -DSYMBOL=CLEAR_PREDICATE_FILL_VERT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_frag_spv}
+	        -DOUTPUT=${clear_predicate_fill_frag_header}
+	        -DSYMBOL=CLEAR_PREDICATE_FILL_FRAG_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${clear_predicate_fill_vert_source}" "${clear_predicate_fill_frag_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${clear_predicate_fill_vert_header}" "${clear_predicate_fill_frag_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

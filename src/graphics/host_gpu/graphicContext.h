@@ -70,6 +70,8 @@ struct GraphicContext {
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
+	// Step 3: VK_EXT_conditional_rendering for the color-clear predicate.
+	bool                               conditional_rendering_enabled         = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;

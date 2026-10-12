@@ -146,6 +146,30 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// Step 3: GPU predicate for the color-clear metadata wait. Checks the decodable codes
+	// on the GPU and clears the image conditionally; true when the wait was replaced.
+	[[nodiscard]] bool TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc,
+	                                              uint32_t first, uint32_t count,
+	                                              uint64_t slice_size, uint64_t range_address,
+	                                              uint64_t range_size);
+	[[nodiscard]] bool ClearPredicateEnsureResources();
+	// Step 3 dispatch half: records the check compute and the conditional clears.
+	// Candidates are (code byte, clear color) pairs decodable for this image.
+	struct ClearPredicateCandidate {
+		uint8_t             code;
+		vk::ClearColorValue clear;
+	};
+	[[nodiscard]] bool TryMaterializeColorClearGpuDispatch(
+	    ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
+	    uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
+	    size_t candidate_count);
+	// Step 3 draw half: one predicated fullscreen-triangle draw per (slice, candidate).
+	// Conditional rendering gates draws, unlike transfer clears.
+	[[nodiscard]] bool TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& desc,
+	                                                  uint32_t count,
+	                                                  const ClearPredicateCandidate* candidates,
+	                                                  size_t candidate_count);
+	[[nodiscard]] vk::Pipeline ClearFillPipelineFor(vk::Format format);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
 	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
@@ -178,6 +202,22 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	// Step 3: persistent GPU resources for the color-clear predicate check shader.
+	vk::DescriptorSetLayout m_clear_predicate_desc_layout = nullptr;
+	vk::PipelineLayout      m_clear_predicate_layout      = nullptr;
+	vk::Pipeline            m_clear_predicate_pipeline    = nullptr;
+	// Step 3 fill path: fullscreen-triangle pipeline writing the clear color. One
+	// pipeline per color format; cached by format value.
+	vk::DescriptorSetLayout m_clear_fill_desc_layout = nullptr;
+	vk::PipelineLayout      m_clear_fill_layout      = nullptr;
+	vk::ShaderModule        m_clear_fill_vert        = nullptr;
+	vk::ShaderModule        m_clear_fill_frag        = nullptr;
+	struct ClearFillPipeline {
+		vk::Format   format = vk::Format::eUndefined;
+		vk::Pipeline handle = nullptr;
+	};
+	std::vector<ClearFillPipeline> m_clear_fill_pipelines;
+	std::unique_ptr<Buffer> m_clear_predicate_buffer;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
