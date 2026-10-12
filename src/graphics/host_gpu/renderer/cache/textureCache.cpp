@@ -17,6 +17,8 @@
 #include "gpu_tiler_shaders/clear_predicate_check_spv.h"
 #include "gpu_tiler_shaders/clear_predicate_fill_vert_spv.h"
 #include "gpu_tiler_shaders/clear_predicate_fill_frag_spv.h"
+#include "gpu_tiler_shaders/clear_predicate_fill_frag_uint_spv.h"
+#include "gpu_tiler_shaders/clear_predicate_fill_frag_sint_spv.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
@@ -129,35 +131,36 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return true;
 }
 
-// Step 3b: the fill fragment shader outputs vec4 float, so UINT/SINT targets cannot use
-// the predicated fill path. Keep the list explicit: DecodeColorClear never accepts DCC
-// fast-clear codes on integer formats, only the register-clear path does (checked via
+// Step 3b regression fix: predicated clears cover integer targets with a matching
+// fragment output type (uvec4/ivec4). DecodeColorClear never accepts DCC fast-clear
+// codes on integer formats, only the register-clear path does (checked via
 // DecodePackedColorClear, which handles eR32Uint/eR32Sint).
-[[nodiscard]] bool IsClearFillIntFormat(vk::Format format) {
+[[nodiscard]] TextureCache::ClearFillClass ClassifyClearFill(vk::Format format) {
 	switch (format) {
 		case vk::Format::eR8Uint:
 		case vk::Format::eR8G8Uint:
 		case vk::Format::eR8G8B8A8Uint:
 		case vk::Format::eB8G8R8A8Uint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eA2R10G10B10UintPack32:
+			return TextureCache::ClearFillClass::Uint;
 		case vk::Format::eR8Sint:
 		case vk::Format::eR8G8Sint:
 		case vk::Format::eR8G8B8A8Sint:
 		case vk::Format::eB8G8R8A8Sint:
-		case vk::Format::eR16Uint:
-		case vk::Format::eR16G16Uint:
-		case vk::Format::eR16G16B16A16Uint:
 		case vk::Format::eR16Sint:
 		case vk::Format::eR16G16Sint:
 		case vk::Format::eR16G16B16A16Sint:
-		case vk::Format::eR32Uint:
-		case vk::Format::eR32G32Uint:
-		case vk::Format::eR32G32B32A32Uint:
 		case vk::Format::eR32Sint:
 		case vk::Format::eR32G32Sint:
-		case vk::Format::eR32G32B32A32Sint:
-		case vk::Format::eA2B10G10R10UintPack32:
-		case vk::Format::eA2R10G10B10UintPack32: return true;
-		default: return false;
+		case vk::Format::eR32G32B32A32Sint: return TextureCache::ClearFillClass::Sint;
+		default: return TextureCache::ClearFillClass::Float;
 	}
 }
 
@@ -302,6 +305,12 @@ TextureCache::~TextureCache() {
 	}
 	if (m_clear_fill_vert != nullptr) {
 		m_graphics.device.destroyShaderModule(m_clear_fill_vert, nullptr);
+	}
+	if (m_clear_fill_frag_sint != nullptr) {
+		m_graphics.device.destroyShaderModule(m_clear_fill_frag_sint, nullptr);
+	}
+	if (m_clear_fill_frag_uint != nullptr) {
+		m_graphics.device.destroyShaderModule(m_clear_fill_frag_uint, nullptr);
 	}
 	if (m_clear_fill_frag != nullptr) {
 		m_graphics.device.destroyShaderModule(m_clear_fill_frag, nullptr);
@@ -1446,9 +1455,16 @@ void TextureCache::InitializeImage(ImageId id) {
 // range GPU-modified so a later CPU reader downloads it lazily. False on any unsupported
 // case (caller takes the old synchronous path).
 // Step 3b: cached DecodeColorClear enumeration per clear-relevant desc fields.
-// DecodeColorClear depends only on (metadata kind, view format, binding type,
-// clear_word, clear_register_valid, dcc_alpha_msb): none of these change per slice,
-// so the 256-code loop runs once per distinct image configuration.
+// DecodeColorClear reads exactly (metadata kind, view format, binding type,
+// clear_word, clear_register_valid, dcc_alpha_msb): the register-clear branch needs
+// kind+type+validity+clear_word (via DecodePackedColorClear, which reads only the
+// format and the packed word), the DCC branch needs kind+format+alpha_msb for the
+// lane mapping. ImageMetadataInfo holds a single 32-bit clear_word (no second word),
+// the guest num format is already folded into view.format at image creation, and no
+// swizzle beyond view.format is consulted. None of these change per slice, so the
+// 256-code loop runs once per distinct image configuration.
+// Step 3b regression fix: re-audited after adding integer fill variants; the key is
+// complete, no field is missing.
 TextureCache::ClearCandidatesResult
 TextureCache::LookupClearCandidates(const ImageDesc& desc) {
 	const ClearCandidatesKey key {.kind                  = desc.info.metadata.kind,
@@ -1481,6 +1497,10 @@ TextureCache::LookupClearCandidates(const ImageDesc& desc) {
 	return result;
 }
 
+TextureCache::ClearFillClass TextureCache::ClearFillClassFor(vk::Format format) {
+	return ClassifyClearFill(format);
+}
+
 TextureCache::ClearPredicateResult
 TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uint32_t first,
                                           uint32_t count, uint64_t slice_size,
@@ -1507,6 +1527,23 @@ TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uin
 		return fail(ClearFbReason::Unsupported);
 	}
 	(void)first;
+	// Step 3b regression fix: every check that can fail in the draw half runs here,
+	// before the dispatch half records anything. After the dispatch the check shader
+	// has overwritten matched metadata slices with 0xFFFFFFFF (fused writeback), so a
+	// later sync fallback would read 0xFF -- which decodes nothing on integer formats
+	// -- and skip the clear the image needs. That left integer targets uncleared and
+	// Device-lost the fight entry with null-descriptor draws.
+	{
+		const auto& view  = desc.view_info;
+		auto&       image = m_slot_images[id];
+		if (image.depth_id || image.info.IsDepth() || image.info.samples != 1 ||
+		    desc.info.resources.levels != 1 || view.level_count != 1) {
+			return fail(ClearFbReason::DepthOrMsaa);
+		}
+		if (ClearFillPipelineFor(view.format) == nullptr) {
+			return fail(ClearFbReason::PipelineFail);
+		}
+	}
 	const auto lookup = LookupClearCandidates(desc);
 	if (lookup.too_many) {
 		return fail(ClearFbReason::TooManyCandidates);
@@ -1681,15 +1718,13 @@ bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& 
 	};
 	const auto& view  = desc.view_info;
 	auto&       image = m_slot_images[id];
-	if (image.depth_id || image.info.IsDepth() || image.info.samples != 1 ||
-	    desc.info.resources.levels != 1 || view.level_count != 1) {
-		return fail(ClearFbReason::DepthOrMsaa);
-	}
-	if (IsClearFillIntFormat(view.format)) {
-		return fail(ClearFbReason::IntFormat);
-	}
+	// Step 3b regression fix: depth/MSAA and pipeline checks run in the Gpu entry
+	// before the dispatch is recorded; reaching here always succeeds.
 	const auto pipeline = ClearFillPipelineFor(view.format);
 	if (pipeline == nullptr) {
+		// Unreachable: the Gpu entry pre-created this pipeline before the dispatch.
+		// Kept as a fallback (not an EXIT) so a future format-class mismatch can only
+		// cost a sync readback, never a crash.
 		return fail(ClearFbReason::PipelineFail);
 	}
 	auto& command = m_scheduler.Current();
@@ -1727,9 +1762,26 @@ bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& 
 			rendering.pColorAttachments    = &attachment;
 			native.beginRendering(rendering);
 			native.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-			native.pushConstants(m_clear_fill_layout, vk::ShaderStageFlagBits::eFragment, 0,
-			                     sizeof(candidates[c].clear.float32),
-			                     &candidates[c].clear.float32);
+			// Step 3b regression fix: push the candidate color through the union member
+			// matching the attachment class; the pipeline's fragment module reads the
+			// same 16 bytes as float/uint/sint.
+			switch (ClearFillClassFor(view.format)) {
+				case ClearFillClass::Uint:
+					native.pushConstants(m_clear_fill_layout, vk::ShaderStageFlagBits::eFragment, 0,
+					                     sizeof(candidates[c].clear.uint32),
+					                     &candidates[c].clear.uint32);
+					break;
+				case ClearFillClass::Sint:
+					native.pushConstants(m_clear_fill_layout, vk::ShaderStageFlagBits::eFragment, 0,
+					                     sizeof(candidates[c].clear.int32),
+					                     &candidates[c].clear.int32);
+					break;
+				default:
+					native.pushConstants(m_clear_fill_layout, vk::ShaderStageFlagBits::eFragment, 0,
+					                     sizeof(candidates[c].clear.float32),
+					                     &candidates[c].clear.float32);
+					break;
+			}
 			const vk::Viewport viewport {0.0f, 0.0f,
 			                             static_cast<float>(std::max(image.info.extent.width >>
 			                                                         view.base_level,
@@ -1761,14 +1813,10 @@ bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& 
 
 // Step 3 fill pipeline: fullscreen-triangle vertex shader plus a fragment shader writing
 // the push-constant clear color. Dynamic rendering with the image's own color format.
-// UINT/SINT formats are rejected (callers count IntFormat): the fragment shader outputs
-// vec4 float, which cannot clear an integer attachment. The vertex shader only uses
-// gl_VertexIndex (no push constants or descriptors), so the fragment-only push range in
-// the shared layout stays valid.
+// The fragment module matches the attachment class (float/uint/sint); the vertex shader
+// only uses gl_VertexIndex (no push constants or descriptors), so the fragment-only push
+// range in the shared layout stays valid.
 vk::Pipeline TextureCache::ClearFillPipelineFor(vk::Format format) {
-	if (IsClearFillIntFormat(format)) {
-		return nullptr;
-	}
 	for (const auto& cached: m_clear_fill_pipelines) {
 		if (cached.format == format) {
 			return cached.handle;
@@ -1799,16 +1847,33 @@ vk::Pipeline TextureCache::ClearFillPipelineFor(vk::Format format) {
 		m_clear_fill_vert =
 		    CompileSPV({CLEAR_PREDICATE_FILL_VERT_SPV, std::size(CLEAR_PREDICATE_FILL_VERT_SPV)},
 		               m_graphics.device);
-		m_clear_fill_frag =
-		    CompileSPV({CLEAR_PREDICATE_FILL_FRAG_SPV, std::size(CLEAR_PREDICATE_FILL_FRAG_SPV)},
-		               m_graphics.device);
+		m_clear_fill_frag = CompileSPV(
+		    {CLEAR_PREDICATE_FILL_FRAG_SPV, std::size(CLEAR_PREDICATE_FILL_FRAG_SPV)},
+		    m_graphics.device);
+		// Step 3b regression fix: integer attachments need a matching fragment output
+		// type (uvec4/ivec4); the float module cannot clear them.
+		m_clear_fill_frag_uint = CompileSPV(
+		    {CLEAR_PREDICATE_FILL_FRAG_UINT_SPV, std::size(CLEAR_PREDICATE_FILL_FRAG_UINT_SPV)},
+		    m_graphics.device);
+		m_clear_fill_frag_sint = CompileSPV(
+		    {CLEAR_PREDICATE_FILL_FRAG_SINT_SPV, std::size(CLEAR_PREDICATE_FILL_FRAG_SINT_SPV)},
+		    m_graphics.device);
+	}
+	vk::ShaderModule frag = m_clear_fill_frag;
+	switch (ClearFillClassFor(format)) {
+		case ClearFillClass::Uint: frag = m_clear_fill_frag_uint; break;
+		case ClearFillClass::Sint: frag = m_clear_fill_frag_sint; break;
+		default: break;
+	}
+	if (frag == nullptr) {
+		return nullptr;
 	}
 	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
 	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
 	stages[0].module = m_clear_fill_vert;
 	stages[0].pName  = "main";
 	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	stages[1].module = m_clear_fill_frag;
+	stages[1].module = frag;
 	stages[1].pName  = "main";
 	vk::PipelineVertexInputStateCreateInfo vertex_input {};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};

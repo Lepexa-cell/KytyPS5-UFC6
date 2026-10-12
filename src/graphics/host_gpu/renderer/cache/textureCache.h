@@ -38,7 +38,9 @@ public:
 	std::function<bool(const Image&)> on_image_release;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
-	// Step 3b: fallback reasons for the GPU-predicate color-clear path. Every failed
+	// Step 3b regression fix: fill fragment module depends on the attachment class.
+	// Public so the anonymous-namespace classifier in textureCache.cpp can name it.
+	enum class ClearFillClass : uint8_t { Float, Uint, Sint };
 	// TryMaterializeColorClearGpu* attempt records one of these; the counters print in
 	// [FRAME_TELEMETRY_CLEARFB].
 	enum class ClearFbReason : uint8_t {
@@ -196,6 +198,7 @@ private:
 		std::vector<ClearPredicateCandidate> candidates;
 	};
 	ClearCandidatesResult LookupClearCandidates(const ImageDesc& desc);
+	[[nodiscard]] ClearFillClass ClearFillClassFor(vk::Format format);
 	[[nodiscard]] bool TryMaterializeColorClearGpuDispatch(
 	    ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
 	    uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
@@ -255,6 +258,8 @@ private:
 	};
 	std::vector<ClearFillPipeline> m_clear_fill_pipelines;
 	std::unique_ptr<Buffer> m_clear_predicate_buffer;
+	vk::ShaderModule        m_clear_fill_frag_uint = nullptr;
+	vk::ShaderModule        m_clear_fill_frag_sint = nullptr;
 	// Step 3b: decodable clear-candidate pairs per clear-relevant desc fields. Bounded:
 	// cleared once it grows past 256 entries.
 	std::map<ClearCandidatesKey, ClearCandidatesResult> m_clear_candidates_cache;

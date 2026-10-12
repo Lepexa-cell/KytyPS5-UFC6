@@ -348,27 +348,46 @@ list(APPEND kyty_emulator_src "${clear_predicate_shader_header}")
 
 set(clear_predicate_fill_vert_source "${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert")
 set(clear_predicate_fill_frag_source "${gpu_tiler_shader_dir}/clear_predicate_fill.frag")
+set(clear_predicate_fill_frag_uint_source "${gpu_tiler_shader_dir}/clear_predicate_fill_uint.frag")
+set(clear_predicate_fill_frag_sint_source "${gpu_tiler_shader_dir}/clear_predicate_fill_sint.frag")
 set(clear_predicate_fill_vert_spv "${gpu_tiler_generated_dir}/clear_predicate_fill.vert.spv")
 set(clear_predicate_fill_frag_spv "${gpu_tiler_generated_dir}/clear_predicate_fill.frag.spv")
+set(clear_predicate_fill_frag_uint_spv "${gpu_tiler_generated_dir}/clear_predicate_fill_uint.frag.spv")
+set(clear_predicate_fill_frag_sint_spv "${gpu_tiler_generated_dir}/clear_predicate_fill_sint.frag.spv")
 set(clear_predicate_fill_vert_header "${gpu_tiler_generated_dir}/clear_predicate_fill_vert_spv.h")
 set(clear_predicate_fill_frag_header "${gpu_tiler_generated_dir}/clear_predicate_fill_frag_spv.h")
+set(clear_predicate_fill_frag_uint_header "${gpu_tiler_generated_dir}/clear_predicate_fill_frag_uint_spv.h")
+set(clear_predicate_fill_frag_sint_header "${gpu_tiler_generated_dir}/clear_predicate_fill_frag_sint_spv.h")
 add_custom_command(
 	OUTPUT "${clear_predicate_fill_vert_header}" "${clear_predicate_fill_frag_header}"
+	       "${clear_predicate_fill_frag_uint_header}" "${clear_predicate_fill_frag_sint_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -o "${clear_predicate_fill_vert_spv}" "${clear_predicate_fill_vert_source}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -o "${clear_predicate_fill_frag_spv}" "${clear_predicate_fill_frag_source}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${clear_predicate_fill_frag_uint_spv}" "${clear_predicate_fill_frag_uint_source}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${clear_predicate_fill_frag_sint_spv}" "${clear_predicate_fill_frag_sint_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_vert_spv}
 	        -DOUTPUT=${clear_predicate_fill_vert_header}
 	        -DSYMBOL=CLEAR_PREDICATE_FILL_VERT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_frag_spv}
 	        -DOUTPUT=${clear_predicate_fill_frag_header}
 	        -DSYMBOL=CLEAR_PREDICATE_FILL_FRAG_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_frag_uint_spv}
+	        -DOUTPUT=${clear_predicate_fill_frag_uint_header}
+	        -DSYMBOL=CLEAR_PREDICATE_FILL_FRAG_UINT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${clear_predicate_fill_frag_sint_spv}
+	        -DOUTPUT=${clear_predicate_fill_frag_sint_header}
+	        -DSYMBOL=CLEAR_PREDICATE_FILL_FRAG_SINT_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
 	DEPENDS "${clear_predicate_fill_vert_source}" "${clear_predicate_fill_frag_source}"
+	        "${clear_predicate_fill_frag_uint_source}" "${clear_predicate_fill_frag_sint_source}"
 	VERBATIM
 )
-list(APPEND kyty_emulator_src "${clear_predicate_fill_vert_header}" "${clear_predicate_fill_frag_header}")
+list(APPEND kyty_emulator_src "${clear_predicate_fill_vert_header}" "${clear_predicate_fill_frag_header}"
+     "${clear_predicate_fill_frag_uint_header}" "${clear_predicate_fill_frag_sint_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
