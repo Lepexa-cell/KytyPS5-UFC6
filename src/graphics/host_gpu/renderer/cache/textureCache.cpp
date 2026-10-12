@@ -92,11 +92,16 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return value != nullptr && value[0] == '1';
 }
 
-// Step 3: KYTY_OPT_CLEAR_GPU_PREDICATE=0 restores the synchronous CPU readback path.
+// Step 3/3b UNSAFE (default off): KYTY_OPT_CLEAR_GPU_PREDICATE=1 enables the predicated
+// GPU color-clear path. Even step 3 (07b1899) flickers and loses the device on fight
+// entry: the synchronous ReadMemory in MaterializeColorClear downloads a ~4 MB window
+// (~10 MB dirty/frame) of GPU-written data into guest memory and clears tracker state,
+// and other readers depend on those side effects. Any path that skips it crashes.
+// Keep the code for now; the safe default is the synchronous CPU readback path.
 [[nodiscard]] bool ClearGpuPredicateEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_OPT_CLEAR_GPU_PREDICATE");
-		return value == nullptr || value[0] != '0';
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }

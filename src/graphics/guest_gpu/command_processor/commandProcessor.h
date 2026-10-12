@@ -38,6 +38,12 @@ struct FrameTelemetry {
 	uint64_t draw_state_prepare_ps_us = 0;
 	uint64_t draw_state_key_find_us = 0;
 	uint64_t draw_state_materialize_us = 0;
+	// Step 4: Mat sub-timers (measured around the MaterializeResources call in
+	// pipelineCache.cpp; the SRT layer itself stays telemetry-free).
+	//  - mat_refresh: the synchronous SRT refresh (walker + guest memory reads).
+	//  - mat_specialize: specialization build + permutation scan that follows.
+	uint64_t draw_state_mat_refresh_us = 0;
+	uint64_t draw_state_mat_specialize_us = 0;
 	uint64_t draw_state_permutation_us = 0;
 	uint64_t draw_state_targets_us = 0;
 	uint64_t draw_targets_color_us = 0;
@@ -58,6 +64,18 @@ struct FrameTelemetry {
 	uint32_t draw_targets_clear_wait_count = 0;
 	uint64_t draw_targets_bind_us = 0;
 	uint64_t draw_bindings_us = 0;
+	// Step 4: Bind sub-timers (measured in PrepareBindings/FindBuffers/Rebind*/CommitBindings).
+	//  - bind_resolve: PrepareBindings (texture desc compute + sampler lookup).
+	//  - bind_buffers: FindBuffers (descriptor decode + buffer cache lookup).
+	//  - bind_images: RebindImages (image view lookup).
+	//  - bind_commit: CommitBindings (descriptor writes).
+	uint64_t draw_bind_resolve_us = 0;
+	uint64_t draw_bind_buffers_us = 0;
+	uint64_t draw_bind_images_us = 0;
+	uint64_t draw_bind_commit_us = 0;
+	// Step 4: bind-cache (KYTY_OPT_BIND_CACHE) hit/miss counters.
+	uint32_t bind_cache_hits = 0;
+	uint32_t bind_cache_misses = 0;
 	uint64_t draw_vertex_us = 0;
 	uint64_t draw_pipe_us = 0;
 	uint64_t draw_emit_us = 0;
@@ -157,6 +175,14 @@ inline void TelemetryAddDrawStateKeyFind(uint64_t delta_us) {
 
 inline void TelemetryAddDrawStateMaterialize(uint64_t delta_us) {
 	GetFrameTelemetry().draw_state_materialize_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateMatRefresh(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_mat_refresh_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateMatSpecialize(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_mat_specialize_us += delta_us;
 }
 
 inline void TelemetryAddDrawStatePermutation(uint64_t delta_us) {
@@ -364,6 +390,45 @@ inline void TelemetrySetCacheImages(uint32_t count) {
 
 inline void TelemetryAddDrawBindings(uint64_t delta_us) {
 	GetFrameTelemetry().draw_bindings_us += delta_us;
+}
+
+// Step 4: draw-only attribution for Bind sub-timers. PrepareBindings/FindBuffers/Rebind*
+// serve compute dispatches too, while draw_bindings_us accumulates draw work only, so the
+// sub-timers accumulate only inside a DrawBindTelemetryScope (set around the draw bind block
+// in ExecutePreparedDraw). CommitBindings gates on the graphics bind point instead.
+inline bool& DrawBindTelemetryScope() {
+	static thread_local bool active = false;
+	return active;
+}
+
+inline void TelemetryAddDrawBindResolve(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_resolve_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindBuffers(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_buffers_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindImages(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_images_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindCommit(uint64_t delta_us) {
+	GetFrameTelemetry().draw_bind_commit_us += delta_us;
+}
+
+inline void TelemetryCountBindCacheHit() {
+	GetFrameTelemetry().bind_cache_hits++;
+}
+
+inline void TelemetryCountBindCacheMiss() {
+	GetFrameTelemetry().bind_cache_misses++;
 }
 
 inline void TelemetryAddDrawVertex(uint64_t delta_us) {

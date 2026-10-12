@@ -1922,6 +1922,18 @@ void TelemetryEndFrame() {
 			     static_cast<double>(telemetry.draw_targets_clear_gpu_wait_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_readback_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_clear_writeback_us) * frame_avg);
+			// Step 4: Mat/Bind split (8 ms specifiers, 2 count specifiers).
+			LOGF("[FRAME_TELEMETRY_BIND] Mat: %.2f ms (refresh %.2f ms specialize %.2f ms) | Bind: %.2f ms (resolve %.2f ms buffers %.2f ms images %.2f ms commit %.2f ms) | bindcache hits %.1f miss %.1f\n",
+			     static_cast<double>(telemetry.draw_state_materialize_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_state_mat_refresh_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_state_mat_specialize_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_bindings_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_bind_resolve_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_bind_buffers_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_bind_images_us) * frame_avg,
+			     static_cast<double>(telemetry.draw_bind_commit_us) * frame_avg,
+			     static_cast<double>(telemetry.bind_cache_hits) * inv_frames,
+			     static_cast<double>(telemetry.bind_cache_misses) * inv_frames);
 			LOGF("[FRAME_TELEMETRY_GPUSYNC] ReadMem: flush %.2f ms fence %.2f ms copy %.2f ms | clears %u waits %u | gpusync: clear %u texture %u buffer %u other %u | gpu_predicate %u fallback %u\n",
 			     static_cast<double>(telemetry.readmem_flush_submit_us) * frame_avg,
 			     static_cast<double>(telemetry.readmem_fence_wait_us) * frame_avg,

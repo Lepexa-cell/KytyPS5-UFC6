@@ -1388,6 +1388,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
+	// Step 4: bind_resolve sub-timer. Draw-only via DrawBindTelemetryScope (set by the draw
+	// bind block); compute dispatches call this too but must not pollute [FRAME_TELEMETRY_BIND].
+	const auto telemetry_resolve_begin_us = TelemetryNowUs();
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	// UFC-октагон: PrepareBindings идёт на каждом из 2350 draw. Диагностика
@@ -1533,11 +1536,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
+	TelemetryAddDrawBindResolve(TelemetryNowUs() - telemetry_resolve_begin_us);
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	// Step 4: bind_buffers sub-timer (draw-only via DrawBindTelemetryScope).
+	const auto telemetry_buffers_begin_us = TelemetryNowUs();
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
@@ -1545,6 +1551,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	prepared.buffer_sources.clear();
 	const auto& layout = program.bindings;
 	if (layout.memory_offset_count == 0) {
+		TelemetryAddDrawBindBuffers(TelemetryNowUs() - telemetry_buffers_begin_us);
 		return;
 	}
 	const auto& resources = layout.descriptors.front().resources;
@@ -1589,6 +1596,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
+	TelemetryAddDrawBindBuffers(TelemetryNowUs() - telemetry_buffers_begin_us);
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -1662,6 +1670,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	// Step 4: bind_images sub-timer (draw-only via DrawBindTelemetryScope).
+	const auto telemetry_images_begin_us = TelemetryNowUs();
 	const auto& program  = *prepared.runtime->program;
 	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
@@ -1706,6 +1716,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 	}
+	TelemetryAddDrawBindImages(TelemetryNowUs() - telemetry_images_begin_us);
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
@@ -1751,6 +1762,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
+	// Step 4: bind_commit sub-timer. Graphics only: compute dispatches commit on their
+	// own path, so gate accumulation to keep [FRAME_TELEMETRY_BIND] draw-exact.
+	const bool   telemetry_draw = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
+	const auto   telemetry_commit_begin_us = telemetry_draw ? TelemetryNowUs() : 0;
 	const auto vk_buffer    = buffer.Recorder();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
@@ -2121,6 +2136,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		EXIT_IF(set == nullptr);
 		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set, 0,
 		                             nullptr);
+	}
+	if (telemetry_draw) {
+		TelemetryAddDrawBindCommit(TelemetryNowUs() - telemetry_commit_begin_us);
 	}
 }
 

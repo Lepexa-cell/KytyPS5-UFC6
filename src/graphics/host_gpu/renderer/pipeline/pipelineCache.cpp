@@ -952,7 +952,11 @@ struct PipelineCache::ProgramCache {
 				    entry->second.resource_plan, runtime, entry->second.resources,
 				    entry->second.specialization);
 				if (subcounters) {
-					TelemetryAddDrawStateMaterialize(TelemetryNowUs() - materialize_begin_us);
+					const auto materialize_end_us = TelemetryNowUs();
+					TelemetryAddDrawStateMaterialize(materialize_end_us - materialize_begin_us);
+					// Step 4: whole-call Mat attribution lands in mat_refresh for now; the
+					// specialize sub-timer below covers the permutation scan that follows.
+					TelemetryAddDrawStateMatRefresh(materialize_end_us - materialize_begin_us);
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;
@@ -1003,12 +1007,16 @@ struct PipelineCache::ProgramCache {
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				if (subcounters) {
-					TelemetryAddDrawStatePermutation(TelemetryNowUs() - permutation_begin_us);
+					const auto permutation_end_us = TelemetryNowUs();
+					TelemetryAddDrawStatePermutation(permutation_end_us - permutation_begin_us);
+					TelemetryAddDrawStateMatSpecialize(permutation_end_us - permutation_begin_us);
 				}
 				return permutation->handle;
 			}
 			if (subcounters) {
-				TelemetryAddDrawStatePermutation(TelemetryNowUs() - permutation_begin_us);
+				const auto permutation_end_us = TelemetryNowUs();
+				TelemetryAddDrawStatePermutation(permutation_end_us - permutation_begin_us);
+				TelemetryAddDrawStateMatSpecialize(permutation_end_us - permutation_begin_us);
 			}
 		}
 

@@ -1402,6 +1402,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	const auto telemetry_bind_begin_us = TelemetryNowUs();
+	DrawBindTelemetryScope() = true;
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
@@ -1416,6 +1417,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {state.color_info, state.color_count});
+	DrawBindTelemetryScope() = false;
 	TelemetryAddDrawBindings(TelemetryNowUs() - telemetry_bind_begin_us);
 	const auto telemetry_vertex_begin_us = TelemetryNowUs();
 	PreparedVertexBuffers vertex_bindings;
