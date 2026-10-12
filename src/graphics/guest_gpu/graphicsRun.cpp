@@ -1946,6 +1946,11 @@ void TelemetryEndFrame() {
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_depth_msaa) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_int_format) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_pipeline) * inv_frames + 0.5));
+			// Regression analysis: windowed readback volume (3 specifiers, 3 args).
+			LOGF("[FRAME_TELEMETRY_CLEARFB] readwin %.1f MB dirty %.1f MB pieces %.1f\n",
+			     static_cast<double>(telemetry.clear_read_requested_bytes) * inv_frames / 1048576.0,
+			     static_cast<double>(telemetry.clear_read_extra_bytes) * inv_frames / 1048576.0,
+			     static_cast<double>(telemetry.clear_read_range_count) * inv_frames);
 		}
 		telemetry = FrameTelemetry {};
 	}

@@ -99,12 +99,15 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return enabled;
 }
 
-// Step 3b: KYTY_OPT_CLEAR_SKIP_NOCAND=0 restores the readback for images whose metadata
-// codes never decode (default skips the wait: the old path provably does nothing there).
+// Step 3b: KYTY_OPT_CLEAR_SKIP_NOCAND=1 skips the readback for images whose metadata
+// codes never decode. Default off: the sync readback's side effects (window download +
+// per-page tracker cleanup) turned out to be load-bearing (fighter-select Device lost).
 [[nodiscard]] bool ClearSkipNocandEnabled() {
 	static const bool enabled = [] {
 		const auto* value = std::getenv("KYTY_OPT_CLEAR_SKIP_NOCAND");
-		return value == nullptr || value[0] != '0';
+		// Default off: the sync readback's side effects (window download +
+		// per-page tracker cleanup) are load-bearing, see step 3b analysis.
+		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
 }
@@ -1510,11 +1513,16 @@ TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uin
 	}
 	if (lookup.candidates.empty()) {
 		// No metadata code decodes for this image (only Cmask without a decodable
-		// register clear reaches here: DCC always decodes code 0x00). The old path then
-		// provably does nothing observable: after its readback every slice hits
-		// "DecodeColorClear fails -> continue" before ClearImage/WriteBacking, so there
-		// is no write, no state change, no counter that a consumer could observe.
-		// Skip the wait and the readback entirely.
+		// register clear reaches here: DCC always decodes code 0x00). The old path's
+		// writes are still no-ops here (every slice hits "DecodeColorClear fails ->
+		// continue" before ClearImage/WriteBacking), BUT the synchronous ReadMemory
+		// before that loop is load-bearing: it downloads a ~4 MB window around the
+		// range into guest memory, unprotects unrelated GPU-dirty pages and clears
+		// their tracker state, which later readers (TryReadBacking callers without
+		// a HasGpuDirtyBytes guard) observe. Skipping it starves those readers of
+		// fresh bytes and removes the wait that ordered the GPU write before their
+		// reads, which Device-lost the fighter select (null-descriptor DrawIndex at
+		// address 0x0). Only skip under the explicit opt-in flag.
 		if (ClearSkipNocandEnabled()) {
 			if (TelemetrySubcountersEnabled()) {
 				TelemetryCountClearGpuPredicate();

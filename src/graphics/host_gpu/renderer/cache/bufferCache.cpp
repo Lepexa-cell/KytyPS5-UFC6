@@ -586,6 +586,18 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		window_begin = std::max(Common::AlignDown(vaddr, window), buffer_begin);
 		window_end   = std::min(std::max(window_begin + window, vaddr + size), buffer_end);
 	}
+	if (TelemetrySubcountersEnabled()) {
+		// Regression analysis: how many tracker pieces the widened download spans.
+		uint32_t pieces = 0;
+		uint64_t pieces_bytes = 0;
+		m_memory_tracker.ForEachDownloadRange<false>(
+		    window_begin, window_end - window_begin,
+		    [&](uint64_t, uint64_t bytes) noexcept {
+			    pieces++;
+			    pieces_bytes += bytes;
+		    });
+		TelemetryAddClearReadWindow(window_end - window_begin, pieces_bytes, pieces);
+	}
 
 	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
 	if (async) {

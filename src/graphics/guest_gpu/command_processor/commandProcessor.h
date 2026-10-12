@@ -68,6 +68,12 @@ struct FrameTelemetry {
 	uint32_t gpusync_texture_count = 0;
 	uint32_t gpusync_buffer_count = 0;
 	uint32_t gpusync_other_count = 0;
+	// Regression analysis: how much the sync readback downloads beyond its range
+	// (ReadbackWindow widens every sync read to ~4 MB) and how many GPU-dirty
+	// tracker bytes/pieces its window carries.
+	uint64_t clear_read_extra_bytes = 0;
+	uint64_t clear_read_requested_bytes = 0;
+	uint32_t clear_read_range_count = 0;
 	uint32_t clear_gpu_predicate_count = 0;
 	uint32_t clear_gpu_predicate_fallback_count = 0;
 	uint32_t clear_gpu_predicate_nocand_count = 0;
@@ -239,6 +245,15 @@ inline void TelemetryCountGpusyncBuffer() {
 
 inline void TelemetryCountGpusyncOther() {
 	GetFrameTelemetry().gpusync_other_count++;
+}
+
+// Regression analysis: a sync readback with a (window_bytes) download window
+// carrying (dirty_bytes) GPU-dirty tracker bytes in (ranges) pieces.
+inline void TelemetryAddClearReadWindow(uint64_t window_bytes, uint64_t dirty_bytes, uint32_t ranges) {
+	auto& telemetry = GetFrameTelemetry();
+	telemetry.clear_read_requested_bytes += window_bytes;
+	telemetry.clear_read_extra_bytes += dirty_bytes;
+	telemetry.clear_read_range_count += ranges;
 }
 
 inline void TelemetryCountClearGpuPredicate() {
