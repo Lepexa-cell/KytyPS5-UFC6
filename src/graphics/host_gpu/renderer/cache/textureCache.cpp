@@ -99,6 +99,16 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return enabled;
 }
 
+// Step 3b: KYTY_OPT_CLEAR_SKIP_NOCAND=0 restores the readback for images whose metadata
+// codes never decode (default skips the wait: the old path provably does nothing there).
+[[nodiscard]] bool ClearSkipNocandEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OPT_CLEAR_SKIP_NOCAND");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
 [[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
 	constexpr uint64_t   Chunk = 64 * 1024;
@@ -115,6 +125,41 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	hash = seed;
 	return true;
 }
+
+// Step 3b: the fill fragment shader outputs vec4 float, so UINT/SINT targets cannot use
+// the predicated fill path. Keep the list explicit: DecodeColorClear never accepts DCC
+// fast-clear codes on integer formats, only the register-clear path does (checked via
+// DecodePackedColorClear, which handles eR32Uint/eR32Sint).
+[[nodiscard]] bool IsClearFillIntFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eB8G8R8A8Uint:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eB8G8R8A8Sint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32B32A32Sint:
+		case vk::Format::eA2B10G10R10UintPack32:
+		case vk::Format::eA2R10G10B10UintPack32: return true;
+		default: return false;
+	}
+}
+
+// Step 3b: fallback reasons live in textureCache.h (TextureCache::ClearFbReason);
+// the counters print in [FRAME_TELEMETRY_CLEARFB].
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -278,6 +323,42 @@ TextureCache::~TextureCache() {
 			UnregisterImage(id);
 		}
 	});
+}
+
+// Step 3b: record one fallback-reason counter per failed GPU-predicate attempt.
+const char* ClearFbReasonName(TextureCache::ClearFbReason reason) {
+	using enum TextureCache::ClearFbReason;
+	switch (reason) {
+		case NoCondRendering: return "nocond";
+		case Resources: return "resources";
+		case Unsupported: return "unsupported";
+		case NoCandidates: return "nocand";
+		case TooManyCandidates: return "toomany";
+		case MetaRange: return "metarange";
+		case DepthOrMsaa: return "depthmsaa";
+		case IntFormat: return "intfmt";
+		case PipelineFail: return "pipefail";
+	}
+	return "unknown";
+}
+
+void RecordClearFb(TextureCache::ClearFbReason reason) {
+	if (!TelemetrySubcountersEnabled()) {
+		return;
+	}
+	using enum TextureCache::ClearFbReason;
+	switch (reason) {
+		case NoCondRendering: TelemetryCountClearFbNoCond(); break;
+		case Resources: TelemetryCountClearFbResources(); break;
+		case Unsupported: TelemetryCountClearFbUnsupported(); break;
+		case NoCandidates: TelemetryCountClearFbNoCand(); break;
+		case TooManyCandidates: TelemetryCountClearFbTooMany(); break;
+		case MetaRange: TelemetryCountClearFbMetaRange(); break;
+		case DepthOrMsaa: TelemetryCountClearFbDepthMsaa(); break;
+		case IntFormat: TelemetryCountClearFbIntFormat(); break;
+		case PipelineFail: TelemetryCountClearFbPipeline(); break;
+	}
+	TelemetryCountClearGpuPredicateFallback();
 }
 
 // Step 3: persistent resources for the color-clear predicate check shader, created on
@@ -1361,39 +1442,99 @@ void TextureCache::InitializeImage(ImageId id) {
 // cache's GPU copy, then issues one conditional clear per matching slice. Keeps the
 // range GPU-modified so a later CPU reader downloads it lazily. False on any unsupported
 // case (caller takes the old synchronous path).
-bool TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc,
-                                              uint32_t first, uint32_t count,
-                                              uint64_t slice_size, uint64_t range_address,
-                                              uint64_t range_size) {
-	if (!m_graphics.conditional_rendering_enabled || !ClearPredicateEnsureResources()) {
-		return false;
+// Step 3b: cached DecodeColorClear enumeration per clear-relevant desc fields.
+// DecodeColorClear depends only on (metadata kind, view format, binding type,
+// clear_word, clear_register_valid, dcc_alpha_msb): none of these change per slice,
+// so the 256-code loop runs once per distinct image configuration.
+TextureCache::ClearCandidatesResult
+TextureCache::LookupClearCandidates(const ImageDesc& desc) {
+	const ClearCandidatesKey key {.kind                  = desc.info.metadata.kind,
+	                             .format                = desc.view_info.format,
+	                             .type                  = desc.type,
+	                             .clear_word            = desc.info.metadata.clear_word,
+	                             .clear_register_valid  = desc.info.metadata.clear_register_valid,
+	                             .dcc_alpha_msb         = desc.info.metadata.dcc_alpha_msb};
+	if (const auto found = m_clear_candidates_cache.find(key);
+	    found != m_clear_candidates_cache.end()) {
+		return found->second;
+	}
+	ClearCandidatesResult result;
+	for (uint32_t code = 0; code < 256; code++) {
+		ClearPredicateCandidate candidate {};
+		candidate.code = static_cast<uint8_t>(code);
+		if (DecodeColorClear(desc, candidate.code, candidate.clear)) {
+			result.candidates.push_back(candidate);
+			if (result.candidates.size() > 4) {
+				result.too_many  = true;
+				result.candidates.clear();
+				break;
+			}
+		}
+	}
+	if (m_clear_candidates_cache.size() > 256) {
+		m_clear_candidates_cache.clear();
+	}
+	m_clear_candidates_cache.emplace(key, result);
+	return result;
+}
+
+TextureCache::ClearPredicateResult
+TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+                                          uint32_t count, uint64_t slice_size,
+                                          uint64_t range_address, uint64_t range_size,
+                                          ClearFbReason* out_reason) {
+	ClearFbReason reason = ClearFbReason::Unsupported;
+	const auto    fail   = [&](ClearFbReason why) {
+        if (out_reason != nullptr) {
+            *out_reason = why;
+        }
+        RecordClearFb(why);
+        return ClearPredicateResult::SyncFallback;
+    };
+	if (!m_graphics.conditional_rendering_enabled) {
+		return fail(ClearFbReason::NoCondRendering);
+	}
+	if (!ClearPredicateEnsureResources()) {
+		return fail(ClearFbReason::Resources);
 	}
 	if (desc.type == BindingType::VideoOut || desc.info.IsVolume() ||
 	    desc.info.resources.levels != 1 || slice_size == 0 || count == 0 || count > 64 ||
 	    slice_size > UINT32_MAX || range_size != slice_size * count ||
 	    (range_address & 3u) != 0 || (slice_size & 3u) != 0) {
-		return false;
+		return fail(ClearFbReason::Unsupported);
 	}
 	(void)first;
-	// Candidate (code, clear color) pairs decodable for this image. Per step-3 data the
-	// guest writes 0xFF (fast clear) or 0x00 (register clear); enumerate all 256 codes so
-	// any decodable code is covered, capped at the shader's 4 predicate slots.
-	std::vector<ClearPredicateCandidate> candidates;
-	for (uint32_t code = 0; code < 256; code++) {
-		ClearPredicateCandidate candidate {};
-		candidate.code = static_cast<uint8_t>(code);
-		if (DecodeColorClear(desc, candidate.code, candidate.clear)) {
-			candidates.push_back(candidate);
-			if (candidates.size() > 4) {
-				return false;
+	const auto lookup = LookupClearCandidates(desc);
+	if (lookup.too_many) {
+		return fail(ClearFbReason::TooManyCandidates);
+	}
+	if (lookup.candidates.empty()) {
+		// No metadata code decodes for this image (only Cmask without a decodable
+		// register clear reaches here: DCC always decodes code 0x00). The old path then
+		// provably does nothing observable: after its readback every slice hits
+		// "DecodeColorClear fails -> continue" before ClearImage/WriteBacking, so there
+		// is no write, no state change, no counter that a consumer could observe.
+		// Skip the wait and the readback entirely.
+		if (ClearSkipNocandEnabled()) {
+			if (TelemetrySubcountersEnabled()) {
+				TelemetryCountClearGpuPredicate();
+				TelemetryCountClearGpuPredicateNocand();
 			}
+			return ClearPredicateResult::SkippedNoCand;
 		}
+		return fail(ClearFbReason::NoCandidates);
 	}
-	if (candidates.empty()) {
-		return false;
+	// reason is assigned by the dispatch/draw halves below.
+	if (!TryMaterializeColorClearGpuDispatch(id, desc, count, slice_size, range_address,
+	                                        range_size, lookup.candidates.data(),
+	                                        lookup.candidates.size(), &reason)) {
+		if (out_reason != nullptr) {
+			*out_reason = reason;
+		}
+		RecordClearFb(reason);
+		return ClearPredicateResult::SyncFallback;
 	}
-	return TryMaterializeColorClearGpuDispatch(id, desc, count, slice_size, range_address,
-	                                          range_size, candidates.data(), candidates.size());
+	return ClearPredicateResult::Applied;
 }
 
 // Step 3 dispatch half: binds the metadata GPU copy and the predicate buffer, runs the
@@ -1401,16 +1542,22 @@ bool TextureCache::TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc
 bool TextureCache::TryMaterializeColorClearGpuDispatch(
     ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
     uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
-    size_t candidate_count) {
+    size_t candidate_count, ClearFbReason* out_reason) {
 	(void)id;
 	(void)desc;
+	const auto fail = [&](ClearFbReason why) {
+		if (out_reason != nullptr) {
+			*out_reason = why;
+		}
+		return false;
+	};
 	// ObtainBuffer with is_written=false never uploads stale CPU bytes over GPU-written
 	// ranges (sync only uploads CPU-modified ranges), so the check reads the guest
 	// dispatch's metadata writes.
 	const auto [meta, meta_offset] =
 	    m_buffer_cache.ObtainBuffer(range_address, range_size, false, false);
 	if (meta == nullptr) {
-		return false;
+		return fail(ClearFbReason::Resources);
 	}
 	const auto& limits              = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_align = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -1418,7 +1565,7 @@ bool TextureCache::TryMaterializeColorClearGpuDispatch(
 	const uint64_t meta_base        = meta_offset - meta_desc_offset;
 	const uint64_t meta_range       = Common::AlignUp(meta_base + range_size, 4);
 	if (meta_range > limits.maxStorageBufferRange) {
-		return false;
+		return fail(ClearFbReason::MetaRange);
 	}
 	struct ClearPredicatePush {
 		uint32_t meta_base_dword;
@@ -1506,7 +1653,8 @@ bool TextureCache::TryMaterializeColorClearGpuDispatch(
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &meta_after, 0,
 	                       nullptr);
-	return TryMaterializeColorClearGpuDraw(id, desc, count, candidates, candidate_count);
+	return TryMaterializeColorClearGpuDraw(id, desc, count, candidates, candidate_count,
+	                                     out_reason);
 }
 
 // Step 3 draw half: predicated fullscreen-triangle draws write the clear color. One
@@ -1516,16 +1664,25 @@ bool TextureCache::TryMaterializeColorClearGpuDispatch(
 bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& desc,
                                                   uint32_t count,
                                                   const ClearPredicateCandidate* candidates,
-                                                  size_t candidate_count) {
+                                                  size_t candidate_count, ClearFbReason* out_reason) {
+	const auto fail = [&](ClearFbReason why) {
+		if (out_reason != nullptr) {
+			*out_reason = why;
+		}
+		return false;
+	};
 	const auto& view  = desc.view_info;
 	auto&       image = m_slot_images[id];
 	if (image.depth_id || image.info.IsDepth() || image.info.samples != 1 ||
 	    desc.info.resources.levels != 1 || view.level_count != 1) {
-		return false;
+		return fail(ClearFbReason::DepthOrMsaa);
+	}
+	if (IsClearFillIntFormat(view.format)) {
+		return fail(ClearFbReason::IntFormat);
 	}
 	const auto pipeline = ClearFillPipelineFor(view.format);
 	if (pipeline == nullptr) {
-		return false;
+		return fail(ClearFbReason::PipelineFail);
 	}
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
@@ -1596,7 +1753,14 @@ bool TextureCache::TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& 
 
 // Step 3 fill pipeline: fullscreen-triangle vertex shader plus a fragment shader writing
 // the push-constant clear color. Dynamic rendering with the image's own color format.
+// UINT/SINT formats are rejected (callers count IntFormat): the fragment shader outputs
+// vec4 float, which cannot clear an integer attachment. The vertex shader only uses
+// gl_VertexIndex (no push constants or descriptors), so the fragment-only push range in
+// the shared layout stays valid.
 vk::Pipeline TextureCache::ClearFillPipelineFor(vk::Format format) {
+	if (IsClearFillIntFormat(format)) {
+		return nullptr;
+	}
 	for (const auto& cached: m_clear_fill_pipelines) {
 		if (cached.format == format) {
 			return cached.handle;
@@ -1762,16 +1926,37 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			return;
 		}
 		// Step 3: replace the synchronous wait with a GPU predicate when possible.
-		if (ClearGpuPredicateEnabled() && TryMaterializeColorClearGpu(id, desc, first, count,
-		                                                              range.size / layers,
-		                                                              range.address, range.size)) {
-			if (subcounters) {
-				TelemetryCountClearGpuPredicate();
+		// Step 3b: per-fallback detail under KYTY_LOG_CLEAR_WAIT=1 (two small LOGFs:
+		// geometry first, then format/kind/slice/count plus the reason string).
+		if (ClearGpuPredicateEnabled()) {
+			ClearFbReason      fb_reason = ClearFbReason::Unsupported;
+			const auto         predicate_result =
+			    TryMaterializeColorClearGpu(id, desc, first, count, range.size / layers,
+			                               range.address, range.size, &fb_reason);
+			using enum ClearPredicateResult;
+			if (predicate_result == Applied || predicate_result == SkippedNoCand) {
+				if (subcounters && predicate_result == Applied) {
+					TelemetryCountClearGpuPredicate();
+				}
+				return;
 			}
-			return;
-		}
-		if (ClearGpuPredicateEnabled() && subcounters) {
-			TelemetryCountClearGpuPredicateFallback();
+			if (gpu_wait_log) {
+				static uint32_t fb_logged = 0;
+				if (fb_logged < 200) {
+					const auto slice_bytes = layers != 0 ? range.size / layers : 0;
+					const auto extent      = desc.info.extent;
+					LOGF("ClearFb: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+					     " image=%u,%u,%u\n",
+					     range.address, range.size, extent.width, extent.height,
+					     extent.depth);
+					LOGF("ClearFbInfo: format=%u kind=%u slice=%llu count=%u reason=%s\n",
+					     static_cast<uint32_t>(view.format),
+					     static_cast<unsigned>(desc.info.metadata.kind),
+					     static_cast<unsigned long long>(slice_bytes),
+					     static_cast<unsigned>(count), ClearFbReasonName(fb_reason));
+					fb_logged++;
+				}
+			}
 		}
 		// Exactly one wait counter per real GPU wait (skipped waits are not waits).
 		TelemetryCountClearGpuWait();

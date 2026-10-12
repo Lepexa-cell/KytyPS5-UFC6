@@ -70,6 +70,17 @@ struct FrameTelemetry {
 	uint32_t gpusync_other_count = 0;
 	uint32_t clear_gpu_predicate_count = 0;
 	uint32_t clear_gpu_predicate_fallback_count = 0;
+	uint32_t clear_gpu_predicate_nocand_count = 0;
+	// Step 3b: per-reason fallback counters for TryMaterializeColorClearGpu.
+	uint32_t clear_fb_no_cond = 0;
+	uint32_t clear_fb_resources = 0;
+	uint32_t clear_fb_unsupported = 0;
+	uint32_t clear_fb_no_cand = 0;
+	uint32_t clear_fb_too_many = 0;
+	uint32_t clear_fb_meta_range = 0;
+	uint32_t clear_fb_depth_msaa = 0;
+	uint32_t clear_fb_int_format = 0;
+	uint32_t clear_fb_pipeline = 0;
 	uint32_t draws = 0;
 	uint32_t flushes = 0;
 	uint32_t draw_state_l1_hits = 0;
@@ -236,6 +247,46 @@ inline void TelemetryCountClearGpuPredicate() {
 
 inline void TelemetryCountClearGpuPredicateFallback() {
 	GetFrameTelemetry().clear_gpu_predicate_fallback_count++;
+}
+
+inline void TelemetryCountClearGpuPredicateNocand() {
+	GetFrameTelemetry().clear_gpu_predicate_nocand_count++;
+}
+
+inline void TelemetryCountClearFbNoCond() {
+	GetFrameTelemetry().clear_fb_no_cond++;
+}
+
+inline void TelemetryCountClearFbResources() {
+	GetFrameTelemetry().clear_fb_resources++;
+}
+
+inline void TelemetryCountClearFbUnsupported() {
+	GetFrameTelemetry().clear_fb_unsupported++;
+}
+
+inline void TelemetryCountClearFbNoCand() {
+	GetFrameTelemetry().clear_fb_no_cand++;
+}
+
+inline void TelemetryCountClearFbTooMany() {
+	GetFrameTelemetry().clear_fb_too_many++;
+}
+
+inline void TelemetryCountClearFbMetaRange() {
+	GetFrameTelemetry().clear_fb_meta_range++;
+}
+
+inline void TelemetryCountClearFbDepthMsaa() {
+	GetFrameTelemetry().clear_fb_depth_msaa++;
+}
+
+inline void TelemetryCountClearFbIntFormat() {
+	GetFrameTelemetry().clear_fb_int_format++;
+}
+
+inline void TelemetryCountClearFbPipeline() {
+	GetFrameTelemetry().clear_fb_pipeline++;
 }
 
 inline void TelemetryAddDrawTargetsBind(uint64_t delta_us) {

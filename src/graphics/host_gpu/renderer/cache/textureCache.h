@@ -38,6 +38,25 @@ public:
 	std::function<bool(const Image&)> on_image_release;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
+	// Step 3b: fallback reasons for the GPU-predicate color-clear path. Every failed
+	// TryMaterializeColorClearGpu* attempt records one of these; the counters print in
+	// [FRAME_TELEMETRY_CLEARFB].
+	enum class ClearFbReason : uint8_t {
+		NoCondRendering,
+		Resources,
+		Unsupported,
+		NoCandidates,
+		TooManyCandidates,
+		MetaRange,
+		DepthOrMsaa,
+		IntFormat,
+		PipelineFail,
+	};
+	// Step 3b: outcome of the GPU-predicate attempt. SkippedNoCand means no metadata code
+	// decodes for this image, so the old path is a proven no-op and the wait is skipped
+	// without a readback.
+	enum class ClearPredicateResult : uint8_t { Applied, SyncFallback, SkippedNoCand };
+
 	struct ImageDesc {
 		ImageInfo     info;
 		ImageViewInfo view_info;
@@ -147,11 +166,13 @@ private:
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
 	// Step 3: GPU predicate for the color-clear metadata wait. Checks the decodable codes
-	// on the GPU and clears the image conditionally; true when the wait was replaced.
-	[[nodiscard]] bool TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc,
-	                                              uint32_t first, uint32_t count,
-	                                              uint64_t slice_size, uint64_t range_address,
-	                                              uint64_t range_size);
+	// on the GPU and clears the image conditionally.
+	// Step 3b: on SyncFallback, out_reason (when non-null) receives the failing check so
+	// the caller can log it; every false return from the Dispatch/Draw halves assigns it.
+	[[nodiscard]] ClearPredicateResult
+	TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uint32_t first, uint32_t count,
+	                           uint64_t slice_size, uint64_t range_address, uint64_t range_size,
+	                           ClearFbReason* out_reason = nullptr);
 	[[nodiscard]] bool ClearPredicateEnsureResources();
 	// Step 3 dispatch half: records the check compute and the conditional clears.
 	// Candidates are (code byte, clear color) pairs decodable for this image.
@@ -159,16 +180,32 @@ private:
 		uint8_t             code;
 		vk::ClearColorValue clear;
 	};
+	// Step 3b: cached decodable (code, clear color) pairs per clear-relevant desc fields,
+	// so the 256-code DecodeColorClear loop doesn't run every frame.
+	struct ClearCandidatesKey {
+		ImageMetadataKind kind;
+		vk::Format        format;
+		BindingType       type;
+		uint32_t          clear_word;
+		bool              clear_register_valid;
+		bool              dcc_alpha_msb;
+		auto operator<=>(const ClearCandidatesKey&) const = default;
+	};
+	struct ClearCandidatesResult {
+		bool                                 too_many = false;
+		std::vector<ClearPredicateCandidate> candidates;
+	};
+	ClearCandidatesResult LookupClearCandidates(const ImageDesc& desc);
 	[[nodiscard]] bool TryMaterializeColorClearGpuDispatch(
 	    ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
 	    uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
-	    size_t candidate_count);
+	    size_t candidate_count, ClearFbReason* out_reason);
 	// Step 3 draw half: one predicated fullscreen-triangle draw per (slice, candidate).
 	// Conditional rendering gates draws, unlike transfer clears.
 	[[nodiscard]] bool TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& desc,
 	                                                  uint32_t count,
 	                                                  const ClearPredicateCandidate* candidates,
-	                                                  size_t candidate_count);
+	                                                  size_t candidate_count, ClearFbReason* out_reason);
 	[[nodiscard]] vk::Pipeline ClearFillPipelineFor(vk::Format format);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] TextureTransfer
@@ -218,6 +255,9 @@ private:
 	};
 	std::vector<ClearFillPipeline> m_clear_fill_pipelines;
 	std::unique_ptr<Buffer> m_clear_predicate_buffer;
+	// Step 3b: decodable clear-candidate pairs per clear-relevant desc fields. Bounded:
+	// cleared once it grows past 256 entries.
+	std::map<ClearCandidatesKey, ClearCandidatesResult> m_clear_candidates_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;

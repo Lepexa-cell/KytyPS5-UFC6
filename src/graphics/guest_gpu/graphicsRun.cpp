@@ -1934,6 +1934,18 @@ void TelemetryEndFrame() {
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_other_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_fallback_count) * inv_frames + 0.5));
+			LOGF("[FRAME_TELEMETRY_CLEARFB] nocand %u nocond %u res %u unsup %u\n",
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_nocand_count) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_no_cond) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_resources) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_unsupported) * inv_frames + 0.5));
+			LOGF("[FRAME_TELEMETRY_CLEARFB] nocandfb %u toomany %u metarange %u depthmsaa %u intfmt %u pipe %u\n",
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_no_cand) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_too_many) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_meta_range) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_depth_msaa) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_int_format) * inv_frames + 0.5),
+			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_pipeline) * inv_frames + 0.5));
 		}
 		telemetry = FrameTelemetry {};
 	}
