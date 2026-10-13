@@ -27,6 +27,16 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return enabled;
 }
 
+// KYTY_OPT_UPLOAD_DEDUP=0 disables the RebindBuffers upload dedup (default: enabled).
+// Telemetry-only change: no behavioural difference when disabled.
+[[nodiscard]] inline bool UploadDedupEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_UPLOAD_DEDUP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 enum class Pm4ProcessResult { Complete, Blocked };
 
 // Microsecond frame telemetry (QPC-based). GPU thread only: no atomics by design.
@@ -69,10 +79,35 @@ struct FrameTelemetry {
 	//  - bind_buffers: FindBuffers (descriptor decode + buffer cache lookup).
 	//  - bind_images: RebindImages (image view lookup).
 	//  - bind_commit: CommitBindings (descriptor writes).
+	// Step 4b adds: bind_rebind (whole RebindBuffers), bind_storage (its
+	// NativeStorageBuffer loop), bind_srt_upload (its flattened-SRT NativeUpload +
+	// FillFlatSlotsOnGpu), bind_sd_upload (its shader_data NativeUpload), bind_bda
+	// (PrepareBda) and bind_targets (color-target loop) in PrepareGraphicsBindings.
 	uint64_t draw_bind_resolve_us = 0;
 	uint64_t draw_bind_buffers_us = 0;
 	uint64_t draw_bind_images_us = 0;
 	uint64_t draw_bind_commit_us = 0;
+	// Step 4b: deeper Bind split (measured in PrepareGraphicsBindings/RebindBuffers).
+	//  - bind_rebind: whole RebindBuffers per stage.
+	//  - bind_storage: NativeStorageBuffer loop inside RebindBuffers.
+	//  - bind_srt_upload: NativeUpload flattened_srt + FillFlatSlotsOnGpu (both branches).
+	//  - bind_sd_upload: NativeUpload shader_data.
+	//  - bind_bda: PrepareBda.
+	//  - bind_targets: color-target FindImage/BindRenderTarget loop.
+	uint64_t draw_bind_rebind_us = 0;
+	uint64_t draw_bind_storage_us = 0;
+	uint64_t draw_bind_srt_upload_us = 0;
+	uint64_t draw_bind_sd_upload_us = 0;
+	uint64_t draw_bind_bda_us = 0;
+	uint64_t draw_bind_targets_us = 0;
+	// Step 4b: Mat split (measured around coarse phases of MaterializeResources).
+	//  - mat_srt_walk: SRT walker RefreshFlatBuffer (descriptor/SRT value graph).
+	//  - mat_guest_read: guest-memory reads serving the walk (armed only around the
+	//    slow path; the clean-page fast path stays uninstrumented).
+	//  - mat_spec_write: snapshot writes + specialization build after the walk.
+	uint64_t draw_state_mat_srt_walk_us = 0;
+	uint64_t draw_state_mat_guest_read_us = 0;
+	uint64_t draw_state_mat_spec_write_us = 0;
 	// Step 4: bind-cache (KYTY_OPT_BIND_CACHE) hit/miss counters.
 	uint32_t bind_cache_hits = 0;
 	uint32_t bind_cache_misses = 0;
@@ -421,6 +456,54 @@ inline void TelemetryAddDrawBindImages(uint64_t delta_us) {
 
 inline void TelemetryAddDrawBindCommit(uint64_t delta_us) {
 	GetFrameTelemetry().draw_bind_commit_us += delta_us;
+}
+
+inline void TelemetryAddDrawBindRebind(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_rebind_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindStorage(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_storage_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindSrtUpload(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_srt_upload_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindSdUpload(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_sd_upload_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindBda(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_bda_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawBindTargets(uint64_t delta_us) {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().draw_bind_targets_us += delta_us;
+	}
+}
+
+inline void TelemetryAddDrawStateMatSrtWalk(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_mat_srt_walk_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateMatGuestRead(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_mat_guest_read_us += delta_us;
+}
+
+inline void TelemetryAddDrawStateMatSpecWrite(uint64_t delta_us) {
+	GetFrameTelemetry().draw_state_mat_spec_write_us += delta_us;
 }
 
 inline void TelemetryCountBindCacheHit() {

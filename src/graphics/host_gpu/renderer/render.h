@@ -28,6 +28,7 @@ class Shader;
 
 struct GraphicContext;
 struct ShaderBufferResource;
+enum class ShaderType;
 struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
 struct RenderColorInfo;
@@ -191,6 +192,21 @@ public:
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// Step 4b: content-based upload dedup (KYTY_OPT_UPLOAD_DEDUP, default on).
+	// Safety rests on content equality (memcmp): a slot collision across stages can
+	// only miss a dedup, never alias different bytes.
+	struct UploadDedupEntry {
+		bool                     valid = false;
+		uint64_t                 tick  = 0;
+		uint64_t                 frame = 0;
+		vk::DescriptorBufferInfo info {nullptr, 0, VK_WHOLE_SIZE};
+		std::vector<uint32_t>    words;
+	};
+	// Two upload kinds (0 flattened-SRT, 1 shader-data) x shader-stage enum value.
+	static constexpr size_t kUploadDedupKinds  = 2;
+	static constexpr size_t kUploadDedupStages = 16;
+	bool DedupUpload(ShaderType stage, size_t kind, std::span<const uint32_t> data,
+	                 vk::DescriptorBufferInfo& out);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -255,6 +271,12 @@ private:
 	std::vector<uint32_t>                 m_bindless_requests;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<uint32_t>                 m_bindless_srt;
+	// Step 4b: per-(stage, upload kind) dedup of identical flattened-SRT / shader-data
+	// uploads within one scheduler tick of one presented frame. The stream ring never
+	// rewrites live memory (a wrap waits for the GPU), so a reused allocation stays
+	// valid while its tick is current; any tick/frame change invalidates the entries.
+	std::array<std::array<UploadDedupEntry, kUploadDedupStages>, kUploadDedupKinds>
+	    m_upload_dedup {};
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

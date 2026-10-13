@@ -948,15 +948,20 @@ struct PipelineCache::ProgramCache {
 				}
 				t_srt_shader_hash = params.hash;
 				const auto materialize_begin_us = subcounters ? TelemetryNowUs() : 0;
+				ShaderRecompiler::IR::MaterializeTimings materialize_timings {};
 				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
 				    entry->second.resource_plan, runtime, entry->second.resources,
-				    entry->second.specialization);
+				    entry->second.specialization, subcounters ? &materialize_timings : nullptr);
 				if (subcounters) {
 					const auto materialize_end_us = TelemetryNowUs();
 					TelemetryAddDrawStateMaterialize(materialize_end_us - materialize_begin_us);
 					// Step 4: whole-call Mat attribution lands in mat_refresh for now; the
 					// specialize sub-timer below covers the permutation scan that follows.
 					TelemetryAddDrawStateMatRefresh(materialize_end_us - materialize_begin_us);
+					// Step 4b: coarse Mat split (SRT walk / guest reads / spec writes).
+					TelemetryAddDrawStateMatSrtWalk(materialize_timings.srt_walk_us);
+					TelemetryAddDrawStateMatGuestRead(materialize_timings.guest_read_us);
+					TelemetryAddDrawStateMatSpecWrite(materialize_timings.spec_write_us);
 				}
 				t_srt_shader_hash = 0;
 				runtime.gpu_written = nullptr;

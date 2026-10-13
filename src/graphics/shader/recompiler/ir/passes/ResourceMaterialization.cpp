@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
+#include "common/platform/sysTimer.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/BindlessBindings.h"
@@ -25,6 +26,80 @@ namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+
+// Step 4b: platform counter in microseconds (same formula as TelemetryNowUs, without
+// pulling the GPU telemetry into the SRT layer).
+inline uint64_t MaterializeNowUs() {
+	uint64_t counter = 0;
+	uint64_t frequency = 0;
+	SysQueryPerformanceFrequency(&frequency);
+	SysQueryPerformanceCounter(&counter);
+	if (frequency == 0) {
+		return 0;
+	}
+	return (counter / frequency) * 1000000ull + ((counter % frequency) * 1000000ull) / frequency;
+}
+
+struct TimedReadState {
+	MaterializeTimings* timings = nullptr;
+	SrtMemoryReader     inner_read = nullptr;
+	SrtMemoryReader     inner_strict = nullptr;
+};
+
+thread_local TimedReadState t_timed_read;
+
+bool TimedReadMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto begin_us = MaterializeNowUs();
+	const bool ok = t_timed_read.inner_read(userdata, address, values);
+	if (t_timed_read.timings != nullptr) {
+		t_timed_read.timings->guest_read_us += MaterializeNowUs() - begin_us;
+	}
+	return ok;
+}
+
+bool TimedReadSpecializationMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto begin_us = MaterializeNowUs();
+	const bool ok = t_timed_read.inner_strict(userdata, address, values);
+	if (t_timed_read.timings != nullptr) {
+		t_timed_read.timings->guest_read_us += MaterializeNowUs() - begin_us;
+	}
+	return ok;
+}
+
+// Arms content-timed guest reads for the scope. No logic change: with
+// timings == nullptr the readers are untouched (zero overhead outside telemetry).
+// Saves and restores the whole thread-local state, so nested scopes are safe.
+struct TimedReadScope {
+	TimedReadState saved {};
+	bool           armed = false;
+
+	explicit TimedReadScope(SrtRuntime& observed, MaterializeTimings* timings) {
+		if (timings == nullptr) {
+			return;
+		}
+		timings->guest_read_us = 0;
+		timings->srt_walk_us = 0;
+		timings->spec_write_us = 0;
+		saved = t_timed_read;
+		t_timed_read.timings = timings;
+		t_timed_read.inner_read = observed.read_memory;
+		t_timed_read.inner_strict = observed.read_specialization_memory;
+		if (observed.read_memory != nullptr) {
+			observed.read_memory = TimedReadMemory;
+		}
+		if (observed.read_specialization_memory != nullptr) {
+			observed.read_specialization_memory = TimedReadSpecializationMemory;
+		}
+		armed = true;
+	}
+
+	~TimedReadScope() {
+		if (!armed) {
+			return;
+		}
+		t_timed_read = saved;
+	}
+};
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -1558,7 +1633,7 @@ namespace {
 
 bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
                               ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                              bool& served) {
+                              bool& served, MaterializeTimings* timings = nullptr) {
 	served                  = false;
 	g_indirect_failure_line = 0;
 	snapshot.bindless_heaps.clear();
@@ -1580,13 +1655,23 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		// Reads through the fast page path are captured there.
 		observed.capture_ranges = &reads;
 	}
+	// Step 4b: coarse Mat split (telemetry only; no logic change). Armed before the
+	// walkers copy the runtime, so every guest read through them is timed.
+	TimedReadScope timed_reads(observed, timings);
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots,
 	                 capture_reads || program.requires_specialization_memory ? &clean : nullptr);
 	SrtTraceSession trace(program, clean, walker, observed);
+	// Step 4b: srt_walk covers the flat-buffer refresh; spec_write covers the snapshot
+	// writes and specialization build below (telemetry only; no logic change).
+	const auto srt_walk_begin_us = timings != nullptr ? MaterializeNowUs() : 0;
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return FailIndirect(__LINE__);
 	}
+	if (timings != nullptr) {
+		timings->srt_walk_us += MaterializeNowUs() - srt_walk_begin_us;
+	}
+	const auto spec_write_begin_us = timings != nullptr ? MaterializeNowUs() : 0;
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
@@ -1771,6 +1856,9 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 	}
 	served = trace.FullyServed();
 	trace.Succeeded();
+	if (timings != nullptr) {
+		timings->spec_write_us += MaterializeNowUs() - spec_write_begin_us;
+	}
 	return true;
 }
 
@@ -1852,9 +1940,11 @@ void VerifyTracedRefresh(const ResourcePlan& program, const SrtRuntime& runtime,
 } // namespace
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializeTimings* timings) {
 	bool       served = false;
-	const bool ok     = MaterializeResourcesImpl(program, runtime, snapshot, specialization, served);
+	const bool ok     = MaterializeResourcesImpl(program, runtime, snapshot, specialization, served,
+                                                     timings);
 	static const bool verify = std::getenv("KYTY_SRT_TRACE_VERIFY") != nullptr;
 	if (ok && served && verify) {
 		VerifyTracedRefresh(program, runtime, snapshot, specialization);

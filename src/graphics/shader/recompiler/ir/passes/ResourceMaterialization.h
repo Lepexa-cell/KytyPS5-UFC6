@@ -52,9 +52,21 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
+// Step 4b: coarse Mat split. Filled by MaterializeResources when non-null; the SRT
+// layer itself stays telemetry-free (timing uses the platform counter directly).
+//  - srt_walk_us: SRT walker RefreshFlatBuffer (descriptor/SRT value graph).
+//  - guest_read_us: guest-memory reads serving the walk (both readers).
+//  - spec_write_us: snapshot writes + specialization build after the walk.
+struct MaterializeTimings {
+	uint64_t srt_walk_us   = 0;
+	uint64_t guest_read_us = 0;
+	uint64_t spec_write_us = 0;
+};
+
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          MaterializeTimings* timings = nullptr);
 
 // Diagnostics: the source line of the indirect-image check that failed the last
 // MaterializeResources call on this thread, or 0.

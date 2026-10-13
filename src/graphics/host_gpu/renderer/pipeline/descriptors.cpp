@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
@@ -975,14 +976,60 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
-static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
-                                             std::span<const uint32_t> data) {
+static vk::DescriptorBufferInfo
+NativeUpload(RenderContext& context, std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
-	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	auto& buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
+}
+
+// Step 4b: per-(stage, upload kind) dedup of the RebindBuffers NativeUpload calls.
+// Single contract: always fills `out` with exactly one allocation — the previous one
+// of the same stage/kind on a content hit (memcmp), or exactly one fresh NativeUpload
+// on a miss. Hits count into the existing bindcache hits, misses into bindcache
+// misses. With KYTY_OPT_UPLOAD_DEDUP=0 takes an early exit: one NativeUpload, no
+// memcmp, no words copy, and the slot is invalidated. The clear/ReadMemory/
+// ReadbackWindow and Mat paths never call this.
+bool RenderExecutor::DedupUpload(ShaderType stage, size_t kind, std::span<const uint32_t> data,
+                                vk::DescriptorBufferInfo& out) {
+	using Entry = UploadDedupEntry;
+	const size_t stage_slot = static_cast<size_t>(stage) < kUploadDedupStages
+	                              ? static_cast<size_t>(stage)
+	                              : kUploadDedupStages - 1u;
+	Entry&     entry = m_upload_dedup[kind][stage_slot];
+	const bool gated = DrawBindTelemetryScope();
+	if (!UploadDedupEnabled()) {
+		out = NativeUpload(m_context, data);
+		entry.valid = false;
+		return false;
+	}
+	const auto tick  = m_context.GetCommandScheduler().CurrentTick();
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	const bool fresh =
+	    entry.valid && entry.tick == tick && entry.frame == frame &&
+	    entry.words.size() == data.size() &&
+	    (data.empty() ||
+	     std::memcmp(entry.words.data(), data.data(), data.size_bytes()) == 0);
+	if (fresh) {
+		out = entry.info;
+		if (gated) {
+			TelemetryCountBindCacheHit();
+		}
+		return true;
+	}
+	out = NativeUpload(m_context, data);
+	if (gated) {
+		TelemetryCountBindCacheMiss();
+	}
+	entry.valid = true;
+	entry.tick  = tick;
+	entry.frame = frame;
+	entry.info  = out;
+	entry.words.assign(data.begin(), data.end());
+	return false;
 }
 
 // The flat slots the refresh left to the GPU (SrtGpuFill): their guest bytes are copied, where
@@ -1602,6 +1649,8 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	// Step 4b: rebind sub-timer (whole function; draw-only via DrawBindTelemetryScope).
+	const auto telemetry_rebind_begin_us = TelemetryNowUs();
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
@@ -1618,6 +1667,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
+	// Step 4b: storage sub-timer (NativeStorageBuffer loop).
+	const auto telemetry_storage_begin_us = TelemetryNowUs();
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
@@ -1635,9 +1686,23 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        ? 0u
 		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
 	}
+	TelemetryAddDrawBindStorage(TelemetryNowUs() - telemetry_storage_begin_us);
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		if (prepared.bindless_patches.empty()) {
+		// Step 4b: srt_upload sub-timer (NativeUpload flattened_srt + FillFlatSlotsOnGpu,
+		// both branches). Dedup only the plain branch with empty gpu_fills: identical
+		// bytes (memcmp) reuse the same-stage allocation of this tick/frame; the
+		// bindless-patched branch and GPU-filled slots always upload fresh.
+		const auto telemetry_srt_upload_begin_us = TelemetryNowUs();
+		if (prepared.bindless_patches.empty() && snapshot.gpu_fills.empty()) {
+			// Dedup path: DedupUpload fills flattened_srt with either the reused
+			// allocation (hit) or exactly one fresh NativeUpload (miss).
+			constexpr size_t kSrtKind = 0;
+			DedupUpload(program.stage, kSrtKind, snapshot.flattened_srt,
+			            prepared.flattened_srt);
+			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
+		} else if (prepared.bindless_patches.empty()) {
+			// GPU-filled slots: original path, no dedup.
 			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		} else {
@@ -1660,11 +1725,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
 			FillFlatSlotsOnGpu(m_context, prepared.flattened_srt, snapshot.gpu_fills);
 		}
+		TelemetryAddDrawBindSrtUpload(TelemetryNowUs() - telemetry_srt_upload_begin_us);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		// Step 4b: sd_upload sub-timer. DedupUpload fills shader_data_buffer with
+		// either the reused allocation (hit) or exactly one fresh NativeUpload (miss).
+		const auto telemetry_sd_upload_begin_us = TelemetryNowUs();
+		constexpr size_t kShaderDataKind = 1;
+		DedupUpload(program.stage, kShaderDataKind, prepared.shader_data,
+		            prepared.shader_data_buffer);
+		TelemetryAddDrawBindSdUpload(TelemetryNowUs() - telemetry_sd_upload_begin_us);
 	}
+	TelemetryAddDrawBindRebind(TelemetryNowUs() - telemetry_rebind_begin_us);
 }
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
@@ -1726,13 +1799,18 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		FindBuffers(*stage);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
+	// Step 4b: bda sub-timer (PrepareBda).
 	if (uses_dma) {
+		const auto telemetry_bda_begin_us = TelemetryNowUs();
 		m_context.PrepareBda();
+		TelemetryAddDrawBindBda(TelemetryNowUs() - telemetry_bda_begin_us);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
 	}
 	auto& cache = m_context.GetTextureCache();
+	// Step 4b: targets sub-timer (color-target FindImage/BindRenderTarget loop).
+	const auto telemetry_targets_begin_us = TelemetryNowUs();
 	for (auto& target: colors) {
 		EXIT_IF(!target.image_id);
 		const auto old_image = cache.m_slot_images.try_get(target.image_id);
@@ -1750,6 +1828,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			BindRenderTarget(target.image_id);
 		}
 	}
+	TelemetryAddDrawBindTargets(TelemetryNowUs() - telemetry_targets_begin_us);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	for (auto* stage: stages) {
