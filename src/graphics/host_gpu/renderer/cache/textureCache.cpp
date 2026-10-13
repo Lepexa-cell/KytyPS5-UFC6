@@ -119,6 +119,58 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	return enabled;
 }
 
+// KYTY_OPT_CLEAR_SCRATCH=0 restores the per-slice std::vector path in MaterializeColorClear
+// (default: enabled). The scratch path removes per-slice heap work from the uniformity check
+// without touching the synchronous ReadMemory wait above it: chunked guest-backing reads with
+// early exit on the first non-uniform byte, and chunked 0xFF write-back. Same bytes read and
+// written, same ClearImage/InvalidateMemory order, same EXITs on unreadable backing.
+[[nodiscard]] bool ClearScratchEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_OPT_CLEAR_SCRATCH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+constexpr uint64_t kClearScratchChunk = 64 * 1024;
+
+[[nodiscard]] std::vector<uint8_t> &ClearScratchChunkBuffer() {
+	static thread_local std::vector<uint8_t> chunk(static_cast<size_t>(kClearScratchChunk));
+	return chunk;
+}
+
+// True when every byte of [address, address + size) equals code. A mixed pattern (an ordinary
+// draw's compression state) exits after the first differing chunk instead of copying and
+// scanning the whole slice.
+[[nodiscard]] bool IsClearSliceUniform(uint64_t address, uint64_t size, uint8_t code) {
+	auto& chunk = ClearScratchChunkBuffer();
+	for (uint64_t done = 0; done < size;) {
+		const auto part = static_cast<size_t>(std::min<uint64_t>(size - done, kClearScratchChunk));
+		if (!LibKernel::Memory::TryReadBacking(address + done, chunk.data(), part)) {
+			EXIT("TextureCache: failed to read color metadata slice\n");
+		}
+		for (size_t i = 0; i < part; i++) {
+			if (chunk[i] != code) {
+				return false;
+			}
+		}
+		done += part;
+	}
+	return true;
+}
+
+// Writes size 0xFF bytes at address in chunks (post-clear key expansion). The caller keeps the
+// single InvalidateMemory before this loop, as in the vector path.
+void WriteClearSliceFF(uint64_t address, uint64_t size) {
+	auto& chunk = ClearScratchChunkBuffer();
+	std::fill(chunk.begin(), chunk.end(), uint8_t {0xff});
+	for (uint64_t done = 0; done < size;) {
+		const auto part = static_cast<size_t>(std::min<uint64_t>(size - done, kClearScratchChunk));
+		LibKernel::Memory::WriteBacking(address + done, chunk.data(), part);
+		done += part;
+	}
+}
+
 // Hash of the guest backing bytes of a range, read in chunks; false if a chunk is unreadable.
 [[nodiscard]] bool HashGuestBacking(uint64_t address, uint64_t size, uint64_t& hash) {
 	constexpr uint64_t   Chunk = 64 * 1024;
@@ -2064,19 +2116,32 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			clear_skip_decode++;
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+		if (ClearScratchEnabled()) {
+			if (!IsClearSliceUniform(address, slice_size, code)) {
+				if (subcounters) {
+					TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+				}
+				clear_skip_all_of++;
+				continue;
+			}
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
 			}
-			clear_skip_all_of++;
-			continue;
-		}
-		if (subcounters) {
-			TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+		} else {
+			std::vector<uint8_t> bytes(static_cast<size_t>(slice_size));
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read color metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+				if (subcounters) {
+					TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+				}
+				clear_skip_all_of++;
+				continue;
+			}
+			if (subcounters) {
+				TelemetryAddDrawTargetsClearReadback(TelemetryNowUs() - readback_begin_us);
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};
@@ -2093,9 +2158,16 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
 			const auto writeback_begin_us = subcounters ? TelemetryNowUs() : 0;
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			// The scratch path reuses the thread-local 64 KiB chunk; the legacy path keeps
+			// the per-slice vector. Both invalidate before writing, both fill with 0xFF.
+			if (ClearScratchEnabled()) {
+				m_buffer_cache.InvalidateMemory(address, slice_size);
+				WriteClearSliceFF(address, slice_size);
+			} else {
+				std::vector<uint8_t> ff(static_cast<size_t>(slice_size), uint8_t {0xff});
+				m_buffer_cache.InvalidateMemory(address, slice_size);
+				LibKernel::Memory::WriteBacking(address, ff.data(), ff.size());
+			}
 			if (subcounters) {
 				TelemetryAddDrawTargetsClearWriteback(TelemetryNowUs() - writeback_begin_us);
 			}
