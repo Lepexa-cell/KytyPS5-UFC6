@@ -37,6 +37,16 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return enabled;
 }
 
+// Step 4c: KYTY_OPT_BDA_CLEAN_SKIP=0 restores the legacy BDA walk (default: enabled).
+// Telemetry-only change when the hint reports dirty: the full walk still runs.
+[[nodiscard]] inline bool BdaCleanSkipEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_BDA_CLEAN_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 enum class Pm4ProcessResult { Complete, Blocked };
 
 // Microsecond frame telemetry (QPC-based). GPU thread only: no atomics by design.
@@ -111,6 +121,13 @@ struct FrameTelemetry {
 	// Step 4: bind-cache (KYTY_OPT_BIND_CACHE) hit/miss counters.
 	uint32_t bind_cache_hits = 0;
 	uint32_t bind_cache_misses = 0;
+	// Step 4c: BDA clean-skip range counters (draw-only via DrawBindTelemetryScope).
+	//  - bda_ranges_checked: mapped ranges probed with the CPU-clean hint.
+	//  - bda_ranges_skipped: ranges that skipped the region walk (hint clean).
+	//  - bda_ranges_walked: ranges that took the legacy region walk.
+	uint32_t bda_ranges_checked = 0;
+	uint32_t bda_ranges_skipped = 0;
+	uint32_t bda_ranges_walked = 0;
 	uint64_t draw_vertex_us = 0;
 	uint64_t draw_pipe_us = 0;
 	uint64_t draw_emit_us = 0;
@@ -512,6 +529,26 @@ inline void TelemetryCountBindCacheHit() {
 
 inline void TelemetryCountBindCacheMiss() {
 	GetFrameTelemetry().bind_cache_misses++;
+}
+
+// Step 4c: BDA clean-skip range counters. Draw-only via DrawBindTelemetryScope, kept
+// separate from the bind-cache hit/miss counters above.
+inline void TelemetryCountBdaRangeChecked() {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().bda_ranges_checked++;
+	}
+}
+
+inline void TelemetryCountBdaRangeSkipped() {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().bda_ranges_skipped++;
+	}
+}
+
+inline void TelemetryCountBdaRangeWalked() {
+	if (DrawBindTelemetryScope()) {
+		GetFrameTelemetry().bda_ranges_walked++;
+	}
 }
 
 inline void TelemetryAddDrawVertex(uint64_t delta_us) {

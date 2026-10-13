@@ -1332,6 +1332,16 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Step 4c: skip the region walk for fully CPU-clean ranges using the existing
+	// bitmap hint. Gated on all three switches; a false hint keeps the legacy path.
+	if (BdaCleanSkipEnabled() && g_tracker_skip_clean && g_tracker_bitmap) {
+		TelemetryCountBdaRangeChecked();
+		if (m_memory_tracker.IsRangeCpuCleanHint(vaddr, size)) {
+			TelemetryCountBdaRangeSkipped();
+			return;
+		}
+	}
+	TelemetryCountBdaRangeWalked();
 	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
 	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
 		    SynchronizeBuffersInRange(address, bytes);
