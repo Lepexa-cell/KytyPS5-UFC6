@@ -360,14 +360,33 @@ public:
 		Run([=](vk::CommandBuffer command) { command.setCheckpointNV(marker); });
 	}
 	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const {
-		if (!Threaded()) {
-			if (!RecordViewportWc(count, viewports, nullptr, 0, true)) {
+		// WithCount viewport and scissor are independent dynamic states: each compares
+		// only its own values against its own shadow entry. A count above the shadow
+		// limit is always recorded and invalidates the entry.
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			const bool same =
+			    cache.wc_viewport_known && cache.wc_viewport_count == count &&
+			    count <= RecordedStateCache::kMaxViewports &&
+			    ViewportsEqual(cache.wc_viewports.data(), viewports, count);
+			if (same) {
+				GetFrameTelemetry().record_dynamic_skipped++;
 				return;
 			}
-			m_direct.setViewportWithCount(count, viewports);
-			return;
+			if (count <= RecordedStateCache::kMaxViewports) {
+					if (count != 0) {
+						std::memcpy(cache.wc_viewports.data(), viewports,
+						            count * sizeof(vk::Viewport));
+					}
+					cache.wc_viewport_count = count;
+					cache.wc_viewport_known = true;
+				} else {
+					cache.wc_viewport_known = false;
+				}
+				GetFrameTelemetry().record_dynamic_emitted++;
 		}
-		if (!RecordViewportWc(count, viewports, nullptr, 0, true)) {
+		if (!Threaded()) {
+			m_direct.setViewportWithCount(count, viewports);
 			return;
 		}
 		const auto* v = m_scheduler->Stash(viewports, count);
@@ -375,14 +394,30 @@ public:
 		    [=](vk::CommandBuffer command) { command.setViewportWithCount(count, v); });
 	}
 	void setScissorWithCount(uint32_t count, const vk::Rect2D* scissors) const {
-		if (!Threaded()) {
-			if (!RecordViewportWc(0, nullptr, scissors, count, false)) {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			const bool same =
+			    cache.wc_scissor_known && cache.wc_scissor_count == count &&
+			    count <= RecordedStateCache::kMaxViewports &&
+			    ScissorsEqual(cache.wc_scissors.data(), scissors, count);
+			if (same) {
+				GetFrameTelemetry().record_dynamic_skipped++;
 				return;
 			}
-			m_direct.setScissorWithCount(count, scissors);
-			return;
+			if (count <= RecordedStateCache::kMaxViewports) {
+				if (count != 0) {
+					std::memcpy(cache.wc_scissors.data(), scissors,
+					            count * sizeof(vk::Rect2D));
+				}
+				cache.wc_scissor_count = count;
+				cache.wc_scissor_known = true;
+			} else {
+				cache.wc_scissor_known = false;
+			}
+			GetFrameTelemetry().record_dynamic_emitted++;
 		}
-		if (!RecordViewportWc(0, nullptr, scissors, count, false)) {
+		if (!Threaded()) {
+			m_direct.setScissorWithCount(count, scissors);
 			return;
 		}
 		const auto* s = m_scheduler->Stash(scissors, count);

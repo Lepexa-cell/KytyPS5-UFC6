@@ -45,13 +45,16 @@ struct RecordedStateCache {
 
 	// Viewport/scissor pairs: draws write them via WithCount, the blit helper via the
 	// firstViewport/firstScissor form. These are distinct Vulkan dynamic states
-	// (eViewportWithCount vs eViewport), so each form has its own entry; count (and
-	// first, for the non-WithCount form) is part of the comparison, arrays fully.
+	// (eViewportWithCount vs eViewport), so each form has its own entry. The WithCount
+	// viewport and scissor are also independent dynamic states: each compares only its
+	// own values, so a repeated viewport is skipped even when the scissor changes.
 	static constexpr uint32_t kMaxViewports = 16;
 	std::array<vk::Viewport, kMaxViewports> wc_viewports {};
-	std::array<vk::Rect2D, kMaxViewports> wc_scissors {};
 	uint32_t wc_viewport_count = 0;
 	bool     wc_viewport_known = false;
+	std::array<vk::Rect2D, kMaxViewports> wc_scissors {};
+	uint32_t wc_scissor_count = 0;
+	bool     wc_scissor_known = false;
 	uint32_t vp_first          = 0;
 	uint32_t vp_count          = 0;
 	std::array<vk::Viewport, kMaxViewports> vp_viewports {};
@@ -60,9 +63,6 @@ struct RecordedStateCache {
 	uint32_t vp_scissor_count = 0;
 	std::array<vk::Rect2D, kMaxViewports> vp_scissors {};
 	bool vp_scissor_known = false;
-	uint32_t wc_pending_count = 0;
-	std::array<vk::Viewport, kMaxViewports> wc_pending_viewports {};
-	bool wc_pending = false;
 
 	float line_width       = 0.0f;
 	bool  line_width_known = false;
@@ -124,7 +124,7 @@ struct RecordedStateCache {
 	void NoteRawComputePipeline() { compute_pipeline_known = false; }
 	void NoteRawViewportScissor() {
 		wc_viewport_known = false;
-		wc_pending        = false;
+		wc_scissor_known  = false;
 		vp_viewport_known = false;
 		vp_scissor_known  = false;
 	}
@@ -151,7 +151,7 @@ struct RecordedStateCache {
 		stencil_back.reference_known       = false;
 		color_write_known                  = false;
 		wc_viewport_known                  = false;
-		wc_pending                         = false;
+		wc_scissor_known                   = false;
 		vp_viewport_known                  = false;
 		vp_scissor_known                   = false;
 	}
