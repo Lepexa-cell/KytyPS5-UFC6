@@ -1326,6 +1326,8 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 PipelineCache::~PipelineCache() {
 	Save();
+	m_pipeline_last_valid    = false;
+	m_pipeline_last_pipeline = nullptr;
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
 			(void)key;
@@ -1678,6 +1680,30 @@ bool PipelineCache::FinishPending(Pipeline& pipeline) {
 	return true;
 }
 
+// KYTY_OPT_PIPELINE_LAST_HIT fast path: every input the map hashes is packed into one compact
+// key first. On field equality with the previous draw the full GraphicsPipelineKey build, XXH3
+// hash and unordered_map lookup are skipped and the map-owned Pipeline* is reused; FinishPending
+// still runs on it, so deferred compiles resolve exactly as on the slow path.
+static GraphicsPipelineLastKey BuildPipelineLastKey(
+    uint32_t color_count, const std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX>& color_formats,
+    vk::Format depth_format, vk::Format stencil_format, std::array<uint64_t, 3> vertex_shader_ids,
+    uint64_t ps_shader_id, const PipelineVertexInputState& vertex_input,
+    const PipelineStaticParameters& static_params) {
+	GraphicsPipelineLastKey key {};
+	key.color_count       = color_count;
+	key.color_formats     = color_formats;
+	key.depth_format      = depth_format;
+	key.stencil_format    = stencil_format;
+	key.vertex_shader_ids = vertex_shader_ids;
+	key.ps_shader_id      = ps_shader_id;
+	key.binding_count     = vertex_input.binding_count;
+	key.attribute_count   = vertex_input.attribute_count;
+	key.bindings          = vertex_input.bindings;
+	key.attributes        = vertex_input.attributes;
+	key.static_params     = static_params;
+	return key;
+}
+
 PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1828,6 +1854,70 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
 	NormalizeGraphicsPipelineKey(static_params);
 
+	if (PipelineLastHitEnabled() && vs_input_info.stage.program->stage != ShaderType::Mesh &&
+	    vs_input_info.buffers_num >= 0 &&
+	    vs_input_info.buffers_num <= ShaderVertexInputInfo::RES_MAX &&
+	    vs_input_info.resources_num >= 0 &&
+	    vs_input_info.resources_num <= ShaderVertexInputInfo::RES_MAX) {
+		std::array<uint64_t, 3> last_vs_ids {};
+		for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+			last_vs_ids[i] = programs.vertex[i].id;
+		}
+		if (m_pipeline_last_valid && rendering.color_count == m_pipeline_last_key.color_count &&
+		    rendering.depth_format == m_pipeline_last_key.depth_format &&
+		    rendering.stencil_format == m_pipeline_last_key.stencil_format &&
+		    last_vs_ids == m_pipeline_last_key.vertex_shader_ids &&
+		    ps_id == m_pipeline_last_key.ps_shader_id &&
+		    vs_input_info.buffers_num == m_pipeline_last_key.binding_count &&
+		    vs_input_info.resources_num == m_pipeline_last_key.attribute_count) {
+			PipelineVertexInputState last_vertex_input {};
+			last_vertex_input.binding_count = static_cast<uint8_t>(vs_input_info.buffers_num);
+			last_vertex_input.attribute_count =
+			    static_cast<uint8_t>(vs_input_info.resources_num);
+			for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
+				const auto& buffer              = vs_input_info.buffers[binding];
+				last_vertex_input.bindings[binding] = {.stride   = buffer.stride,
+				                                       .instance = buffer.fetch_index != 0};
+			}
+			bool attributes_valid = true;
+			for (int attribute = 0; attribute < vs_input_info.resources_num; attribute++) {
+				const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
+				if (binding < 0 || binding >= vs_input_info.buffers_num) {
+					attributes_valid = false;
+					break;
+				}
+				last_vertex_input.attributes[attribute] = {
+				    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
+				                                    vs_input_info.buffers[binding].addr),
+				    .binding = static_cast<uint8_t>(binding),
+				};
+			}
+			if (attributes_valid) {
+				const auto last_key =
+				    BuildPipelineLastKey(rendering.color_count, rendering.color_formats,
+				                         rendering.depth_format, rendering.stencil_format,
+				                         last_vs_ids, ps_id, last_vertex_input, static_params);
+				// Field-exact compare over the compact key instead of the XXH3 + map lookup below.
+				// All hashed inputs are in the key, including both vertex-input arrays.
+				if (last_key == m_pipeline_last_key && m_pipeline_last_pipeline != nullptr) {
+					auto& found = *m_pipeline_last_pipeline;
+					if (found.pending && !FinishPending(found)) {
+						Profiler::Add(Profiler::Counter::SkippedPipelinePending);
+						Profiler::CommandZone::Annotate("skipped: pipeline compiling");
+						if (++m_deferred_draws % 256 == 1) {
+							LOGF("PipelineCache: %" PRIu64
+							     " draws skipped while their pipeline compiled in the "
+							     "background\n",
+							     m_deferred_draws);
+						}
+						return nullptr;
+					}
+					return &found;
+				}
+			}
+		}
+	}
+
 	if (vs_input_info.stage.program->stage != ShaderType::Mesh) {
 		EXIT_IF(vs_input_info.buffers_num < 0 ||
 		        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX ||
@@ -1882,6 +1972,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		if (found.pending && !FinishPending(found)) {
 			return defer();
 		}
+		if (PipelineLastHitEnabled() && vs_input_info.stage.program->stage != ShaderType::Mesh) {
+			std::array<uint64_t, 3> last_vs_ids {};
+			for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+				last_vs_ids[i] = programs.vertex[i].id;
+			}
+			m_pipeline_last_key =
+			    BuildPipelineLastKey(rendering.color_count, rendering.color_formats,
+			                         rendering.depth_format, rendering.stencil_format, last_vs_ids,
+			                         ps_id, key.vertex_input, static_params);
+			m_pipeline_last_pipeline = &found;
+			m_pipeline_last_valid    = true;
+		}
 		return &found;
 	}
 
@@ -1927,6 +2029,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 		if (!FinishPending(pipeline)) {
 			return defer();
 		}
+		if (PipelineLastHitEnabled() && vs_input_info.stage.program->stage != ShaderType::Mesh) {
+			std::array<uint64_t, 3> last_vs_ids {};
+			for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+				last_vs_ids[i] = programs.vertex[i].id;
+			}
+			m_pipeline_last_key =
+			    BuildPipelineLastKey(rendering.color_count, rendering.color_formats,
+			                         rendering.depth_format, rendering.stencil_format, last_vs_ids,
+			                         ps_id, iter->first.vertex_input, static_params);
+			m_pipeline_last_pipeline = &pipeline;
+			m_pipeline_last_valid    = true;
+		}
 		LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 		return &pipeline;
 	}
@@ -1943,6 +2057,18 @@ PipelineCache::Pipeline* PipelineCache::TryGetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
+	if (PipelineLastHitEnabled() && vs_input_info.stage.program->stage != ShaderType::Mesh) {
+		std::array<uint64_t, 3> last_vs_ids {};
+		for (uint32_t i = 0; i < programs.vertex.size(); i++) {
+			last_vs_ids[i] = programs.vertex[i].id;
+		}
+		m_pipeline_last_key =
+		    BuildPipelineLastKey(rendering.color_count, rendering.color_formats,
+		                         rendering.depth_format, rendering.stencil_format, last_vs_ids, ps_id,
+		                         iter->first.vertex_input, static_params);
+		m_pipeline_last_pipeline = iter->second.get();
+		m_pipeline_last_valid    = true;
+	}
 	return iter->second.get();
 }
 

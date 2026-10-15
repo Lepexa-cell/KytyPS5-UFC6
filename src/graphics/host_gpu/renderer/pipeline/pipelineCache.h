@@ -97,6 +97,32 @@ struct PipelineVertexInputState {
 	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
+// Compact MRU key for the hottest repeated draw: all fields TryGetGraphicsPipeline hashes into
+// the pipeline map (rendering formats/count, shader ids, vertex input, static params blob).
+// POD + fixed arrays only, compared field-by-field (never memcmp: padding bytes are unwritten).
+struct GraphicsPipelineLastKey {
+	uint32_t                                             color_count = UINT32_MAX;
+	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
+	vk::Format                                           depth_format   = vk::Format::eUndefined;
+	vk::Format                                           stencil_format = vk::Format::eUndefined;
+	std::array<uint64_t, 3>                              vertex_shader_ids {};
+	uint64_t                                             ps_shader_id = 0;
+	uint8_t                                              binding_count   = 0;
+	uint8_t                                              attribute_count = 0;
+	std::array<PipelineVertexInputState::Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
+	std::array<PipelineVertexInputState::Attribute, ShaderVertexInputInfo::RES_MAX> attributes {};
+	PipelineStaticParameters                                                         static_params {};
+
+	bool operator==(const GraphicsPipelineLastKey& other) const noexcept {
+		return color_count == other.color_count && color_formats == other.color_formats &&
+		       depth_format == other.depth_format && stencil_format == other.stencil_format &&
+		       vertex_shader_ids == other.vertex_shader_ids &&
+		       ps_shader_id == other.ps_shader_id && binding_count == other.binding_count &&
+		       attribute_count == other.attribute_count && bindings == other.bindings &&
+		       attributes == other.attributes && static_params == other.static_params;
+	}
+};
+
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
@@ -241,6 +267,15 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// KYTY_OPT_PIPELINE_LAST_HIT (default on): single-entry MRU over the map above. A repeated
+	// draw with identical inputs skips the GraphicsPipelineKey build, XXH3 hash and map lookup
+	// and reuses the same Pipeline* the map holds (owned by m_graphics_pipelines, so the
+	// pointer stays valid while the entry lives; cleared on Save/destroy with the map).
+	// Key equality is field-exact over every input the map hashes; FinishPending still runs on
+	// the reused entry, so a deferred compile resolves exactly as on the slow path.
+	bool                   m_pipeline_last_valid = false;
+	GraphicsPipelineLastKey m_pipeline_last_key {};
+	Pipeline*              m_pipeline_last_pipeline = nullptr;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unique_ptr<PipelineCompiler>                       m_compiler;
 	uint64_t                                                m_deferred_draws = 0;

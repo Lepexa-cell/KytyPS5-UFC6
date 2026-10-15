@@ -48,6 +48,17 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return enabled;
 }
 
+// KYTY_OPT_PIPELINE_LAST_HIT=0 restores the full GraphicsPipelineKey hash + map lookup on every
+// draw (default: reuse the last pipeline when the compact key matches).
+// CPU-only change: MaterializeResources/specialization/invalidation are untouched.
+[[nodiscard]] inline bool PipelineLastHitEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_PIPELINE_LAST_HIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 // KYTY_OPT_SUBMIT_TELEMETRY=0 disables the per-submit cause accounting below
 // (default: enabled). Diagnostic only: all submits take the same code path either way.
 [[nodiscard]] inline bool SubmitTelemetryEnabled() {
