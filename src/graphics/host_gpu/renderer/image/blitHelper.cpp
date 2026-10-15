@@ -151,6 +151,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	auto& command_buffer = m_scheduler.Current();
 	auto  command        = command_buffer.Handle();
+	// The raw handle below serves barriers, rendering commands and push descriptors, none
+	// of which the shadow tracks. The pipeline/viewport/scissor writes go through the
+	// recorder further down, so the shadow stays in sync with the recorded state.
 	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {},
 	               command);
 	destination.Transit(ColorToMsDepthLayout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {},
@@ -179,8 +182,13 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	descriptor_write.pImageInfo      = &descriptor_image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_pipeline_layout, 0, 1,
 	                             &descriptor_write);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics,
-	                     GetPipeline({destination_info.samples, destination_info.pixel_format}));
+	// Route state writes through the recorder so the shadow stays in sync (a skipped bind
+	// here must not desync later draws, and a repeated blit should skip its own bind).
+	// The raw handle below still serves barriers and rendering commands, which the
+	// shadow does not track.
+	auto recorder = command_buffer.Recorder();
+	recorder.bindPipeline(vk::PipelineBindPoint::eGraphics,
+	                      GetPipeline({destination_info.samples, destination_info.pixel_format}));
 
 	const vk::Viewport viewport {0.0f,
 	                             0.0f,
@@ -190,9 +198,9 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	                             1.0f};
 	const vk::Rect2D   scissor {{0, 0},
 	                            {destination_info.extent.width, destination_info.extent.height}};
-	command.setViewport(0, 1, &viewport);
-	command.setScissor(0, 1, &scissor);
-	command.draw(3, 1, 0, 0);
+	recorder.setViewport(0, 1, &viewport);
+	recorder.setScissor(0, 1, &scissor);
+	recorder.draw(3, 1, 0, 0);
 	command.endRendering();
 }
 

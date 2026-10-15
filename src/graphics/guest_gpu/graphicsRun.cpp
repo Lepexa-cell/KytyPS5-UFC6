@@ -1915,6 +1915,13 @@ void TelemetryEndFrame() {
 			         : 0.0,
 			     static_cast<unsigned>(telemetry.cache_candidates_max),
 			     static_cast<unsigned>(telemetry.cache_images));
+			// Command-recording dedup: pipeline binds and dynamic-state commands emitted
+			// into command buffers vs skipped as redundant (averages per frame).
+			LOGF("[FRAME_TELEMETRY_RECORD] binds emitted %.1f skipped %.1f | dynamic emitted %.1f skipped %.1f\n",
+			     static_cast<double>(telemetry.record_pipeline_emitted) * inv_frames,
+			     static_cast<double>(telemetry.record_pipeline_skipped) * inv_frames,
+			     static_cast<double>(telemetry.record_dynamic_emitted) * inv_frames,
+			     static_cast<double>(telemetry.record_dynamic_skipped) * inv_frames);
 			LOGF("[FRAME_TELEMETRY_CLEAR] Clear: lookup %.2f ms insert %.2f ms overlap %.2f ms expand %.2f ms refresh %.2f ms clear %.2f ms (tracker %.2f ms gpuwait %.2f ms readback %.2f ms writeback %.2f ms)\n",
 			     static_cast<double>(telemetry.draw_targets_cache_lookup_us) * frame_avg,
 			     static_cast<double>(telemetry.draw_targets_cache_insert_us) * frame_avg,

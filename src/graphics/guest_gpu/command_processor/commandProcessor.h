@@ -222,6 +222,13 @@ struct FrameTelemetry {
 	uint32_t cache_candidates_total = 0;
 	uint32_t cache_candidates_max = 0;
 	uint32_t cache_images = 0;
+	// Command-recording dedup (RecordedStateCache): vkCmdBindPipeline and dynamic-state
+	// commands actually emitted vs skipped as redundant. Compact counters only, no
+	// per-command timing. GPU thread only.
+	uint32_t record_pipeline_emitted = 0;
+	uint32_t record_pipeline_skipped = 0;
+	uint32_t record_dynamic_emitted = 0;
+	uint32_t record_dynamic_skipped = 0;
 };
 
 inline FrameTelemetry& GetFrameTelemetry() {

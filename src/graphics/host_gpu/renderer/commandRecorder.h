@@ -2,11 +2,13 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDRECORDER_H_
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 namespace Libs::Graphics {
 
@@ -27,8 +29,30 @@ public:
 	[[nodiscard]] bool operator==(std::nullptr_t) const noexcept {
 		return m_direct == nullptr && m_scheduler == nullptr;
 	}
+	// Direct-mode recorders still compare against the scheduler's shadow: CommandBuffer
+	// passes its scheduler even when it hands out the raw command buffer, so dedup works
+	// identically in both modes (see context.cpp Recorder()).
+	void BindScheduler(CommandScheduler& scheduler) { m_scheduler = &scheduler; }
 
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
+		if (m_scheduler != nullptr && RecordPipelineCacheEnabled()) {
+			auto&                          cache = m_scheduler->RecordCache();
+			vk::Pipeline&                  known_pipeline = bind_point == vk::PipelineBindPoint::eCompute
+				                                                ? cache.compute_pipeline
+				                                                : cache.graphics_pipeline;
+			bool&                          known = bind_point == vk::PipelineBindPoint::eCompute
+				                                       ? cache.compute_pipeline_known
+				                                       : cache.graphics_pipeline_known;
+			// A graphics bind never touches the compute entry and vice versa: each half of
+			// the pair is compared only against its own bind point.
+			if (known && known_pipeline == pipeline) {
+				GetFrameTelemetry().record_pipeline_skipped++;
+				return;
+			}
+			known_pipeline = pipeline;
+			known          = true;
+			GetFrameTelemetry().record_pipeline_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.bindPipeline(bind_point, pipeline); });
 	}
 	void draw(uint32_t vertices, uint32_t instances, uint32_t first_vertex,
@@ -337,7 +361,13 @@ public:
 	}
 	void setViewportWithCount(uint32_t count, const vk::Viewport* viewports) const {
 		if (!Threaded()) {
+			if (!RecordViewportWc(count, viewports, nullptr, 0, true)) {
+				return;
+			}
 			m_direct.setViewportWithCount(count, viewports);
+			return;
+		}
+		if (!RecordViewportWc(count, viewports, nullptr, 0, true)) {
 			return;
 		}
 		const auto* v = m_scheduler->Stash(viewports, count);
@@ -346,66 +376,329 @@ public:
 	}
 	void setScissorWithCount(uint32_t count, const vk::Rect2D* scissors) const {
 		if (!Threaded()) {
+			if (!RecordViewportWc(0, nullptr, scissors, count, false)) {
+				return;
+			}
 			m_direct.setScissorWithCount(count, scissors);
+			return;
+		}
+		if (!RecordViewportWc(0, nullptr, scissors, count, false)) {
 			return;
 		}
 		const auto* s = m_scheduler->Stash(scissors, count);
 		m_scheduler->Record(
 		    [=](vk::CommandBuffer command) { command.setScissorWithCount(count, s); });
 	}
+	// Non-WithCount form used by the blit helper: distinct Vulkan dynamic state, tracked
+	// in its own shadow entry (never compared against WithCount values). Viewport and
+	// scissor are independent commands: each compares only its own values.
+	void setViewport(uint32_t first, uint32_t count, const vk::Viewport* viewports) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			const bool same =
+			    cache.vp_viewport_known && cache.vp_first == first && cache.vp_count == count &&
+			    count <= RecordedStateCache::kMaxViewports &&
+			    ViewportsEqual(cache.vp_viewports.data(), viewports, count);
+			if (same) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			if (count <= RecordedStateCache::kMaxViewports) {
+				if (count != 0) {
+					std::memcpy(cache.vp_viewports.data(), viewports,
+					            count * sizeof(vk::Viewport));
+				}
+				cache.vp_first          = first;
+				cache.vp_count          = count;
+				cache.vp_viewport_known = true;
+			} else {
+				cache.vp_viewport_known = false;
+			}
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
+		if (!Threaded()) {
+			m_direct.setViewport(first, count, viewports);
+			return;
+		}
+		const auto* v = m_scheduler->Stash(viewports, count);
+		m_scheduler->Record(
+		    [=](vk::CommandBuffer command) { command.setViewport(first, count, v); });
+	}
+	void setScissor(uint32_t first, uint32_t count, const vk::Rect2D* scissors) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			const bool same =
+			    cache.vp_scissor_known && cache.vp_scissor_first == first &&
+			    cache.vp_scissor_count == count && count <= RecordedStateCache::kMaxViewports &&
+			    ScissorsEqual(cache.vp_scissors.data(), scissors, count);
+			if (same) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			if (count <= RecordedStateCache::kMaxViewports) {
+				if (count != 0) {
+					std::memcpy(cache.vp_scissors.data(), scissors, count * sizeof(vk::Rect2D));
+				}
+				cache.vp_scissor_first = first;
+				cache.vp_scissor_count = count;
+				cache.vp_scissor_known = true;
+			} else {
+				cache.vp_scissor_known = false;
+			}
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
+		if (!Threaded()) {
+			m_direct.setScissor(first, count, scissors);
+			return;
+		}
+		const auto* s = m_scheduler->Stash(scissors, count);
+		m_scheduler->Record(
+		    [=](vk::CommandBuffer command) { command.setScissor(first, count, s); });
+	}
 	void setLineWidth(float width) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.line_width_known &&
+			    std::memcmp(&cache.line_width, &width, sizeof(float)) == 0) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.line_width       = width;
+			cache.line_width_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setLineWidth(width); });
 	}
 	void setBlendConstants(const float constants[4]) const {
 		const std::array<float, 4> values {constants[0], constants[1], constants[2], constants[3]};
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.blend_constants_known && cache.blend_constants == values) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.blend_constants       = values;
+			cache.blend_constants_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setBlendConstants(values.data()); });
 	}
 	void setCullMode(vk::CullModeFlags mode) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.cull_mode_known && cache.cull_mode == mode) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.cull_mode       = mode;
+			cache.cull_mode_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setCullMode(mode); });
 	}
 	void setFrontFace(vk::FrontFace face) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.front_face_known && cache.front_face == face) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.front_face       = face;
+			cache.front_face_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setFrontFace(face); });
 	}
 	void setDepthBoundsTestEnable(vk::Bool32 enable) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_bounds_test_enable_known && cache.depth_bounds_test_enable == enable) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_bounds_test_enable       = enable;
+			cache.depth_bounds_test_enable_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBoundsTestEnable(enable); });
 	}
 	void setDepthBounds(float min_bounds, float max_bounds) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_bounds_known && cache.depth_min_bounds == min_bounds &&
+			    cache.depth_max_bounds == max_bounds) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_min_bounds   = min_bounds;
+			cache.depth_max_bounds   = max_bounds;
+			cache.depth_bounds_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBounds(min_bounds, max_bounds); });
 	}
 	void setDepthTestEnable(vk::Bool32 enable) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_test_enable_known && cache.depth_test_enable == enable) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_test_enable       = enable;
+			cache.depth_test_enable_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthTestEnable(enable); });
 	}
 	void setDepthWriteEnable(vk::Bool32 enable) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_write_enable_known && cache.depth_write_enable == enable) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_write_enable       = enable;
+			cache.depth_write_enable_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthWriteEnable(enable); });
 	}
 	void setDepthCompareOp(vk::CompareOp op) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_compare_op_known && cache.depth_compare_op == op) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_compare_op       = op;
+			cache.depth_compare_op_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthCompareOp(op); });
 	}
 	void setDepthBiasEnable(vk::Bool32 enable) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_bias_enable_known && cache.depth_bias_enable == enable) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_bias_enable       = enable;
+			cache.depth_bias_enable_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBiasEnable(enable); });
 	}
 	void setDepthBias(float constant, float clamp, float slope) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.depth_bias_known && cache.depth_bias_constant == constant &&
+			    cache.depth_bias_clamp == clamp && cache.depth_bias_slope == slope) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.depth_bias_constant = constant;
+			cache.depth_bias_clamp    = clamp;
+			cache.depth_bias_slope    = slope;
+			cache.depth_bias_known    = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setDepthBias(constant, clamp, slope); });
 	}
 	void setStencilTestEnable(vk::Bool32 enable) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (cache.stencil_test_enable_known && cache.stencil_test_enable == enable) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			cache.stencil_test_enable       = enable;
+			cache.stencil_test_enable_known = true;
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilTestEnable(enable); });
 	}
 	void setStencilOp(vk::StencilFaceFlags face, vk::StencilOp fail, vk::StencilOp pass,
 	                  vk::StencilOp depth_fail, vk::CompareOp compare) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			// eStencilOp is declared dynamic by every renderer graphics pipeline (see
+			// shaders.cpp dynamic_states); the helper graphics pipelines never record
+			// stencil state, so a value comparison is valid here.
+			if (StencilOpMatches(cache, face, fail, pass, depth_fail, compare)) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			StencilOpUpdate(cache, face, fail, pass, depth_fail, compare);
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) {
 			command.setStencilOp(face, fail, pass, depth_fail, compare);
 		});
 	}
 	void setStencilCompareMask(vk::StencilFaceFlags face, uint32_t mask) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (StencilMaskMatches(cache, face, mask, true)) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			StencilMaskUpdate(cache, face, mask, true);
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilCompareMask(face, mask); });
 	}
 	void setStencilWriteMask(vk::StencilFaceFlags face, uint32_t mask) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (StencilMaskMatches(cache, face, mask, false)) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			StencilMaskUpdate(cache, face, mask, false);
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilWriteMask(face, mask); });
 	}
 	void setStencilReference(vk::StencilFaceFlags face, uint32_t reference) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			if (StencilReferenceMatches(cache, face, reference)) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			StencilReferenceUpdate(cache, face, reference);
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) { command.setStencilReference(face, reference); });
 	}
 	void setColorWriteEnableEXT(uint32_t count, const vk::Bool32* enables) const {
+		if (m_scheduler != nullptr && RecordDynamicCacheEnabled()) {
+			auto& cache = m_scheduler->RecordCache();
+			// eColorWriteEnableEXT exists only when the pipeline declares it (renderer
+			// pipelines with color_count != 0, never on macOS): the only recorder caller
+			// runs right after binding such a pipeline, and helper pipelines never call
+			// this. Count is part of the comparison; only the first `count` entries are
+			// compared.
+			const bool same = cache.color_write_known && cache.color_write_count == count &&
+			                  count <= RecordedStateCache::kMaxColorAttachments &&
+			                  ColorWriteEqual(cache.color_write_enables.data(), enables, count);
+			if (same) {
+				GetFrameTelemetry().record_dynamic_skipped++;
+				return;
+			}
+			if (count <= RecordedStateCache::kMaxColorAttachments) {
+				if (count != 0) {
+					std::memcpy(cache.color_write_enables.data(), enables,
+					            count * sizeof(vk::Bool32));
+				}
+				cache.color_write_count = count;
+				cache.color_write_known = true;
+			} else {
+				cache.color_write_known = false;
+			}
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		if (!Threaded()) {
 			m_direct.setColorWriteEnableEXT(count, enables);
 			return;
@@ -415,12 +708,170 @@ public:
 		    [=](vk::CommandBuffer command) { command.setColorWriteEnableEXT(count, e); });
 	}
 	void setAttachmentFeedbackLoopEnableEXT(vk::ImageAspectFlags aspects) const {
+		// Single draw-time caller whose value follows the bound pipeline's feedback state;
+		// with no validity signal to compare safely, always record.
+		if (m_scheduler != nullptr) {
+			GetFrameTelemetry().record_dynamic_emitted++;
+		}
 		Run([=](vk::CommandBuffer command) {
 			command.setAttachmentFeedbackLoopEnableEXT(aspects);
 		});
 	}
 
 private:
+	// Bitwise float compare: SetGraphicsDynamicParams copies register bits verbatim, so
+	// equal values must produce equal bits (no arithmetic reaches the recorder).
+	static bool FloatBitsEqual(float a, float b) {
+		uint32_t ua = 0;
+		uint32_t ub = 0;
+		std::memcpy(&ua, &a, sizeof(float));
+		std::memcpy(&ub, &b, sizeof(float));
+		return ua == ub;
+	}
+	static bool ViewportsEqual(const vk::Viewport* a, const vk::Viewport* b, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (!FloatBitsEqual(a[i].x, b[i].x) || !FloatBitsEqual(a[i].y, b[i].y) ||
+			    !FloatBitsEqual(a[i].width, b[i].width) ||
+			    !FloatBitsEqual(a[i].height, b[i].height) ||
+			    !FloatBitsEqual(a[i].minDepth, b[i].minDepth) ||
+			    !FloatBitsEqual(a[i].maxDepth, b[i].maxDepth)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	static bool ScissorsEqual(const vk::Rect2D* a, const vk::Rect2D* b, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (a[i].offset.x != b[i].offset.x || a[i].offset.y != b[i].offset.y ||
+			    a[i].extent.width != b[i].extent.width ||
+			    a[i].extent.height != b[i].extent.height) {
+				return false;
+			}
+		}
+		return true;
+	}
+	static bool ColorWriteEqual(const vk::Bool32* a, const vk::Bool32* b, uint32_t count) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (a[i] != b[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
+	// Stencil state is per-face Vulkan state: front-only updates compare only the front
+	// entry. Combined front+back updates compare both, so neither face suppresses the other.
+	static bool StencilOpFaceMatches(const RecordedStateCache::StencilFaceState& state,
+	                                 vk::StencilOp fail, vk::StencilOp pass,
+	                                 vk::StencilOp depth_fail, vk::CompareOp compare) {
+		return state.op_known && state.op_fail == fail && state.op_pass == pass &&
+		       state.op_depth_fail == depth_fail && state.op_compare == compare;
+	}
+	static bool StencilOpMatches(const RecordedStateCache& cache, vk::StencilFaceFlags face,
+	                             vk::StencilOp fail, vk::StencilOp pass, vk::StencilOp depth_fail,
+	                             vk::CompareOp compare) {
+		const bool front = (face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {};
+		const bool back  = (face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {};
+		if (front && !StencilOpFaceMatches(cache.stencil_front, fail, pass, depth_fail, compare)) {
+			return false;
+		}
+		if (back && !StencilOpFaceMatches(cache.stencil_back, fail, pass, depth_fail, compare)) {
+			return false;
+		}
+		return front || back;
+	}
+	static void StencilOpFaceUpdate(RecordedStateCache::StencilFaceState& state,
+	                                vk::StencilOp fail, vk::StencilOp pass,
+	                                vk::StencilOp depth_fail, vk::CompareOp compare) {
+		state.op_fail       = fail;
+		state.op_pass       = pass;
+		state.op_depth_fail = depth_fail;
+		state.op_compare    = compare;
+		state.op_known      = true;
+	}
+	static void StencilOpUpdate(RecordedStateCache& cache, vk::StencilFaceFlags face,
+	                            vk::StencilOp fail, vk::StencilOp pass, vk::StencilOp depth_fail,
+	                            vk::CompareOp compare) {
+		if ((face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {}) {
+			StencilOpFaceUpdate(cache.stencil_front, fail, pass, depth_fail, compare);
+		}
+		if ((face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {}) {
+			StencilOpFaceUpdate(cache.stencil_back, fail, pass, depth_fail, compare);
+		}
+	}
+	static bool StencilMaskMatches(const RecordedStateCache& cache, vk::StencilFaceFlags face,
+	                               uint32_t mask, bool compare_mask) {
+		const bool front = (face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {};
+		const bool back  = (face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {};
+		if (front) {
+			const auto& state = cache.stencil_front;
+			const bool  known = compare_mask ? state.compare_mask_known : state.write_mask_known;
+			const auto  value = compare_mask ? state.compare_mask : state.write_mask;
+			if (!known || value != mask) {
+				return false;
+			}
+		}
+		if (back) {
+			const auto& state = cache.stencil_back;
+			const bool  known = compare_mask ? state.compare_mask_known : state.write_mask_known;
+			const auto  value = compare_mask ? state.compare_mask : state.write_mask;
+			if (!known || value != mask) {
+				return false;
+			}
+		}
+		return front || back;
+	}
+	static void StencilMaskUpdate(RecordedStateCache& cache, vk::StencilFaceFlags face,
+	                              uint32_t mask, bool compare_mask) {
+		if ((face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {}) {
+			auto& state = cache.stencil_front;
+			if (compare_mask) {
+				state.compare_mask       = mask;
+				state.compare_mask_known = true;
+			} else {
+				state.write_mask       = mask;
+				state.write_mask_known = true;
+			}
+		}
+		if ((face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {}) {
+			auto& state = cache.stencil_back;
+			if (compare_mask) {
+				state.compare_mask       = mask;
+				state.compare_mask_known = true;
+			} else {
+				state.write_mask       = mask;
+				state.write_mask_known = true;
+			}
+		}
+	}
+	static bool StencilReferenceMatches(const RecordedStateCache& cache,
+	                                    vk::StencilFaceFlags face, uint32_t reference) {
+		const bool front = (face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {};
+		const bool back  = (face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {};
+		if (front) {
+			const auto& state = cache.stencil_front;
+			if (!state.reference_known || state.reference != reference) {
+				return false;
+			}
+		}
+		if (back) {
+			const auto& state = cache.stencil_back;
+			if (!state.reference_known || state.reference != reference) {
+				return false;
+			}
+		}
+		return front || back;
+	}
+	static void StencilReferenceUpdate(RecordedStateCache& cache, vk::StencilFaceFlags face,
+	                                   uint32_t reference) {
+		if ((face & vk::StencilFaceFlagBits::eFront) != vk::StencilFaceFlags {}) {
+			cache.stencil_front.reference       = reference;
+			cache.stencil_front.reference_known = true;
+		}
+		if ((face & vk::StencilFaceFlagBits::eBack) != vk::StencilFaceFlags {}) {
+			cache.stencil_back.reference       = reference;
+			cache.stencil_back.reference_known = true;
+		}
+	}
 	template <typename F>
 	void Run(F&& fn) const {
 		if (!Threaded()) {

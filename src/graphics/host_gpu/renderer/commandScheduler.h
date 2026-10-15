@@ -6,9 +6,11 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <atomic>
@@ -26,6 +28,167 @@ namespace Libs::Graphics {
 
 uint32_t DrawFlushInterval();
 void     LogDrawFlushInterval();
+
+// Shadow of the Vulkan state already recorded into the command buffer being written.
+// Owned by CommandScheduler (one instance, reset at every BeginCommand), compared and
+// updated on the GPU thread only: CommandRecorder methods run there in both direct and
+// threaded modes (threaded only queues lambdas; the recording thread executes them later
+// and never touches this struct). Never stored on CommandRecorder: recorder temporaries
+// are created per call site and would leak state across command buffers.
+struct RecordedStateCache {
+	// Graphics and compute pipeline binds are independent Vulkan state: tracked
+	// separately, so a compute bind never suppresses a graphics bind and vice versa.
+	vk::Pipeline graphics_pipeline       = nullptr;
+	bool          graphics_pipeline_known = false;
+	vk::Pipeline compute_pipeline       = nullptr;
+	bool          compute_pipeline_known = false;
+
+	// Viewport/scissor pairs: draws write them via WithCount, the blit helper via the
+	// firstViewport/firstScissor form. These are distinct Vulkan dynamic states
+	// (eViewportWithCount vs eViewport), so each form has its own entry; count (and
+	// first, for the non-WithCount form) is part of the comparison, arrays fully.
+	static constexpr uint32_t kMaxViewports = 16;
+	std::array<vk::Viewport, kMaxViewports> wc_viewports {};
+	std::array<vk::Rect2D, kMaxViewports> wc_scissors {};
+	uint32_t wc_viewport_count = 0;
+	bool     wc_viewport_known = false;
+	uint32_t vp_first          = 0;
+	uint32_t vp_count          = 0;
+	std::array<vk::Viewport, kMaxViewports> vp_viewports {};
+	bool vp_viewport_known = false;
+	uint32_t vp_scissor_first = 0;
+	uint32_t vp_scissor_count = 0;
+	std::array<vk::Rect2D, kMaxViewports> vp_scissors {};
+	bool vp_scissor_known = false;
+	uint32_t wc_pending_count = 0;
+	std::array<vk::Viewport, kMaxViewports> wc_pending_viewports {};
+	bool wc_pending = false;
+
+	float line_width       = 0.0f;
+	bool  line_width_known = false;
+	std::array<float, 4> blend_constants {};
+	bool                 blend_constants_known = false;
+	vk::CullModeFlags cull_mode       = {};
+	bool              cull_mode_known = false;
+	vk::FrontFace front_face       = {};
+	bool          front_face_known = false;
+	vk::Bool32 depth_bounds_test_enable       = VK_FALSE;
+	bool       depth_bounds_test_enable_known = false;
+	float depth_min_bounds       = 0.0f;
+	float depth_max_bounds       = 0.0f;
+	bool  depth_bounds_known     = false;
+	vk::Bool32 depth_test_enable       = VK_FALSE;
+	bool       depth_test_enable_known = false;
+	vk::Bool32 depth_write_enable       = VK_FALSE;
+	bool       depth_write_enable_known = false;
+	vk::CompareOp depth_compare_op       = {};
+	bool          depth_compare_op_known = false;
+	vk::Bool32 depth_bias_enable       = VK_FALSE;
+	bool       depth_bias_enable_known = false;
+	float depth_bias_constant = 0.0f;
+	float depth_bias_clamp    = 0.0f;
+	float depth_bias_slope    = 0.0f;
+	bool  depth_bias_known    = false;
+	vk::Bool32 stencil_test_enable       = VK_FALSE;
+	bool       stencil_test_enable_known = false;
+	// Stencil ops/masks/references are per-face Vulkan state; front and back tracked
+	// separately so an update to one face never suppresses the other.
+	struct StencilFaceState {
+		vk::StencilOp op_fail       = {};
+		vk::StencilOp op_pass       = {};
+		vk::StencilOp op_depth_fail = {};
+		vk::CompareOp op_compare    = {};
+		bool          op_known      = false;
+		uint32_t compare_mask       = 0;
+		bool     compare_mask_known = false;
+		uint32_t write_mask         = 0;
+		bool     write_mask_known   = false;
+		uint32_t reference          = 0;
+		bool     reference_known    = false;
+	};
+	StencilFaceState stencil_front {};
+	StencilFaceState stencil_back {};
+	// Color-write enables are per-attachment state with a dynamic count: the count is
+	// part of the comparison, and only the first `count` entries are compared.
+	static constexpr uint32_t kMaxColorAttachments = 8;
+	std::array<vk::Bool32, kMaxColorAttachments> color_write_enables {};
+	uint32_t color_write_count = 0;
+	bool     color_write_known = false;
+
+	void Reset() { *this = RecordedStateCache {}; }
+	// A raw graphics bind outside the recorder changes bound-pipeline state without
+	// touching dynamic values: drop only the graphics entry, keep dynamic comparisons.
+	// A raw dynamic write is unknown: drop the matching dynamic entry so the next
+	// compared write records unconditionally.
+	void NoteRawGraphicsPipeline() { graphics_pipeline_known = false; }
+	void NoteRawComputePipeline() { compute_pipeline_known = false; }
+	void NoteRawViewportScissor() {
+		wc_viewport_known = false;
+		wc_pending        = false;
+		vp_viewport_known = false;
+		vp_scissor_known  = false;
+	}
+	void NoteRawDynamicState() {
+		line_width_known                   = false;
+		blend_constants_known              = false;
+		cull_mode_known                    = false;
+		front_face_known                   = false;
+		depth_bounds_test_enable_known     = false;
+		depth_bounds_known                 = false;
+		depth_test_enable_known            = false;
+		depth_write_enable_known           = false;
+		depth_compare_op_known             = false;
+		depth_bias_enable_known            = false;
+		depth_bias_known                   = false;
+		stencil_test_enable_known          = false;
+		stencil_front.op_known             = false;
+		stencil_front.compare_mask_known   = false;
+		stencil_front.write_mask_known     = false;
+		stencil_front.reference_known      = false;
+		stencil_back.op_known              = false;
+		stencil_back.compare_mask_known    = false;
+		stencil_back.write_mask_known      = false;
+		stencil_back.reference_known       = false;
+		color_write_known                  = false;
+		wc_viewport_known                  = false;
+		wc_pending                         = false;
+		vp_viewport_known                  = false;
+		vp_scissor_known                   = false;
+	}
+};
+
+// KYTY_OPT_RECORD_STATE_CACHE (default on): skip redundant vkCmdBindPipeline and
+// dynamic-state commands when the shadow above already holds the same values.
+// =0 records everything unconditionally, as before.
+[[nodiscard]] inline bool RecordStateCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_RECORD_STATE_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_OPT_RECORD_PIPELINE_CACHE (default on): independent kill switch for the pipeline-bind
+// half of the shadow above. =0 keeps dynamic-state dedup while binding every pipeline.
+// The master KYTY_OPT_RECORD_STATE_CACHE=0 disables both halves.
+[[nodiscard]] inline bool RecordPipelineCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_RECORD_PIPELINE_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && RecordStateCacheEnabled();
+}
+
+// KYTY_OPT_RECORD_DYNAMIC_CACHE (default on): independent kill switch for the dynamic-state
+// half of the shadow above. =0 keeps pipeline-bind dedup while recording every state value.
+// The master KYTY_OPT_RECORD_STATE_CACHE=0 disables both halves.
+[[nodiscard]] inline bool RecordDynamicCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_RECORD_DYNAMIC_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled && RecordStateCacheEnabled();
+}
 
 class CommandScheduler {
 public:
@@ -149,6 +312,22 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Shadow of the Vulkan state recorded into the command buffer being written.
+	// Compared and updated on the GPU thread only (see RecordedStateCache); reset at
+	// every BeginCommand, so reuse of the same VkCommandBuffer handle starts clean.
+	[[nodiscard]] RecordedStateCache& RecordCache() noexcept { return m_record_cache; }
+	// A raw vk::CommandBuffer write outside CommandRecorder changed state behind the
+	// shadow's back: drop the matching entries so the next compared write records.
+	// GPU thread only, same ownership as the shadow itself.
+	void NoteRawPipeline(vk::PipelineBindPoint bind_point) {
+		if (bind_point == vk::PipelineBindPoint::eCompute) {
+			m_record_cache.NoteRawComputePipeline();
+		} else {
+			m_record_cache.NoteRawGraphicsPipeline();
+		}
+	}
+	void NoteRawViewportScissor() { m_record_cache.NoteRawViewportScissor(); }
+	void NoteRawDynamicState() { m_record_cache.NoteRawDynamicState(); }
 
 private:
 	class CommandPool {
@@ -240,6 +419,8 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// See RecordCache(): written state of the command buffer being recorded.
+	RecordedStateCache           m_record_cache;
 	uint32_t                     m_recorded_release_mem_writes     = 0;
 	uint32_t                     m_recorded_release_mem_interrupts = 0;
 	uint32_t                     m_recorded_draws                  = 0;

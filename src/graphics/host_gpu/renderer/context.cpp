@@ -36,7 +36,12 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 CommandRecorder CommandBuffer::Recorder() const {
 	EXIT_IF(IsInvalid());
-	return m_scheduler.Threaded() ? CommandRecorder(m_scheduler, nullptr) : CommandRecorder(m_buffer);
+	if (m_scheduler.Threaded()) {
+		return CommandRecorder(m_scheduler, nullptr);
+	}
+	CommandRecorder recorder(m_buffer);
+	recorder.BindScheduler(m_scheduler);
+	return recorder;
 }
 
 void CommandBuffer::Begin() {

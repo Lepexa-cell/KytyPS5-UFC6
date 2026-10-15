@@ -534,6 +534,12 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_open = true;
+	// The shadow describes the command buffer being written: a fresh recording starts
+	// with undefined Vulkan state, and a reused VkCommandBuffer handle carries no state
+	// across vkBeginCommandBuffer. Reset on the GPU thread, which owns both this struct
+	// and the recording calls that compare against it (the recording thread never reads
+	// it: it only executes already-filtered lambdas queued before the next reset).
+	m_record_cache.Reset();
 	// Ticks are allocated in submit order, so this command buffer will be submitted with the
 	// current one.
 	const auto tick = m_master.CurrentTick();
