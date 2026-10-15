@@ -2325,13 +2325,23 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			// the accumulated command buffer actually reaches the GPU -- safe to batch instead of
 			// paying a host vkQueueSubmit for every single fence update.
 			cp.CompleteReleaseMemWrite();
+		} else if (SubmitMergeReleaseFlushEnabled()) {
+			// Same safety shape as CompleteReleaseMemInterrupt below: the fence value was
+			// already written synchronously by WriteAtEndOfPipe32 above (memcpy into guest
+			// memory; LabelsAtCompletion is off for the interrupt path), and the guest
+			// interrupt was queued via DeferPriorityOperation on the current tick
+			// (Sync::TriggerEopEventAtEndOfPipe). Merging only delays the vkQueueSubmit
+			// that lets the tick complete -- bounded by InterruptsPerSubmission (8), the
+			// same hedge CompleteReleaseMemInterrupt already uses. =0 keeps the legacy
+			// immediate BufferFlush.
+			cp.CompleteReleaseMemInterrupt(true);
 		} else {
 			// interrupt_selector 0x01/0x02 route through WriteAtEndOfPipe's interrupt path, which
 			// schedules a callback gated on this submission's tick actually completing on the
 			// GPU -- flush now so a guest thread that may be blocked waiting on it isn't stalled
 			// behind a batching window.
 			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			cp.BufferFlush(SubmitCause::ReleaseFlush);
 		}
 
 		return 7;
@@ -2350,8 +2360,15 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
 		if (interrupt_selector == 0x01) {
-			KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
-			cp.BufferFlush();
+			if (SubmitMergeReleaseFlushEnabled()) {
+				// Same shape as the data_sel == 1 interrupt merge above: the fence value
+				// was written synchronously and the interrupt queued on the current tick;
+				// only the vkQueueSubmit is deferred, bounded by 8.
+				cp.CompleteReleaseMemInterrupt(true);
+			} else {
+				KYTY_PROFILER_BLOCK("CpOpReleaseMem: BufferFlush");
+				cp.BufferFlush(SubmitCause::ReleaseFlush);
+			}
 		}
 
 		return 7;

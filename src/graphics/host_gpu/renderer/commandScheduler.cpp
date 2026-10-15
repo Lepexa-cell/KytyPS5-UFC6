@@ -35,12 +35,15 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	std::fflush(stdout);
 }
 
+} // namespace
+
 // KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
 // UFC-октагон: 2350 draw/кадр при дефолте 16 дают ~147 сабмитов — драйвер NVIDIA
 // тонет в переключениях контекста. Дефолт 384 даёт ~6 сабмитов/кадр (в целевом
 // коридоре 4-8 крупных пачек); transient-память командных буферов при этом не
 // растёт (переиспользование пула), потолок VRAM 8.5-9.5 ГБ не задет.
 // KYTY_DRAW_FLUSH_INTERVAL переопределяет при нужде; 0 — как раньше (выкл).
+// Printed once at startup (see LogDrawFlushInterval()).
 uint32_t DrawFlushInterval() {
 	static const uint32_t interval = [] {
 		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
@@ -52,7 +55,13 @@ uint32_t DrawFlushInterval() {
 	return interval;
 }
 
-} // namespace
+void LogDrawFlushInterval() {
+	static const bool logged = [] {
+		LOGF("DrawFlushInterval: %u draws per submit\n", DrawFlushInterval());
+		return true;
+	}();
+	(void)logged;
+}
 
 CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
     : m_graphics(graphics), m_master(master) {
@@ -195,10 +204,10 @@ void CommandScheduler::EndRendering() {
 	InvalidateDrawStateCache();
 }
 
-void CommandScheduler::Flush() {
+void CommandScheduler::Flush(SubmitCause cause) {
 	TelemetryCountFlush();
 	SubmitInfo submit;
-	Flush(submit);
+	Flush(submit, cause);
 }
 
 void CommandScheduler::CompleteReleaseMemWrite() {
@@ -207,10 +216,10 @@ void CommandScheduler::CompleteReleaseMemWrite() {
 		return;
 	}
 	CheckActive();
-	Flush();
+	Flush(SubmitCause::ReleaseWrite);
 }
 
-void CommandScheduler::CompleteReleaseMemInterrupt() {
+void CommandScheduler::CompleteReleaseMemInterrupt(bool merged) {
 	// Deliberately smaller than CompleteReleaseMemWrite's 32: this event has already been queued
 	// for guest delivery once its tick completes (see Sync::TriggerEopEventAtEndOfPipe ->
 	// DeferPriorityOperation), and a guest thread may be blocked waiting on it via an event queue.
@@ -222,7 +231,7 @@ void CommandScheduler::CompleteReleaseMemInterrupt() {
 		return;
 	}
 	CheckActive();
-	Flush();
+	Flush(merged ? SubmitCause::ReleaseFlush : SubmitCause::ReleaseIrq);
 }
 
 void CommandScheduler::CompleteDraw() {
@@ -231,30 +240,76 @@ void CommandScheduler::CompleteDraw() {
 		return;
 	}
 	CheckActive();
-	Flush();
+	Flush(SubmitCause::DrawFlush);
 }
 
-void CommandScheduler::Flush(SubmitInfo& submit) {
+void CommandScheduler::Flush(SubmitInfo& submit, SubmitCause cause) {
+	const uint64_t cpu_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	Submit(submit);
 	BeginNext();
+	// Gate on the GPU thread like Finish()/Wait() below: CountSubmit asserts it
+	// (FrameTelemetry is thread_local, batch bases must not move off-thread).
+	if (SubmitTelemetryEnabled() && GuestGpu::IsGpuThread()) {
+		CountSubmit(cause, TelemetryNowUs() - cpu_begin_us);
+	}
+}
+
+void CommandScheduler::CountSubmit(SubmitCause cause, uint64_t cpu_us) {
+	// Callers already gate on SubmitTelemetryEnabled() && GuestGpu::IsGpuThread():
+	// the swapchain's present-thread submits and the shutdown drain must never
+	// touch FrameTelemetry (thread_local, per GPU thread) nor the batch bases below.
+	EXIT_IF(!GuestGpu::IsGpuThread());
+	const auto& telemetry = GetFrameTelemetry();
+	const uint32_t batch_draws =
+	    telemetry.draws >= m_submit_base_draws ? telemetry.draws - m_submit_base_draws : 0;
+	const uint32_t batch_dispatches = telemetry.dispatches >= m_submit_base_dispatches
+	                                      ? telemetry.dispatches - m_submit_base_dispatches
+	                                      : 0;
+	m_submit_base_draws      = telemetry.draws;
+	m_submit_base_dispatches = telemetry.dispatches;
+	TelemetryCountSubmit(cause, cpu_us, batch_draws, batch_dispatches);
 }
 
 void CommandScheduler::FlushAndWait() {
 	KYTY_PROFILER_FUNCTION();
+	const uint64_t submit_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	const auto tick = Submit();
+	const uint64_t submit_us =
+	    SubmitTelemetryEnabled() ? TelemetryNowUs() - submit_begin_us : 0;
+	const uint64_t wait_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	m_master.Wait(tick);
+	const uint64_t wait_us =
+	    SubmitTelemetryEnabled() ? TelemetryNowUs() - wait_begin_us : 0;
+	const uint64_t next_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	BeginNext();
+	if (SubmitTelemetryEnabled() && GuestGpu::IsGpuThread()) {
+		CountSubmit(SubmitCause::Finish, submit_us + TelemetryNowUs() - next_begin_us);
+		TelemetryCountSubmitWait(wait_us);
+	}
 }
 
 void CommandScheduler::Finish() {
 	KYTY_PROFILER_FUNCTION();
 	CheckActive();
+	const uint64_t submit_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
+	bool submitted = false;
 	if (!m_command.IsInvalid()) {
 		Submit();
+		submitted = true;
 	}
+	const uint64_t submit_us =
+	    SubmitTelemetryEnabled() ? TelemetryNowUs() - submit_begin_us : 0;
+	const uint64_t wait_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	m_master.Wait(CurrentTick() - 1);
+	const uint64_t wait_us =
+	    SubmitTelemetryEnabled() ? TelemetryNowUs() - wait_begin_us : 0;
+	const uint64_t next_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 	BeginNext();
 	PopPendingOperations();
+	if (submitted && SubmitTelemetryEnabled() && GuestGpu::IsGpuThread()) {
+		CountSubmit(SubmitCause::Finish, submit_us + TelemetryNowUs() - next_begin_us);
+		TelemetryCountSubmitWait(wait_us);
+	}
 }
 
 // How long the GPU thread spends drained on the host GPU, and how often. A drain that
@@ -304,18 +359,35 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		{
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
+			const uint64_t submit_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 			const auto submitted_tick = Submit();
+			const uint64_t submit_us =
+			    SubmitTelemetryEnabled() ? TelemetryNowUs() - submit_begin_us : 0;
 			EXIT_IF(submitted_tick != tick);
 			Timeline::Mark("drain-begin", tick);
+			const uint64_t wait_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 			m_master.Wait(tick);
+			const uint64_t wait_us =
+			    SubmitTelemetryEnabled() ? TelemetryNowUs() - wait_begin_us : 0;
 			Timeline::Mark("drain-end", tick);
+			const uint64_t next_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
 			BeginNext();
+			if (SubmitTelemetryEnabled() && GuestGpu::IsGpuThread()) {
+				CountSubmit(SubmitCause::Wait, submit_us + TelemetryNowUs() - next_begin_us);
+				// wait_us covers m_master.Wait() only (measured after Submit returned,
+				// before BeginNext), so it is pure GPU idle -- no subtraction needed.
+				TelemetryCountSubmitWait(wait_us);
+			}
 		}
 		RecordWait(timer.GetTimeS(), true);
 	} else {
 		Timeline::Mark("wait-begin", tick);
 		m_master.Wait(tick);
 		Timeline::Mark("wait-end", tick);
+		// No submit_wait_* here: the tick was already submitted by an earlier boundary
+		// (its cost went to that cause's bucket). Counting this idle again under
+		// submit_wait would double-charge the same stall; RecordWait below still
+		// captures it in the GpuWaits drain/total stats.
 		RecordWait(timer.GetTimeS(), false);
 	}
 }

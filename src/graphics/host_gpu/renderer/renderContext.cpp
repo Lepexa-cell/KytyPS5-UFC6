@@ -57,6 +57,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	LOGF("Recording thread: %s, async queue submit: %s\n",
 	     m_command_scheduler.Threaded() ? "on" : "off",
 	     m_command_scheduler.AsyncSubmit() ? "on" : "off");
+	LogDrawFlushInterval();
 }
 
 RenderContext::~RenderContext() {

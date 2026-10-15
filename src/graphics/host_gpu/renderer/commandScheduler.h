@@ -24,6 +24,9 @@
 
 namespace Libs::Graphics {
 
+uint32_t DrawFlushInterval();
+void     LogDrawFlushInterval();
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -33,8 +36,8 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
-	void           Flush();
-	void           Flush(SubmitInfo& submit);
+	void           Flush(SubmitCause cause = SubmitCause::Flush);
+	void           Flush(SubmitInfo& submit, SubmitCause cause = SubmitCause::Flush);
 	void           FlushAndWait();
 	void           Finish();
 	// Bounds how many no-interrupt RELEASE_MEM fence writes accumulate in one command buffer
@@ -47,7 +50,9 @@ public:
 	// may be waiting on it via an event queue) -- deferring the flush delays real event delivery,
 	// so this uses a much smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
 	// some of the possible win for less added latency. Never waits itself.
-	void           CompleteReleaseMemInterrupt();
+	// merged=true marks submits that folded a legacy immediate BufferFlush into this window
+	// (telemetry cause ReleaseFlush); =0 restores the full original path for that branch.
+	void           CompleteReleaseMemInterrupt(bool merged = false);
 	// Called after every DrawIndex/DrawAuto. Long chains of draws with no intervening
 	// RELEASE_MEM/wait can otherwise sit fully recorded but unsubmitted for a long time, leaving
 	// the GPU idle until something else finally forces a flush -- this periodically calls Flush()
@@ -59,6 +64,14 @@ public:
 	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
 	// exists to remove.
 	void           CompleteDraw();
+	// Frame reset for the per-submit batch bases: draws/dispatches totals are zeroed every
+	// 60 frames in TelemetryEndFrame, so a carry-over base would clamp the next frame's
+	// first batch to zero. Called there through CommandProcessor::GetScheduler().
+	// Public only for that GPU-thread call; the bases themselves stay private below.
+	void ResetSubmitBatchBase() {
+		m_submit_base_draws      = 0;
+		m_submit_base_dispatches = 0;
+	}
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -213,6 +226,14 @@ private:
 	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+	// Submit telemetry: wraps one Submit()+BeginNext() span with its cause, so each
+	// real vkQueueSubmit records count, CPU time and batch volume. GPU thread only.
+	// cpu_us covers Submit()+BeginNext() only (never the m_master.Wait between them);
+	// batch volume is the draws+dispatches delta since the previous counted submit.
+	void CountSubmit(SubmitCause cause, uint64_t cpu_us);
+
+	uint32_t m_submit_base_draws      = 0;
+	uint32_t m_submit_base_dispatches = 0;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;

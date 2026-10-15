@@ -13,6 +13,7 @@
 
 #include <unordered_set>
 #include <array>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -40,6 +41,35 @@ class RenderContext;
 class CommandScheduler;
 class CommandRecorder;
 struct RenderExecutorTestAccess;
+
+// Submit-cause telemetry: which boundary actually paid a vkQueueSubmit.
+// Recorded per Flush()/Submit() site, aggregated over 60 frames in TelemetryEndFrame.
+// GPU thread only. Lives here (not in commandProcessor.h) so CommandScheduler's
+// Flush()/Submit() signatures can name it without an include cycle.
+enum class SubmitCause : uint8_t {
+	Flush,       // Generic non-blocking flush (BufferFlush slice progress, suspend-point
+	             // drain, readback download drain). Refined per-site below as needed.
+	DrawFlush,   // CompleteDraw()'s periodic non-blocking flush (KYTY_DRAW_FLUSH_INTERVAL).
+	ReleaseWrite, // CompleteReleaseMemWrite()'s fence-write batching (32 per submit).
+	ReleaseIrq,  // CompleteReleaseMemInterrupt()'s event batching (8 per submit).
+	SliceFlush,  // Guest slice progress: BufferFlush() after a graphics/compute slice
+	             // made progress, or the suspend-point drain (SubmitType boundaries).
+	ReleaseFlush, // CpOpReleaseMem interrupt path, merged into the ReleaseIrq window
+	             // under KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH (default on).
+	Readback,    // Async readback download drain (BufferCache downloads).
+	Present,     // Flip / PrepareCpuFlip / WaitFlipDone frame-boundary submit.
+	Wait,        // CommandScheduler::Wait() on the current tick: submits the open
+	             // buffer then blocks until the GPU drains it (stream-buffer wrap,
+	             // sync readback, fault handling). Additionally adds submit_wait_*
+	             // (m_master.Wait() only -- pure GPU idle, measured after Submit
+	             // returned and before BeginNext, never the submit overhead).
+	             // Waiting on an already-submitted tick adds nothing: its submit
+	             // cost went to the earlier cause's bucket (see Wait() else-branch).
+	Finish,      // CommandScheduler::Finish()/FlushAndWait(): submit plus host-side wait
+	             // for all prior ticks. Also adds its Wait() interval to submit_wait_*;
+	             // Shutdown()'s final drain stays uncounted (not on the GPU thread).
+	Count,
+};
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,

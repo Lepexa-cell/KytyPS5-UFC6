@@ -614,7 +614,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			if (ReadbackRetick()) {
 				tick = m_scheduler.CurrentTick();
 			}
-			m_scheduler.Flush();
+			m_scheduler.Flush(SubmitCause::Readback);
 			m_last_async_download_tick = tick;
 			return tick;
 		}

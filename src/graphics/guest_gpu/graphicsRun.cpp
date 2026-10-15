@@ -26,9 +26,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <semaphore>
@@ -408,16 +410,16 @@ void CommandProcessor::BufferInit() {
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
-void CommandProcessor::BufferFlush() {
-	GetScheduler().Flush();
+void CommandProcessor::BufferFlush(SubmitCause cause) {
+	GetScheduler().Flush(cause);
 }
 
 void CommandProcessor::CompleteReleaseMemWrite() {
 	GetScheduler().CompleteReleaseMemWrite();
 }
 
-void CommandProcessor::CompleteReleaseMemInterrupt() {
-	GetScheduler().CompleteReleaseMemInterrupt();
+void CommandProcessor::CompleteReleaseMemInterrupt(bool merged) {
+	GetScheduler().CompleteReleaseMemInterrupt(merged);
 }
 
 void CommandProcessor::CompleteDraw() {
@@ -1347,6 +1349,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
+		TelemetryCountDispatch();
 	}
 }
 
@@ -1368,6 +1371,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	}
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
+	TelemetryCountDispatch();
 }
 
 uint32_t CommandProcessor::NumInstances() {
@@ -1407,7 +1411,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
 	const auto telemetry_wait_flip_begin_us = TelemetryNowUs();
-	BufferFlush();
+	BufferFlush(SubmitCause::Present);
 
 	m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 	                                      static_cast<int>(display_buffer_index));
@@ -1761,7 +1765,7 @@ void CommandProcessor::Flip() {
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
 	                               m_flip.flip_mode, m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	GetScheduler().Flush(SubmitCause::Present);
 	TelemetryEndFrame();
 }
 
@@ -1781,7 +1785,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
 	                                 value, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                 m_flip.flip_arg, request);
-	GetScheduler().Flush();
+	GetScheduler().Flush(SubmitCause::Present);
 	TelemetryEndFrame();
 }
 
@@ -1807,7 +1811,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(
 	    m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr), value, m_flip.handle,
 	    m_flip.index, m_flip.flip_mode, m_flip.flip_arg, request, m_interrupt_event_id);
-	GetScheduler().Flush();
+	GetScheduler().Flush(SubmitCause::Present);
 	TelemetryEndFrame();
 }
 
@@ -1825,7 +1829,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
 	GetScheduler().DeferPriorityOperation(
 	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
-	GetScheduler().Flush();
+	GetScheduler().Flush(SubmitCause::Present);
 	TelemetryEndFrame();
 }
 
@@ -1961,6 +1965,39 @@ void TelemetryEndFrame() {
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_other_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_fallback_count) * inv_frames + 0.5));
+			// Submit causes: one compact line per active cause per 60 frames (count/frame,
+			// Submit+BeginNext CPU ms/frame, mean batch draws+dispatches per submit, plus
+			// the forced-wait total). Cause order matches SubmitCause in render.h.
+			static constexpr const char* kSubmitCauseNames[] = {
+			    "flush",  "draw",   "relwr", "relirq", "slice",
+			    "relfl",  "readbk", "pres",  "wait",   "finish",
+			};
+			static_assert(std::size(kSubmitCauseNames) == SubmitCauseCount(),
+			              "submit cause names must match SubmitCause");
+			for (size_t cause = 0; cause < SubmitCauseCount(); cause++) {
+				const double count = static_cast<double>(telemetry.submit_count[cause]) * inv_frames;
+				if (count <= 0.0 && telemetry.submit_cpu_us[cause] == 0) {
+					continue;
+				}
+				const double cpu_ms = static_cast<double>(telemetry.submit_cpu_us[cause]) * frame_avg;
+				const double batch_draws =
+				    telemetry.submit_count[cause] != 0
+				        ? static_cast<double>(telemetry.submit_batch_draws[cause]) /
+				              static_cast<double>(telemetry.submit_count[cause])
+				        : 0.0;
+				const double batch_dispatches =
+				    telemetry.submit_count[cause] != 0
+				        ? static_cast<double>(telemetry.submit_batch_dispatches[cause]) /
+				              static_cast<double>(telemetry.submit_count[cause])
+				        : 0.0;
+				LOGF("[FRAME_TELEMETRY_SUBMIT] %s: %.1f/frame cpu %.3f ms/frame batch %.1f draws + %.1f dispatches\n",
+				     kSubmitCauseNames[cause], count, cpu_ms, batch_draws, batch_dispatches);
+			}
+			if (telemetry.submit_wait_count != 0 || telemetry.submit_wait_us != 0) {
+				LOGF("[FRAME_TELEMETRY_SUBMIT] forced wait: %.1f/frame %.3f ms/frame\n",
+				     static_cast<double>(telemetry.submit_wait_count) * inv_frames,
+				     static_cast<double>(telemetry.submit_wait_us) * frame_avg);
+			}
 			LOGF("[FRAME_TELEMETRY_CLEARFB] nocand %u nocond %u res %u unsup %u\n",
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_nocand_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_fb_no_cond) * inv_frames + 0.5),
@@ -1980,6 +2017,13 @@ void TelemetryEndFrame() {
 			     static_cast<double>(telemetry.clear_read_range_count) * inv_frames);
 		}
 		telemetry = FrameTelemetry {};
+		// Reset the per-submit batch bases alongside the frame totals above: both live
+		// in thread_local FrameTelemetry, so a carry-over base would clamp the next
+		// frame's first batch to zero. TelemetryEndFrame runs on Flip/PrepareCpuFlip
+		// paths (GPU thread only).
+		if (GuestGpu::IsGpuThread() && g_current_processor != nullptr) {
+			g_current_processor->GetScheduler().ResetSubmitBatchBase();
+		}
 	}
 	// Draw-state L1 scope: never leak into a foreign frame.
 	InvalidateDrawStateCache();

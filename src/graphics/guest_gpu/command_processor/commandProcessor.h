@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <span>
@@ -42,6 +43,30 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 [[nodiscard]] inline bool BdaCleanSkipEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_OPT_BDA_CLEAN_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_OPT_SUBMIT_TELEMETRY=0 disables the per-submit cause accounting below
+// (default: enabled). Diagnostic only: all submits take the same code path either way.
+[[nodiscard]] inline bool SubmitTelemetryEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_SUBMIT_TELEMETRY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// SubmitCause lives in render.h so CommandScheduler's Flush()/Submit() signatures can
+// name it without an include cycle.
+
+// KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH=0 restores the legacy immediate submit after
+// every interrupt-path CpOpReleaseMem (default: merged into the CompleteReleaseMemInterrupt
+// batching window below). Independent from KYTY_OPT_SUBMIT_TELEMETRY.
+[[nodiscard]] inline bool SubmitMergeReleaseFlushEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH");
 		return value == nullptr || value[0] != '0';
 	}();
 	return enabled;
@@ -158,7 +183,20 @@ struct FrameTelemetry {
 	uint32_t clear_fb_int_format = 0;
 	uint32_t clear_fb_pipeline = 0;
 	uint32_t draws = 0;
+	uint32_t dispatches = 0;
 	uint32_t flushes = 0;
+	// Compact per-cause accounting for real vkQueueSubmit calls: count, CPU time
+	// (Submit+BeginNext, never the GPU wait), and batch volume (draws+dispatches
+	// recorded since the previous submit). Indexed by SubmitCause; the Wait/Finish
+	// buckets additionally add submit_wait_* (m_master.Wait() only -- pure GPU
+	// idle, measured separately from the CPU submit interval). GPU thread only.
+	static constexpr size_t kSubmitCauses = static_cast<size_t>(SubmitCause::Count);
+	uint32_t submit_count[kSubmitCauses] = {};
+	uint64_t submit_cpu_us[kSubmitCauses] = {};
+	uint32_t submit_batch_draws[kSubmitCauses] = {};
+	uint32_t submit_batch_dispatches[kSubmitCauses] = {};
+	uint32_t submit_wait_count = 0;
+	uint64_t submit_wait_us = 0;
 	uint32_t draw_state_l1_hits = 0;
 	uint32_t draw_state_l1_misses = 0;
 	uint32_t color_resolves = 0;
@@ -579,8 +617,49 @@ inline void TelemetryCountDraw() {
 	GetFrameTelemetry().draws++;
 }
 
+inline void TelemetryCountDispatch() {
+	GetFrameTelemetry().dispatches++;
+}
+
 inline void TelemetryCountFlush() {
 	GetFrameTelemetry().flushes++;
+}
+
+// Number of SubmitCause buckets; kept next to the recorders so the report loop in
+// graphicsRun.cpp cannot drift apart from the FrameTelemetry array size.
+inline constexpr size_t SubmitCauseCount() {
+	return static_cast<size_t>(SubmitCause::Count);
+}
+
+// Records one real vkQueueSubmit: cause bucket, Submit()+BeginNext() CPU time, and the
+// batch volume (draws+dispatches recorded since the previous submit, as deltas against
+// the frame totals). GPU thread only; the present-thread swapchain scheduler never
+// touches FrameTelemetry. TelemetryEndFrame zeroes the frame totals every 60 frames,
+// so the scheduler's batch bases must reset with them (see ResetSubmitBatchBase) --
+// otherwise the first batch after a reset clamps to zero.
+inline void TelemetryCountSubmit(SubmitCause cause, uint64_t cpu_us, uint32_t batch_draws,
+                                 uint32_t batch_dispatches) {
+	if (!SubmitTelemetryEnabled()) {
+		return;
+	}
+	auto& telemetry = GetFrameTelemetry();
+	const size_t index = static_cast<size_t>(cause);
+	if (index >= FrameTelemetry::kSubmitCauses) {
+		return;
+	}
+	telemetry.submit_count[index]++;
+	telemetry.submit_cpu_us[index] += cpu_us;
+	telemetry.submit_batch_draws[index] += batch_draws;
+	telemetry.submit_batch_dispatches[index] += batch_dispatches;
+}
+
+inline void TelemetryCountSubmitWait(uint64_t wait_us) {
+	if (!SubmitTelemetryEnabled()) {
+		return;
+	}
+	auto& telemetry = GetFrameTelemetry();
+	telemetry.submit_wait_count++;
+	telemetry.submit_wait_us += wait_us;
 }
 
 void TelemetryEndFrame();
@@ -630,14 +709,17 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	void            BufferFlush(SubmitCause cause = SubmitCause::SliceFlush);
 	void            BufferWait();
 	// See CommandScheduler::CompleteReleaseMemWrite -- only safe for a RELEASE_MEM that already
 	// wrote its guest-visible value synchronously and scheduled no interrupt callback.
 	void            CompleteReleaseMemWrite();
 	// See CommandScheduler::CompleteReleaseMemInterrupt -- for a RELEASE_MEM that DOES request a
 	// guest interrupt/event; uses a smaller batch bound as a hedge against delaying it.
-	void            CompleteReleaseMemInterrupt();
+	// merged=true when the legacy immediate BufferFlush was folded into this window under
+	// KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH (telemetry cause ReleaseFlush), false for the
+	// pre-existing batched path (cause ReleaseIrq).
+	void            CompleteReleaseMemInterrupt(bool merged = false);
 	// See CommandScheduler::CompleteDraw -- called after every DrawIndex/DrawAuto.
 	void            CompleteDraw();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -720,6 +802,8 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// Public for TelemetryEndFrame's per-submit batch-base reset (GPU thread only).
+	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 
 private:
 	template <typename T>
@@ -729,7 +813,6 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
