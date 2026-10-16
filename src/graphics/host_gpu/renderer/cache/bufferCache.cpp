@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -247,14 +248,39 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	// Recorded through the recording thread: a raw Handle() made every readback wait for it to
 	// drain first (4.5 % of the GPU thread at the Leap Attack prompt, 2026-10-05).
 	const auto              native = command.Recorder();
+	// KYTY_OPT_NARROW_READBACK_BARRIER=1 (default off): the transfer only reads the dirty
+	// [min,max) span of this copy list, so the source barrier covers that span instead of
+	// the whole buffer. Applies to both async and sync downloads (shared code above the
+	// async/sync split); barrier geometry only -- same bytes copied/published, same
+	// waits, same tracker updates. The [min,max) accumulation below cannot overflow:
+	// each copy satisfies srcOffset <= buffer.Size() and
+	// size <= buffer.Size() - srcOffset (callers pass buffers whose range contains the
+	// download window, and RangeSet::End aborts on address+size overflow), so both
+	// srcOffset and srcOffset+size fit in 64 bits before the clamp into the buffer.
+	vk::DeviceSize barrier_offset = 0;
+	vk::DeviceSize barrier_size = static_cast<vk::DeviceSize>(buffer.Size());
+	if (NarrowReadbackBarrierEnabled() && !copies.empty()) {
+		vk::DeviceSize first = std::numeric_limits<vk::DeviceSize>::max();
+		vk::DeviceSize last = 0;
+		for (const auto& copy : copies) {
+			first = std::min<vk::DeviceSize>(first, static_cast<vk::DeviceSize>(copy.srcOffset));
+			last = std::max<vk::DeviceSize>(
+			    last, static_cast<vk::DeviceSize>(copy.srcOffset + copy.size));
+		}
+		const auto buffer_size = static_cast<vk::DeviceSize>(buffer.Size());
+		if (last > first && first < buffer_size && barrier_size != 0) {
+			barrier_offset = first;
+			barrier_size = std::min(last, buffer_size) - first;
+		}
+	}
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
 	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	before.buffer              = buffer.Handle();
-	before.offset              = 0;
-	before.size                = buffer.Size();
+	before.offset              = barrier_offset;
+	before.size                = barrier_size;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
 	                       nullptr);
@@ -286,20 +312,43 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
+		const bool diag = SyncDownloadDiagEnabled();
 		const auto readmem_submit_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
 		const auto tick = m_scheduler.CurrentTick();
 		if (TelemetrySubcountersEnabled()) {
 			TelemetryAddReadmemFlushSubmit(TelemetryNowUs() - readmem_submit_begin_us);
 		}
 		const auto readmem_fence_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
-		m_scheduler.Wait(tick);
+		uint64_t diag_submit_us = 0;
+		uint64_t diag_master_wait_us = 0;
+		uint64_t diag_priority_wait_us = 0;
+		bool forced = true;
+		if (diag) {
+			forced = m_scheduler.WaitWithBreakdown(tick, diag_submit_us, diag_master_wait_us);
+		} else {
+			m_scheduler.Wait(tick);
+		}
+		// Times the same WaitPriorityOperations call the legacy path makes, in both the
+		// forced and the already-submitted cases.
+		const auto diag_priority_begin_us = diag ? TelemetryNowUs() : 0;
 		m_scheduler.WaitPriorityOperations(tick);
+		if (diag) {
+			diag_priority_wait_us = TelemetryNowUs() - diag_priority_begin_us;
+			TelemetryCountSyncDownloadCall(forced);
+			TelemetryAddSyncDownloadSubmit(diag_submit_us);
+			TelemetryAddSyncDownloadMasterWait(diag_master_wait_us);
+		}
 		if (TelemetrySubcountersEnabled()) {
 			TelemetryAddReadmemFenceWait(TelemetryNowUs() - readmem_fence_begin_us);
 			TelemetryCountGpusyncBuffer();
 		}
 		const auto readmem_publish_begin_us = TelemetrySubcountersEnabled() ? TelemetryNowUs() : 0;
+		const auto diag_publish_begin_us = diag ? TelemetryNowUs() : 0;
 		publish();
+		if (diag) {
+			TelemetryAddSyncDownloadPublish(TelemetryNowUs() - diag_publish_begin_us);
+			TelemetryAddSyncDownloadPriorityWait(diag_priority_wait_us);
+		}
 		if (TelemetrySubcountersEnabled()) {
 			TelemetryAddReadmemCopyReadback(TelemetryNowUs() - readmem_publish_begin_us);
 		}

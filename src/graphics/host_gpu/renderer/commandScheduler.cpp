@@ -349,9 +349,18 @@ void RecordWait(double seconds, bool drained) {
 
 void CommandScheduler::Wait(uint64_t tick) {
 	KYTY_PROFILER_FUNCTION();
+	uint64_t submit_us = 0;
+	uint64_t master_wait_us = 0;
+	(void)WaitWithBreakdown(tick, submit_us, master_wait_us);
+}
+
+bool CommandScheduler::WaitWithBreakdown(uint64_t tick, uint64_t& submit_us,
+                                         uint64_t& master_wait_us) {
 	EXIT_IF(tick > CurrentTick());
 	Common::Timer timer;
 	timer.Start();
+	submit_us = 0;
+	master_wait_us = 0;
 	if (tick == CurrentTick()) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
@@ -359,36 +368,56 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// resources are released only at the next GPU operation boundary.
 		{
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
-			const uint64_t submit_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
+			const bool diag = SyncDownloadDiagEnabled();
+			const uint64_t submit_begin_us =
+			    (SubmitTelemetryEnabled() || diag) ? TelemetryNowUs() : 0;
 			const auto submitted_tick = Submit();
-			const uint64_t submit_us =
-			    SubmitTelemetryEnabled() ? TelemetryNowUs() - submit_begin_us : 0;
+			// Legacy path measures Submit+BeginNext CPU only when submit telemetry is on;
+			// the diagnostic breakdown needs the same interval even when it is off. This
+			// is host-side CPU around Submit, not the duration of the GPU submission.
+			const uint64_t after_submit_us =
+			    (SubmitTelemetryEnabled() || diag) ? TelemetryNowUs() : 0;
 			EXIT_IF(submitted_tick != tick);
 			Timeline::Mark("drain-begin", tick);
-			const uint64_t wait_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
+			const uint64_t wait_begin_us =
+			    (SubmitTelemetryEnabled() || diag) ? TelemetryNowUs() : 0;
 			m_master.Wait(tick);
 			const uint64_t wait_us =
-			    SubmitTelemetryEnabled() ? TelemetryNowUs() - wait_begin_us : 0;
+			    (SubmitTelemetryEnabled() || diag) ? TelemetryNowUs() - wait_begin_us : 0;
 			Timeline::Mark("drain-end", tick);
-			const uint64_t next_begin_us = SubmitTelemetryEnabled() ? TelemetryNowUs() : 0;
+			const uint64_t next_begin_us =
+			    (SubmitTelemetryEnabled() || diag) ? TelemetryNowUs() : 0;
 			BeginNext();
+			const uint64_t cpu_us =
+			    (SubmitTelemetryEnabled() || diag)
+			        ? (after_submit_us - submit_begin_us) + (TelemetryNowUs() - next_begin_us)
+			        : 0;
+			submit_us = cpu_us;
+			master_wait_us = wait_us;
 			if (SubmitTelemetryEnabled() && GuestGpu::IsGpuThread()) {
-				CountSubmit(SubmitCause::Wait, submit_us + TelemetryNowUs() - next_begin_us);
+				CountSubmit(SubmitCause::Wait, cpu_us);
 				// wait_us covers m_master.Wait() only (measured after Submit returned,
-				// before BeginNext), so it is pure GPU idle -- no subtraction needed.
+				// before BeginNext): host-side wait for the tick, not a GPU-busy measure.
 				TelemetryCountSubmitWait(wait_us);
 			}
 		}
 		RecordWait(timer.GetTimeS(), true);
+		return true;
 	} else {
+		const bool diag = SyncDownloadDiagEnabled();
 		Timeline::Mark("wait-begin", tick);
+		const uint64_t wait_begin_us = diag ? TelemetryNowUs() : 0;
 		m_master.Wait(tick);
+		if (diag) {
+			master_wait_us = TelemetryNowUs() - wait_begin_us;
+		}
 		Timeline::Mark("wait-end", tick);
 		// No submit_wait_* here: the tick was already submitted by an earlier boundary
-		// (its cost went to that cause's bucket). Counting this idle again under
+		// (its cost went to that cause's bucket). Counting this wait again under
 		// submit_wait would double-charge the same stall; RecordWait below still
 		// captures it in the GpuWaits drain/total stats.
 		RecordWait(timer.GetTimeS(), false);
+		return false;
 	}
 }
 

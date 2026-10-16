@@ -72,6 +72,35 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 // SubmitCause lives in render.h so CommandScheduler's Flush()/Submit() signatures can
 // name it without an include cycle.
 
+// KYTY_OPT_SYNC_DOWNLOAD_DIAG=1 adds a per-frame sync-download breakdown (default: off).
+// Diagnostic only: when off, the sync path adds no extra clock reads. When on, the
+// synchronous BufferCache download splits its fence wait into submit+BeginNext CPU /
+// host-side tick wait / priority-operations wait / publish, and the BufferFlush
+// slice sites count completed vs yielded graphics/compute boundaries plus suspend
+// points.
+[[nodiscard]] inline bool SyncDownloadDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_SYNC_DOWNLOAD_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// KYTY_OPT_NARROW_READBACK_BARRIER=1 narrows the pre-copy source barrier to the dirty
+// [min,max) span actually copied (default: off = legacy whole-buffer barrier).
+// Scope: DownloadBufferCopies runs it for both async and sync downloads; the change
+// is barrier geometry only. The span is clamped into the buffer below, but that clamp
+// never validates a copy -- an out-of-range copy stays the caller's bug. The post-copy
+// download-buffer barrier is untouched, the copy list/order, publication, dirty
+// tracking and tick waits are identical.
+[[nodiscard]] inline bool NarrowReadbackBarrierEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPT_NARROW_READBACK_BARRIER");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 // KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH=0 restores the legacy immediate submit after
 // every interrupt-path CpOpReleaseMem (default: merged into the CompleteReleaseMemInterrupt
 // batching window below). Independent from KYTY_OPT_SUBMIT_TELEMETRY.
@@ -117,6 +146,25 @@ struct FrameTelemetry {
 	uint64_t readmem_flush_submit_us = 0;
 	uint64_t readmem_fence_wait_us = 0;
 	uint64_t readmem_copy_readback_us = 0;
+	// KYTY_OPT_SYNC_DOWNLOAD_DIAG breakdown of the sync-download covered span only
+	// (explicit DownloadBufferCopies<false> calls, never the scheduler's other waits):
+	// calls, already-submitted ticks, forced/current-tick drains, and the fence span
+	// split into submit+BeginNext CPU / host-side tick wait / priority operations /
+	// publish.
+	uint32_t sync_dl_calls = 0;
+	uint32_t sync_dl_already_submitted = 0;
+	uint32_t sync_dl_forced = 0;
+	uint64_t sync_dl_submit_us = 0;
+	uint64_t sync_dl_master_wait_us = 0;
+	uint64_t sync_dl_priority_wait_us = 0;
+	uint64_t sync_dl_publish_us = 0;
+	// Slice-boundary counters: BufferFlush sites only (not actual vkQueueSubmit calls).
+	// Graphics/compute split into completed vs yielded progress, plus suspend points.
+	uint32_t slice_graphics_completed = 0;
+	uint32_t slice_graphics_yielded = 0;
+	uint32_t slice_compute_completed = 0;
+	uint32_t slice_compute_yielded = 0;
+	uint32_t slice_suspend_points = 0;
 	uint32_t draw_targets_clear_wait_count = 0;
 	uint64_t draw_targets_bind_us = 0;
 	uint64_t draw_bindings_us = 0;
@@ -359,6 +407,78 @@ inline void TelemetryAddReadmemFenceWait(uint64_t delta_us) {
 
 inline void TelemetryAddReadmemCopyReadback(uint64_t delta_us) {
 	GetFrameTelemetry().readmem_copy_readback_us += delta_us;
+}
+
+inline void TelemetryCountSyncDownloadCall(bool forced) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	auto& telemetry = GetFrameTelemetry();
+	telemetry.sync_dl_calls++;
+	if (forced) {
+		telemetry.sync_dl_forced++;
+	} else {
+		telemetry.sync_dl_already_submitted++;
+	}
+}
+
+inline void TelemetryAddSyncDownloadSubmit(uint64_t delta_us) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	GetFrameTelemetry().sync_dl_submit_us += delta_us;
+}
+
+inline void TelemetryAddSyncDownloadMasterWait(uint64_t delta_us) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	GetFrameTelemetry().sync_dl_master_wait_us += delta_us;
+}
+
+inline void TelemetryAddSyncDownloadPriorityWait(uint64_t delta_us) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	GetFrameTelemetry().sync_dl_priority_wait_us += delta_us;
+}
+
+inline void TelemetryAddSyncDownloadPublish(uint64_t delta_us) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	GetFrameTelemetry().sync_dl_publish_us += delta_us;
+}
+
+inline void TelemetryCountSliceGraphics(bool completed) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	auto& telemetry = GetFrameTelemetry();
+	if (completed) {
+		telemetry.slice_graphics_completed++;
+	} else {
+		telemetry.slice_graphics_yielded++;
+	}
+}
+
+inline void TelemetryCountSliceCompute(bool completed) {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	auto& telemetry = GetFrameTelemetry();
+	if (completed) {
+		telemetry.slice_compute_completed++;
+	} else {
+		telemetry.slice_compute_yielded++;
+	}
+}
+
+inline void TelemetryCountSliceSuspendPoint() {
+	if (!SyncDownloadDiagEnabled()) {
+		return;
+	}
+	GetFrameTelemetry().slice_suspend_points++;
 }
 
 inline void TelemetryCountClearGpuWait() {

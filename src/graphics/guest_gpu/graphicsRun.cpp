@@ -161,6 +161,8 @@ static bool LogIndirectDraw() {
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
+	LOGF("SyncDownload: narrow_readback_barrier=%d sync_download_diag=%d\n",
+	     NarrowReadbackBarrierEnabled() ? 1 : 0, SyncDownloadDiagEnabled() ? 1 : 0);
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
 	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
@@ -813,6 +815,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
+				TelemetryCountSliceGraphics(complete);
 				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
@@ -839,6 +842,7 @@ bool GuestGpu::Process(Submission& submission) {
 				if (complete) {
 					m_renderer.RunGarbageCollector();
 				}
+				TelemetryCountSliceCompute(complete);
 				cp.BufferFlush();
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
@@ -853,6 +857,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.EmitGlobalBarrier();
 			m_renderer.GetCommandScheduler().DeferPriorityOperation(
 			    [ready = m_suspend_point_ready] { ready->release(); });
+			TelemetryCountSliceSuspendPoint();
 			cp.BufferFlush();
 			cp.Reset();
 			break;
@@ -1972,6 +1977,24 @@ void TelemetryEndFrame() {
 			     static_cast<unsigned>(static_cast<double>(telemetry.gpusync_other_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_count) * inv_frames + 0.5),
 			     static_cast<unsigned>(static_cast<double>(telemetry.clear_gpu_predicate_fallback_count) * inv_frames + 0.5));
+			// KYTY_OPT_SYNC_DOWNLOAD_DIAG: sync-download covered span only (never the
+			// scheduler's other waits), plus BufferFlush slice boundaries (not submits).
+			if (SyncDownloadDiagEnabled()) {
+				LOGF("[FRAME_TELEMETRY_SYNCDL] calls %.1f forced %.1f already %.1f | submit_cpu %.2f ms master %.2f ms priority %.2f ms publish %.2f ms\n",
+				     static_cast<double>(telemetry.sync_dl_calls) * inv_frames,
+				     static_cast<double>(telemetry.sync_dl_forced) * inv_frames,
+				     static_cast<double>(telemetry.sync_dl_already_submitted) * inv_frames,
+				     static_cast<double>(telemetry.sync_dl_submit_us) * frame_avg,
+				     static_cast<double>(telemetry.sync_dl_master_wait_us) * frame_avg,
+				     static_cast<double>(telemetry.sync_dl_priority_wait_us) * frame_avg,
+				     static_cast<double>(telemetry.sync_dl_publish_us) * frame_avg);
+				LOGF("[FRAME_TELEMETRY_SLICE] slice boundaries: gfx_completed %.1f gfx_yielded %.1f cmp_completed %.1f cmp_yielded %.1f suspend %.1f\n",
+				     static_cast<double>(telemetry.slice_graphics_completed) * inv_frames,
+				     static_cast<double>(telemetry.slice_graphics_yielded) * inv_frames,
+				     static_cast<double>(telemetry.slice_compute_completed) * inv_frames,
+				     static_cast<double>(telemetry.slice_compute_yielded) * inv_frames,
+				     static_cast<double>(telemetry.slice_suspend_points) * inv_frames);
+			}
 			// Submit causes: one compact line per active cause per 60 frames (count/frame,
 			// Submit+BeginNext CPU ms/frame, mean batch draws+dispatches per submit, plus
 			// the forced-wait total). Cause order matches SubmitCause in render.h.

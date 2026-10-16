@@ -241,6 +241,13 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
+	// KYTY_OPT_SYNC_DOWNLOAD_DIAG split of one sync-download wait: submit+BeginNext CPU
+	// time and host-side tick wait. Returns whether the tick was the current one
+	// (forced submit-then-wait) or already submitted. Diagnostic only: the plain Wait()
+	// path is untouched when the breakdown is not requested. The caller times
+	// WaitPriorityOperations itself, the same call the legacy path makes.
+	[[nodiscard]] bool WaitWithBreakdown(uint64_t tick, uint64_t& submit_us,
+	                                     uint64_t& master_wait_us);
 	// Fast-path gate for the per-draw PopPendingOperations() calls: DeferRelease sets it when
 	// an operation is queued, PopPendingOperations clears it when the queue drains. Draws read
 	// it lock-free first so the 99.9% empty-queue case skips the semaphore refresh, mutex and
