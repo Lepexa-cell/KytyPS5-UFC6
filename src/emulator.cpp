@@ -196,6 +196,12 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	Log::WriteToConsoleAndLog(
+	    fmt::format("Launch: exe={} pid={} log={}\n", options.executable_path.empty()
+	                                                     ? std::string("<unknown>")
+	                                                     : options.executable_path,
+	                static_cast<unsigned long long>(Common::CurrentProcessId()),
+	                Common::PathToString(Config::GetPrintfOutputFile())));
 	std::string title_id;
 	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));

@@ -13,6 +13,8 @@ struct RunOptions {
 	std::filesystem::path app0_dir;
 	std::filesystem::path elf;
 	std::filesystem::path game_patch;
+	// argv[0] of the emulator process, for the startup Launch log line.
+	std::string executable_path;
 };
 
 void Run(const RunOptions& options);

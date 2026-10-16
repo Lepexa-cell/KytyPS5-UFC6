@@ -252,6 +252,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.bindless_images_enabled) {
 		args << "--bindless";
 	}
+	if (info.narrow_readback_barrier_enabled) {
+		args << "--narrow-readback-barrier";
+	}
+	if (info.sync_download_diag_enabled) {
+		args << "--sync-download-diag";
+	}
 	if (!info.skip_shader_hashes.isEmpty()) {
 		args << "--skip-shaders" << info.skip_shader_hashes;
 	}

@@ -160,6 +160,14 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool NarrowReadbackBarrierEnabled() {
+	return g_config->narrow_readback_barrier_enabled;
+}
+
+bool SyncDownloadDiagEnabled() {
+	return g_config->sync_download_diag_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

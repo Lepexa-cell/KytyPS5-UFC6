@@ -90,6 +90,10 @@ static void PrintUsage() {
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --narrow-readback-barrier            Narrow the sync/async readback pre-copy source barrier\n"
+	         "                                       to the dirty span (experimental, default off).\n");
+	::printf("  --sync-download-diag                 Enable per-frame sync-download telemetry breakdown\n"
+	         "                                       (experimental, default off).\n");
 	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
 	         "                                       float images (they run by default).\n");
 	::printf("  --skip-shaders <hash,...>            Skip the draws and dispatches of these guest shaders\n"
@@ -247,6 +251,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 		if (arg == "--bindless") {
 			options.config.bindless_images_enabled = true;
+			continue;
+		}
+		if (arg == "--narrow-readback-barrier") {
+			options.config.narrow_readback_barrier_enabled = true;
+			continue;
+		}
+		if (arg == "--sync-download-diag") {
+			options.config.sync_download_diag_enabled = true;
 			continue;
 		}
 		if (arg == "--float-image-atomics" || arg == "--no-float-image-atomics") {
@@ -476,6 +488,10 @@ static int Main(int argc, char* argv[]) {
 
 	RunOptions options;
 	bool       show_help = false;
+
+	if (argc >= 1 && argv[0] != nullptr) {
+		options.executable_path = argv[0];
+	}
 
 	if (argc < 2) {
 		PrintUsage();

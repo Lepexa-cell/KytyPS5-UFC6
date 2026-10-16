@@ -75,6 +75,8 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   narrow_readback_barrier_enabled = false;
+	bool                   sync_download_diag_enabled      = false;
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 	bool                   bindless_images_enabled     = false;
@@ -130,6 +132,8 @@ bool VulkanValidationFatal();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
+bool NarrowReadbackBarrierEnabled();
+bool SyncDownloadDiagEnabled();
 bool TrophyEnabled();
 bool BindlessImagesEnabled();
 const std::string& GetSkipShaderHashes();

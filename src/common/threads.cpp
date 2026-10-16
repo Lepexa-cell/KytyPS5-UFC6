@@ -23,6 +23,17 @@
 #include <string>
 #include <thread>
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef KYTY_WIN_CS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+#else
+#include <unistd.h>
+#endif
+
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
@@ -186,6 +197,14 @@ static std::atomic<int> g_thread_counter = 0;
 void InitializeThreads() {
 	g_main_thread     = std::this_thread::get_id();
 	g_main_thread_int = Thread::GetThreadIdUnique();
+}
+
+unsigned long long CurrentProcessId() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return static_cast<unsigned long long>(::GetCurrentProcessId());
+#else
+	return static_cast<unsigned long long>(::getpid());
+#endif
 }
 
 Thread::Thread(thread_func_t func, void* arg)

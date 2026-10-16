@@ -122,6 +122,8 @@ public:
 	bool                   hide_cursor_enabled         = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   narrow_readback_barrier_enabled = false;
+	bool                   sync_download_diag_enabled      = false;
 	bool                   trophy_enabled              = true;
 	bool                   bindless_images_enabled     = false;
 	QString                skip_shader_hashes;
@@ -157,6 +159,8 @@ public:
 		hide_cursor_enabled         = other.hide_cursor_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
+		narrow_readback_barrier_enabled = other.narrow_readback_barrier_enabled;
+		sync_download_diag_enabled      = other.sync_download_diag_enabled;
 		trophy_enabled              = other.trophy_enabled;
 		bindless_images_enabled     = other.bindless_images_enabled;
 		skip_shader_hashes          = other.skip_shader_hashes;
@@ -207,6 +211,8 @@ public:
 		KYTY_CFG_SET(hide_cursor_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
+		KYTY_CFG_SET(narrow_readback_barrier_enabled);
+		KYTY_CFG_SET(sync_download_diag_enabled);
 		KYTY_CFG_SET(trophy_enabled);
 		KYTY_CFG_SET(bindless_images_enabled);
 		KYTY_CFG_SET(skip_shader_hashes);
@@ -253,6 +259,9 @@ public:
 		KYTY_CFG_GET(hide_cursor_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
+		narrow_readback_barrier_enabled =
+		    s->value("narrow_readback_barrier_enabled", false).toBool();
+		sync_download_diag_enabled = s->value("sync_download_diag_enabled", false).toBool();
 		trophy_enabled = s->value("trophy_enabled", trophy_enabled).toBool();
 		KYTY_CFG_GET(bindless_images_enabled);
 		KYTY_CFG_GET(skip_shader_hashes);

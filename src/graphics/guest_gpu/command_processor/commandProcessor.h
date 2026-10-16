@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/platform/sysTimer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -72,33 +73,30 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 // SubmitCause lives in render.h so CommandScheduler's Flush()/Submit() signatures can
 // name it without an include cycle.
 
-// KYTY_OPT_SYNC_DOWNLOAD_DIAG=1 adds a per-frame sync-download breakdown (default: off).
+// --sync-download-diag adds a per-frame sync-download breakdown (default: off).
+// Reads the runtime configuration loaded from explicit GUI/CLI settings: Config::Load
+// runs before the graphics subsystem starts, so no read happens before settings are
+// initialized. Priority: explicit GUI/CLI settings win; a leftover
+// KYTY_OPT_SYNC_DOWNLOAD_DIAG variable never overrides them.
 // Diagnostic only: when off, the sync path adds no extra clock reads. When on, the
 // synchronous BufferCache download splits its fence wait into submit+BeginNext CPU /
 // host-side tick wait / priority-operations wait / publish, and the BufferFlush
 // slice sites count completed vs yielded graphics/compute boundaries plus suspend
 // points.
 [[nodiscard]] inline bool SyncDownloadDiagEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_OPT_SYNC_DOWNLOAD_DIAG");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return Config::SyncDownloadDiagEnabled();
 }
 
-// KYTY_OPT_NARROW_READBACK_BARRIER=1 narrows the pre-copy source barrier to the dirty
+// --narrow-readback-barrier narrows the pre-copy source barrier to the dirty
 // [min,max) span actually copied (default: off = legacy whole-buffer barrier).
+// Same initialization and priority as above: runtime configuration only, no env read.
 // Scope: DownloadBufferCopies runs it for both async and sync downloads; the change
 // is barrier geometry only. The span is clamped into the buffer below, but that clamp
 // never validates a copy -- an out-of-range copy stays the caller's bug. The post-copy
 // download-buffer barrier is untouched, the copy list/order, publication, dirty
 // tracking and tick waits are identical.
 [[nodiscard]] inline bool NarrowReadbackBarrierEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_OPT_NARROW_READBACK_BARRIER");
-		return value != nullptr && value[0] == '1';
-	}();
-	return enabled;
+	return Config::NarrowReadbackBarrierEnabled();
 }
 
 // KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH=0 restores the legacy immediate submit after
