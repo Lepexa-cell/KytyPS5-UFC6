@@ -1982,7 +1982,10 @@ void TelemetryEndFrame() {
 			if (SyncDownloadDiagEnabled()) {
 					// Per-cause sync-download breakdown (SyncDownloadCause order from bufferCache.h).
 			constexpr const char* kCauseNames[] = {"General", "ClearMetadata", "IndirectDispatch",
-			                                       "GpuFault", "SrtGuestRead"};
+			                                       "GpuFault", "SrtGuestRead", "WriteInvalidate"};
+			static_assert(std::size(kCauseNames) ==
+			                  std::size(decltype(telemetry.sync_dl_cause_calls) {}),
+			              "sync-download cause names must match the telemetry arrays");
 			for (uint32_t cause = 0; cause < std::size(kCauseNames); cause++) {
 				const double calls =
 				    static_cast<double>(telemetry.sync_dl_cause_calls[cause]) * inv_frames;

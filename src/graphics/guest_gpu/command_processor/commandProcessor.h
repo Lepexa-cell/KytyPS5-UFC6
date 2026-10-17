@@ -153,9 +153,10 @@ struct FrameTelemetry {
 	uint32_t sync_dl_already_submitted = 0;
 	uint32_t sync_dl_forced = 0;
 	// Per-cause sync-download counts: indexed by SyncDownloadCause (bufferCache.h).
-	// The enum lives there to avoid a guest/host include cycle; keep the size in sync.
-	uint32_t sync_dl_cause_calls[5] = {};
-	uint64_t sync_dl_cause_master_wait_us[5] = {};
+	// The enum lives there to avoid a guest/host include cycle; keep the size in
+	// sync with SyncDownloadCause::Count (General .. WriteInvalidate).
+	uint32_t sync_dl_cause_calls[6] = {};
+	uint64_t sync_dl_cause_master_wait_us[6] = {};
 	uint64_t sync_dl_submit_us = 0;
 	uint64_t sync_dl_master_wait_us = 0;
 	uint64_t sync_dl_priority_wait_us = 0;

@@ -902,7 +902,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			buffers.ReadMemory(vaddr, size);
+			// First CPU consumer of these GPU-owned bytes is an SRT/materialize
+			// guest read (ReadShaderGuestMemory*). Not a tracked-page fault.
+			buffers.ReadMemory(vaddr, size, false,
+			                   Graphics::SyncDownloadCause::SrtGuestRead);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);

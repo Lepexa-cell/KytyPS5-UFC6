@@ -53,12 +53,14 @@ struct GpuWriteOrigin {
 // Why a synchronous buffer download waits: every DownloadBufferCopies<false>
 // call goes through ReadMemoryStep, so tagging the ReadMemory entry attributes
 // the whole sync-download stall to its first CPU consumer. Diagnostic only.
+// Count is not a cause: it sizes the telemetry arrays and must stay last.
 enum class SyncDownloadCause : uint8_t {
 	General = 0,      // Unknown / diagnostic paths.
 	ClearMetadata,    // MaterializeColorClear DCC/Cmask metadata refresh.
 	IndirectDispatch, // DispatchIndirect workgroup-count refresh.
 	GpuFault,         // Tracked-page fault served on the GPU thread.
 	SrtGuestRead,     // SRT/materialize guest read of GPU-owned bytes.
+	WriteInvalidate,  // CPU write fault: InvalidateMemory downloads GPU-owned bytes.
 	Count
 };
 
@@ -205,20 +207,21 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
+	// cause has no default: every internal hop must name its caller, so a missed
+	// argument is a compile error instead of a silent General.
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
 	                                      bool from_gpu_thread, bool async,
-	                                      SyncDownloadCause cause = SyncDownloadCause::General);
+	                                      SyncDownloadCause cause);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        SyncDownloadCause cause = SyncDownloadCause::General);
+	                                        SyncDownloadCause cause);
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        SyncDownloadCause cause = SyncDownloadCause::General);
+	                                        SyncDownloadCause cause);
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-	                          uint64_t total_size,
-	                          SyncDownloadCause cause = SyncDownloadCause::General);
+	                          uint64_t total_size, SyncDownloadCause cause);
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;

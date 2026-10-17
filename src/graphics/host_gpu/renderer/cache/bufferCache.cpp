@@ -411,8 +411,9 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
-	m_memory_tracker.InvalidateRegion(vaddr, size,
-	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	m_memory_tracker.InvalidateRegion(vaddr, size, [this, vaddr, size] {
+		ReadMemory(vaddr, size, true, SyncDownloadCause::WriteInvalidate);
+	});
 }
 
 bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
@@ -658,7 +659,7 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 		// The download publishes when its tick completes; the page stays protected until the
 		// caller's next step finds its bytes downloaded and lifts it.
 		auto tick = m_scheduler.CurrentTick();
-		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin)) {
+		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin, cause)) {
 			// The tick of the last copy, not of the first: a download ring that wraps within this
 			// recording submits it (StreamBuffer::WaitPendingOperations), and the later copies
 			// and their publication then land in the next tick. A caller waiting for the earlier
@@ -672,7 +673,8 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 			m_last_async_download_tick = tick;
 			return tick;
 		}
-	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
+	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin,
+	                                      cause)) {
 		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
 	if (is_write) {
@@ -1240,7 +1242,8 @@ void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto begin  = std::max(vaddr, buffer.CpuAddress());
 		const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
-		if (begin < end && DownloadBufferMemory<true>(buffer, begin, end - begin)) {
+		if (begin < end &&
+		    DownloadBufferMemory<true>(buffer, begin, end - begin, SyncDownloadCause::General)) {
 			downloaded.emplace_back(begin, end - begin);
 		}
 	}
@@ -1319,7 +1322,8 @@ void BufferCache::RunGarbageCollector() {
 		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size(),
+			                                              SyncDownloadCause::General));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
