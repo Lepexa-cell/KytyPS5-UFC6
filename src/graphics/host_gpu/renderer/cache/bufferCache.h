@@ -50,6 +50,18 @@ struct GpuWriteOrigin {
 	uint32_t frame_dispatch = 0;
 };
 
+// Why a synchronous buffer download waits: every DownloadBufferCopies<false>
+// call goes through ReadMemoryStep, so tagging the ReadMemory entry attributes
+// the whole sync-download stall to its first CPU consumer. Diagnostic only.
+enum class SyncDownloadCause : uint8_t {
+	General = 0,      // Unknown / diagnostic paths.
+	ClearMetadata,    // MaterializeColorClear DCC/Cmask metadata refresh.
+	IndirectDispatch, // DispatchIndirect workgroup-count refresh.
+	GpuFault,         // Tracked-page fault served on the GPU thread.
+	SrtGuestRead,     // SRT/materialize guest read of GPU-owned bytes.
+	Count
+};
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -76,7 +88,8 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
+	                                 SyncDownloadCause cause = SyncDownloadCause::General);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	// needs_device_address: the caller reads the data through a buffer device address, which
@@ -193,15 +206,19 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
 	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
-	                                      bool from_gpu_thread, bool async);
+	                                      bool from_gpu_thread, bool async,
+	                                      SyncDownloadCause cause = SyncDownloadCause::General);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        SyncDownloadCause cause = SyncDownloadCause::General);
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                        SyncDownloadCause cause = SyncDownloadCause::General);
 	template <bool async>
 	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-	                          uint64_t total_size);
+	                          uint64_t total_size,
+	                          SyncDownloadCause cause = SyncDownloadCause::General);
 
 	GraphicContext&                                    m_graphics;
 	CommandScheduler&                                  m_scheduler;

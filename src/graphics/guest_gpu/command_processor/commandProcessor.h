@@ -152,6 +152,10 @@ struct FrameTelemetry {
 	uint32_t sync_dl_calls = 0;
 	uint32_t sync_dl_already_submitted = 0;
 	uint32_t sync_dl_forced = 0;
+	// Per-cause sync-download counts: indexed by SyncDownloadCause (bufferCache.h).
+	// The enum lives there to avoid a guest/host include cycle; keep the size in sync.
+	uint32_t sync_dl_cause_calls[5] = {};
+	uint64_t sync_dl_cause_master_wait_us[5] = {};
 	uint64_t sync_dl_submit_us = 0;
 	uint64_t sync_dl_master_wait_us = 0;
 	uint64_t sync_dl_priority_wait_us = 0;
@@ -407,7 +411,8 @@ inline void TelemetryAddReadmemCopyReadback(uint64_t delta_us) {
 	GetFrameTelemetry().readmem_copy_readback_us += delta_us;
 }
 
-inline void TelemetryCountSyncDownloadCall(bool forced) {
+inline void TelemetryCountSyncDownloadCall(bool forced, uint8_t cause,
+                                                   uint64_t master_wait_us) {
 	if (!SyncDownloadDiagEnabled()) {
 		return;
 	}
@@ -417,6 +422,11 @@ inline void TelemetryCountSyncDownloadCall(bool forced) {
 		telemetry.sync_dl_forced++;
 	} else {
 		telemetry.sync_dl_already_submitted++;
+	}
+	// Aggregated cause only: no per-call logging, no new timers.
+	if (cause < std::size(telemetry.sync_dl_cause_calls)) {
+		telemetry.sync_dl_cause_calls[cause]++;
+		telemetry.sync_dl_cause_master_wait_us[cause] += master_wait_us;
 	}
 }
 

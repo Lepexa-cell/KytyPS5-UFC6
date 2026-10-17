@@ -2095,7 +2095,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (gpu_wait_log) {
 			gpu_wait_start_us = TelemetryNowUs();
 		}
-		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		m_buffer_cache.ReadMemory(range.address, range.size, false,
+		                          SyncDownloadCause::ClearMetadata);
 		if (subcounters) {
 			TelemetryAddDrawTargetsClearGpuWait(TelemetryNowUs() - gpu_wait_begin_us);
 		}

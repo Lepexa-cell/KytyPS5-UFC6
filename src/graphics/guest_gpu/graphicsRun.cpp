@@ -1980,14 +1980,28 @@ void TelemetryEndFrame() {
 			// KYTY_OPT_SYNC_DOWNLOAD_DIAG: sync-download covered span only (never the
 			// scheduler's other waits), plus BufferFlush slice boundaries (not submits).
 			if (SyncDownloadDiagEnabled()) {
-				LOGF("[FRAME_TELEMETRY_SYNCDL] calls %.1f forced %.1f already %.1f | submit_cpu %.2f ms master %.2f ms priority %.2f ms publish %.2f ms\n",
-				     static_cast<double>(telemetry.sync_dl_calls) * inv_frames,
-				     static_cast<double>(telemetry.sync_dl_forced) * inv_frames,
-				     static_cast<double>(telemetry.sync_dl_already_submitted) * inv_frames,
-				     static_cast<double>(telemetry.sync_dl_submit_us) * frame_avg,
-				     static_cast<double>(telemetry.sync_dl_master_wait_us) * frame_avg,
-				     static_cast<double>(telemetry.sync_dl_priority_wait_us) * frame_avg,
-				     static_cast<double>(telemetry.sync_dl_publish_us) * frame_avg);
+					// Per-cause sync-download breakdown (SyncDownloadCause order from bufferCache.h).
+			constexpr const char* kCauseNames[] = {"General", "ClearMetadata", "IndirectDispatch",
+			                                       "GpuFault", "SrtGuestRead"};
+			for (uint32_t cause = 0; cause < std::size(kCauseNames); cause++) {
+				const double calls =
+				    static_cast<double>(telemetry.sync_dl_cause_calls[cause]) * inv_frames;
+				if (calls <= 0.0) {
+					continue;
+				}
+				LOGF("[FRAME_TELEMETRY_SYNCDL_CAUSE] %s: %.1f/frame master_wait %.2f ms/frame\n",
+				     kCauseNames[cause], calls,
+				     static_cast<double>(telemetry.sync_dl_cause_master_wait_us[cause]) *
+				         frame_avg);
+			}
+			LOGF("[FRAME_TELEMETRY_SYNCDL] calls %.1f forced %.1f already %.1f | submit_cpu %.2f ms master %.2f ms priority %.2f ms publish %.2f ms\n",
+			     static_cast<double>(telemetry.sync_dl_calls) * inv_frames,
+			     static_cast<double>(telemetry.sync_dl_forced) * inv_frames,
+			     static_cast<double>(telemetry.sync_dl_already_submitted) * inv_frames,
+			     static_cast<double>(telemetry.sync_dl_submit_us) * frame_avg,
+			     static_cast<double>(telemetry.sync_dl_master_wait_us) * frame_avg,
+			     static_cast<double>(telemetry.sync_dl_priority_wait_us) * frame_avg,
+			     static_cast<double>(telemetry.sync_dl_publish_us) * frame_avg);
 				LOGF("[FRAME_TELEMETRY_SLICE] slice boundaries: gfx_completed %.1f gfx_yielded %.1f cmp_completed %.1f cmp_yielded %.1f suspend %.1f\n",
 				     static_cast<double>(telemetry.slice_graphics_completed) * inv_frames,
 				     static_cast<double>(telemetry.slice_graphics_yielded) * inv_frames,

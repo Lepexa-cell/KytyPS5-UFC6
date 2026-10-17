@@ -166,19 +166,22 @@ void BufferCache::ReleaseBuffer(BufferId id) {
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       SyncDownloadCause cause) {
 	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
 	// windows; a window that does not fit drains the ring before it is mapped.
 	const auto capacity = m_download_buffer.Size();
 	bool       any      = false;
 	for (uint64_t offset = 0; offset < size; offset += capacity) {
-		any |= DownloadBufferWindow<async>(buffer, vaddr + offset, std::min(capacity, size - offset));
+		any |= DownloadBufferWindow<async>(buffer, vaddr + offset,
+		                                   std::min(capacity, size - offset), cause);
 	}
 	return any;
 }
 
 template <bool async>
-bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                       SyncDownloadCause cause) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -217,7 +220,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (auto& copy: batch) {
 			copy.dstOffset -= base;
 		}
-		DownloadBufferCopies<async>(buffer, std::move(batch), batch_size);
+		DownloadBufferCopies<async>(buffer, std::move(batch), batch_size, cause);
 		first = last;
 	}
 	return true;
@@ -225,7 +228,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 template <bool async>
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-                                       uint64_t total_size) {
+                                       uint64_t total_size, SyncDownloadCause cause) {
 	Profiler::Add(Profiler::Counter::Readbacks);
 	Profiler::Add(Profiler::Counter::ReadbackBytes, static_cast<int64_t>(total_size));
 	const auto buffer_address = buffer.CpuAddress();
@@ -334,7 +337,8 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		m_scheduler.WaitPriorityOperations(tick);
 		if (diag) {
 			diag_priority_wait_us = TelemetryNowUs() - diag_priority_begin_us;
-			TelemetryCountSyncDownloadCall(forced);
+			TelemetryCountSyncDownloadCall(forced, static_cast<uint8_t>(cause),
+			                               diag_master_wait_us);
 			TelemetryAddSyncDownloadSubmit(diag_submit_us);
 			TelemetryAddSyncDownloadMasterWait(diag_master_wait_us);
 		}
@@ -449,7 +453,8 @@ static const bool g_async_readback = [] {
 	return value == nullptr || value[0] != '0';
 }();
 
-void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write,
+                             SyncDownloadCause cause) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -461,8 +466,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	for (;;) {
 		uint64_t wait_tick = 0;
 		m_scheduler.Context().GetGpu().SendCommandSync(
-		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick] {
-			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+		    [this, vaddr, size, is_write, from_gpu_thread, async, cause, &wait_tick] {
+			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async, cause);
 		    });
 		if (wait_tick == 0) {
 			return;
@@ -497,7 +502,7 @@ static bool ReadbackRetick() {
 }
 
 uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
-                                     bool from_gpu_thread, bool async) {
+                                     bool from_gpu_thread, bool async, SyncDownloadCause cause) {
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return 0;
 	}
