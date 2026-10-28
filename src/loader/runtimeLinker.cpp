@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -12,7 +13,6 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
-#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -25,15 +25,14 @@
 #include "loader/x64InstructionEmulator.h"
 
 #include <algorithm>
-#include <chrono>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -90,16 +89,6 @@ ThreadLocalStorage::~ThreadLocalStorage() {
 		FreeTlsBlock(&block);
 	}
 }
-
-#pragma pack(1)
-
-struct EntryParams {
-	int         argc;
-	uint32_t    pad;
-	const char* argv[3];
-};
-
-#pragma pack()
 
 using atexit_func_t = KYTY_SYSV_ABI void (*)();
 using entry_func_t  = KYTY_SYSV_ABI void (*)(EntryParams* params, atexit_func_t atexit_func);
@@ -202,6 +191,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -659,95 +649,12 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
-// Tracked-page faults are the emulator's CPU/GPU coherence mechanism, and every one costs a
-// protection change or a GPU drain. This tallies who takes them (host code address, thread)
-// so the hot readers and writers of GPU-owned memory can be named.
-namespace {
-struct FaultStats {
-	struct Site {
-		uint64_t address = 0;
-		uint64_t count   = 0;
-		uint64_t reads   = 0;
-		uint64_t gpu     = 0;
-		uint64_t micros  = 0; // time in the handler: downloads and GPU waits show up here
-		uint64_t vaddr   = 0; // last faulting guest address
-		uint64_t emulated = 0; // reads of GPU-clean bytes completed by the handler itself
-	};
-	std::mutex             mutex;
-	std::vector<Site>      sites;
-	uint64_t               total    = 0;
-	uint64_t               reported = 0;
-};
-FaultStats g_fault_stats;
-
-void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bool gpu_thread,
-                        uint64_t micros, bool emulated) {
-	if (gpu_thread && !emulated) {
-		// The GPU thread faulting on GPU-owned memory drains the whole pipeline; the first few
-		// get a full host stack so the command-processor path responsible can be named.
-		static std::atomic<uint32_t> traced = 0;
-		if (traced.fetch_add(1) < 48) {
-			LOGF("TrackedFault on GPU thread: %s vaddr=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n%s",
-			     is_read ? "read" : "write", guest_vaddr, host_pc,
-			     Common::HostBacktrace().c_str());
-		}
-	}
-	std::scoped_lock lock(g_fault_stats.mutex);
-	auto&            stats = g_fault_stats;
-	stats.total++;
-	auto it = std::find_if(stats.sites.begin(), stats.sites.end(),
-	                       [host_pc](const FaultStats::Site& site) { return site.address == host_pc; });
-	if (it == stats.sites.end()) {
-		stats.sites.push_back({host_pc, 0, 0, 0, 0, 0, 0});
-		it = std::prev(stats.sites.end());
-	}
-	it->count++;
-	it->reads += is_read ? 1 : 0;
-	it->gpu += gpu_thread ? 1 : 0;
-	it->micros += micros;
-	it->vaddr = guest_vaddr;
-	it->emulated += emulated ? 1 : 0;
-	if (stats.total - stats.reported < 5000) {
-		return;
-	}
-	stats.reported = stats.total;
-	std::sort(stats.sites.begin(), stats.sites.end(),
-	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.count > b.count; });
-	uint64_t gpu_total = 0;
-	for (const auto& site: stats.sites) {
-		gpu_total += site.gpu;
-	}
-	LOGF("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
-	     gpu_total, stats.sites.size());
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
-		const auto& site = stats.sites[i];
-		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64 "\n",
-		     site.address, site.count, site.reads, site.gpu);
-	}
-	std::sort(stats.sites.begin(), stats.sites.end(),
-	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.gpu > b.gpu; });
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 8) && stats.sites[i].gpu != 0; i++) {
-		const auto& site = stats.sites[i];
-		LOGF("\t gpu-thread pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 "\n", site.address,
-		     site.gpu, site.reads);
-	}
-	std::sort(stats.sites.begin(), stats.sites.end(),
-	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.micros > b.micros; });
-	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
-		const auto& site = stats.sites[i];
-		LOGF("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
-		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
-		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
-		     site.vaddr);
-	}
-}
-} // namespace
-
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -761,30 +668,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		const auto started = std::chrono::steady_clock::now();
-		const auto elapsed = [started] {
-			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
-			                                 std::chrono::steady_clock::now() - started)
-			                                 .count());
-		};
-		// A read of bytes the GPU has not written, on a page protected because it wrote others:
-		// complete the load from the backing store and leave the page protected. Otherwise the
-		// fault waits for the GPU thread, which downloads the page and drains the GPU.
-		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
-		static const bool emulate_clean_reads =
-		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
-		if (access == GpuAccess::Read && emulate_clean_reads &&
-		    Loader::X64InstructionEmulator::TryEmulateLoad(
-		        info->native_context, info->access_violation_vaddr,
-		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
-			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
-			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
-			return true;
-		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
-			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
-			                   elapsed(), false);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -1393,11 +1278,16 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
 	if (auto entry = GetEntry(); entry != 0) {
+		const auto& arguments = Config::GetGuestArguments();
+		const auto params_size = offsetof(EntryParams, argv) +
+		                         (arguments.size() + 2) * sizeof(const char*);
 		auto* params = reinterpret_cast<EntryParams*>(
-		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
-		std::memset(params, 0, sizeof(EntryParams));
-		params->argc    = 1;
-		params->argv[0] = "KytyEmu";
+		    (reinterpret_cast<uintptr_t>(main_stack_top) - params_size - 0x100u) &
+		    ~static_cast<uintptr_t>(0x0f));
+		std::memset(params, 0, params_size);
+		for (const auto& argument: arguments) {
+			params->argv[params->argc++] = argument.c_str();
+		}
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
@@ -1780,11 +1670,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-#if !defined(__APPLE__)
 	const bool emulate_amd = Config::AmdCpuEnabled();
-#else
-	const bool emulate_amd = false;
-#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else

@@ -1,5 +1,9 @@
+#define SPV_ENABLE_UTILITY_CODE
+
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -34,24 +38,27 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include <vulkan/vulkan_format_traits.hpp>
+#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
+#include "loader/symbolDatabase.h"
 #include "spirv-tools/libspirv.hpp"
 
 #if __has_include("graphics/host_gpu/renderer/renderTargetBarriers.h")
@@ -79,6 +86,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -89,6 +97,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -105,6 +114,10 @@
 #undef min
 #undef max
 #endif
+
+namespace Libs {
+void InitAgcDriver_1(Loader::SymbolDatabase *symbols);
+}
 
 namespace Libs::Graphics {
 
@@ -155,6 +168,8 @@ struct BufferCacheTestAccess {
   static_assert(std::same_as<decltype(BufferCache::m_slot_buffers),
                              Common::SlotVector<Buffer>>);
 
+  static uint64_t GcTick(const BufferCache &cache) { return cache.m_gc_tick; }
+
   static void SetGarbageCollectionThresholds(BufferCache &cache,
                                              uint64_t trigger,
                                              uint64_t critical) {
@@ -162,13 +177,15 @@ struct BufferCacheTestAccess {
     cache.m_critical_gc_memory = critical;
   }
 
-  // The caches age their entries by presented frames; the tests present them here.
-  static void PresentFrames(BufferCache &cache, uint64_t frames) {
-    cache.m_graphics.presented_frames.fetch_add(frames);
-  }
-
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
+  }
+
+  static void SetUnusedStagingBufferSize(BufferCache &cache, uint64_t size) {
+    // Called immediately after cache construction, before any staging reservation.
+    std::destroy_at(&cache.m_staging_buffer);
+    std::construct_at(&cache.m_staging_buffer, cache.m_graphics, cache.m_scheduler,
+                      MemoryUsage::Upload, size);
   }
 
   static bool SynchronizeBufferFromImage(BufferCache &cache, Buffer &buffer,
@@ -211,12 +228,26 @@ struct TileManagerTestAccess {
   }
 };
 
+struct ImageHeapTestAccess {
+  static size_t ElementCount(const ImageHeap &heap) { return heap.m_elements.size(); }
+  static size_t MemoryCount(const ImageHeap &heap) { return heap.m_memories.size(); }
+  static const auto &Views(const ImageHeap &heap) { return heap.m_memories.at(0)->views; }
+  static const auto &Element(const ImageHeap &heap, uint32_t entry) {
+    return heap.m_elements[entry & ((1u << ShaderRecompiler::IR::ImageHeapKindShift) - 1u)];
+  }
+  static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
+    return Element(heap, entry).binding.image_id;
+  }
+};
+
 struct TextureCacheTestAccess {
   static_assert(std::same_as<decltype(TextureCache::m_slot_images),
                              Common::SlotVector<Image>>);
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 44);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
+
+  static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
 
   static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
@@ -236,9 +267,6 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
-    // A fresh scenario: the per-frame eviction budget starts empty, as at a new frame.
-    cache.m_gc_freed_bytes_frame = 0;
-    cache.m_gc_freed_images_frame = 0;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
@@ -344,10 +372,6 @@ struct TextureCacheTestAccess {
     return cache.m_download_images.contains(id);
   }
 
-  static size_t NullImageCount(const TextureCache &cache) {
-    return cache.m_null_images.size();
-  }
-
   static void TrackDownload(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.TrackImageDownload(id, cache.m_slot_images[id]);
@@ -381,23 +405,27 @@ struct TextureCacheTestAccess {
   static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
-    metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.clear_mask.reset();
   }
 
   static TileManager &Tiler(TextureCache &cache) { return cache.m_tiler; }
 };
 
 struct RenderExecutorTestAccess {
-  static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
-                       const DrawAutoArgs &args) {
-    executor.DrawAuto(0, command, args);
+  static bool DrawIndex(RenderExecutor &executor, CommandBuffer &command,
+                        const DrawIndexArgs &args) {
+    return executor.DrawIndex(0, command, args);
   }
 
-  static bool TryConsumeComputeImageClear(RenderExecutor &executor,
+  static bool DrawAuto(RenderExecutor &executor, CommandBuffer &command,
+                       const DrawAutoArgs &args) {
+    return executor.DrawAuto(0, command, args);
+  }
+
+  static bool TryConsumeComputeFill(RenderExecutor &executor,
       const ShaderComputeInputInfo &input, CommandBuffer &command,
       uint32_t x, uint32_t y, uint32_t z, uint32_t mode) {
-    return executor.TryConsumeComputeImageClear(input, command, x, y, z, mode);
+    return executor.TryConsumeComputeFill(input, command, x, y, z, mode);
   }
 
   static bool TryConsumeComputeMetaClear(RenderExecutor &executor,
@@ -449,11 +477,12 @@ struct RenderExecutorTestAccess {
                                 : program.stage == ShaderType::Pixel
                                     ? vk::ShaderStageFlagBits::eFragment
                                     : vk::ShaderStageFlagBits::eCompute;
-      for (const auto &binding : program.bindings.descriptors) {
+      for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+        const auto index = std::countr_zero(mask);
+        const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
         layout_bindings.push_back(
-            {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
-             NativeDescriptorType(binding.kind), NativeDescriptorCount(binding),
-             shader_stage});
+            {ShaderRecompiler::IR::NativeBinding(program.stage, kind),
+             NativeDescriptorType(kind), program.bindings.descriptor_counts[index], shader_stage});
       }
     }
     vk::DescriptorSetLayoutCreateInfo descriptor_info{};
@@ -583,6 +612,22 @@ using u32 = uint32_t;
 using BindingType = TextureCache::BindingType;
 using ImageDesc = TextureCache::ImageDesc;
 using ShaderOpcode = ShaderRecompiler::Decoder::Opcode;
+
+ImageInfo MakeTilingImage(Prospero::BufferFormat format, uint32_t width,
+                          uint32_t height, uint32_t levels, uint32_t depth,
+                          Prospero::TileMode tile, uint64_t guest_size,
+                          bool volume) {
+  ImageInfo info{};
+  info.guest_format = format;
+  info.type =
+      volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+  info.extent = {width, height, volume ? depth : 1u};
+  info.resources = {levels, volume ? 1u : depth};
+  info.data.size = guest_size;
+  info.tile_mode = tile;
+  info.UpdateSize();
+  return info;
+}
 
 constexpr u32 InlineU32(u32 value) { return 128u + value; }
 
@@ -722,7 +767,7 @@ constexpr u32 EncodeVopcSdwa(u32 src0, u32 sdst = 0, u32 sd = 0,
 
 constexpr u32 EncodeMubuf0(u32 opcode, u32 offset = 0, bool idxen = false,
                            bool offen = true, bool glc = false) {
-  return (0x38u << 26u) | ((opcode & 0x7fu) << 18u) |
+  return (0x38u << 26u) | ((opcode & 0xffu) << 18u) |
          (offen ? (1u << 12u) : 0u) | (idxen ? (1u << 13u) : 0u) |
          (glc ? (1u << 14u) : 0u) | (offset & 0xfffu);
 }
@@ -1277,68 +1322,13 @@ void CheckLeastRecentlyUsedCacheOrdering() {
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
 }
 
-// The cached expander must return exactly what InlineShaderFunctions returns, while user data
-// the call does not depend on changes, the target changes, and the callee code changes.
-void CheckShaderFunctionExpansionCache() {
-  constexpr const char *name = "ShaderFunctionExpansionCache";
-  constexpr uint64_t callee_a = 0x10000000ull;
-  constexpr uint64_t callee_b = 0x10000100ull;
-  std::vector<u32> memory(0x200 / 4, 0xbf810000u);
-  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
-    std::copy(words.begin(), words.end(), memory.begin() + (address - callee_a) / 4);
-  };
-  // v_mov_b32 v0, 1; s_setpc_b64 s[4:5]
-  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 4)});
-  // v_mov_b32 v0, 2; v_mov_b32 v1, 3; s_setpc_b64 s[4:5]
-  store(callee_b, {EncodeVop1(0x01u, 0, InlineU32(2)), EncodeVop1(0x01u, 1, InlineU32(3)),
-                   EncodeSop1(0x20u, 0, 4)});
-  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<uint32_t> words) {
-    if (address < callee_a || address + words.size() * 4 > callee_a + memory.size() * 4) {
-      return false;
-    }
-    std::copy_n(memory.begin() + (address - callee_a) / 4, words.size(), words.begin());
-    return true;
-  };
-  // s_swappc_b64 s[4:5], s[0:1]: the target comes from user data s0/s1.
-  std::vector<u32> code{EncodeSop1(0x21u, 4, 0)};
-  AppendEnd(&code);
-  const uint64_t base = reinterpret_cast<uint64_t>(code.data());
-
-  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
-  const auto check = [&](const char *step, std::array<u32, 3> user_data,
-                         bool expect_calls) {
-    std::vector<u32> reference;
-    std::vector<u32> cached;
-    std::string reference_reason;
-    std::string cached_reason;
-    const bool reference_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
-        code, base, user_data, read, reference, reference_reason, 64);
-    const bool cached_ok =
-        expander.Expand(code, base, user_data, read, cached, cached_reason, 64);
-    Require(name, step,
-            reference_ok && cached_ok && reference == cached &&
-                reference_reason == cached_reason && (reference.size() > 2) == expect_calls,
-            "the cached expansion differs from InlineShaderFunctions");
-    return cached;
-  };
-  const auto first = check("first expansion", {u32(callee_a), 0, 7}, true);
-  const auto unrelated = check("unrelated user data", {u32(callee_a), 0, 9}, true);
-  Require(name, "unrelated user data", first == unrelated,
-          "a register the call does not use changed the expansion");
-  const auto other = check("other target", {u32(callee_b), 0, 9}, true);
-  Require(name, "other target", other != first, "a new call target reused the old expansion");
-  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(4))});
-  const auto patched = check("patched callee", {u32(callee_a), 0, 7}, true);
-  Require(name, "patched callee", patched != first,
-          "changed callee code reused the old expansion");
-  check("target again", {u32(callee_b), 0, 7}, true);
-  std::printf("[host]    %-32s ok\n", name);
-}
-
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
 };
+
+using ShaderProfile = ShaderRecompiler::Spirv::Profile;
+constexpr ShaderProfile Maintenance8Profile{.maintenance8 = true};
 
 struct TestCase {
   const char *name = "";
@@ -1367,6 +1357,7 @@ struct TestCase {
   std::vector<u32> expected_storage_image_r32ui;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
+  const ShaderProfile *profile = &Maintenance8Profile;
   ShaderComputeInputInfo compute_info = [] {
     ShaderComputeInputInfo info{};
     info.lds_size_dwords = 1024;
@@ -1382,7 +1373,9 @@ struct TestCase {
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
+  std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
+  std::optional<uint64_t> fault_free_address;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -1392,6 +1385,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  size_t max_spirv_words = 0;
 };
 
 struct GraphicsCase {
@@ -1404,16 +1398,21 @@ struct GraphicsCase {
   std::vector<u32> push_constants;
   std::vector<u32> pixel_interpolator_settings;
   bool pixel_no_perspective = false;
+  bool provoking_vtx_last = false;
   std::vector<u32> vertices;
   bool pixel_ancillary = false;
   bool pixel_front_face = false;
+  bool pixel_front_face_all_bits = false;
   u32 layers = 1;
   vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1;
   bool pixel_position_w = false;
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
+  u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 width = 1;
+  std::vector<u32> object_ids;
 };
 
 struct CompiledShader {
@@ -1456,7 +1455,9 @@ void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
     messages += buffer;
   });
 
-  if (!tools.Validate(spirv)) {
+  spvtools::ValidatorOptions options;
+  options.SetAllowOffsetTextureOperand(true);
+  if (!tools.Validate(spirv.data(), spirv.size(), options)) {
     Fail(shader_name, "SPIR-V validation", messages);
   }
 }
@@ -1499,6 +1500,20 @@ void CheckPixelParameterAliases() {
   pixel.interpolator_settings[1] = 0u;
   pixel.interpolator_settings[2] = 1u;
   const std::array<uint32_t, 3> active = {0, 1, 2};
+  Require(name, "ordinary mixed aliases",
+          ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 1) == 0u &&
+              ShaderPixelParameterLocation(pixel, active, 2) == 1u,
+          "flat/smooth aliases must retain the real vertex export location");
+  std::vector<uint32_t> ordinary_key, rectangle_key, provoking_key;
+  BuildStageStaticKey(pixel, ordinary_key);
+  pixel.parameter_mode = ShaderPixelParameterMode::LastVertex;
+  BuildStageStaticKey(pixel, provoking_key);
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  BuildStageStaticKey(pixel, rectangle_key);
+  Require(name, "interpolation specialization",
+          ordinary_key != rectangle_key && ordinary_key != provoking_key,
+          "rectangle and provoking-vertex modes must participate in the shader key");
   Require(name, "reserved physical locations",
           ShaderPixelParameterLocation(pixel, active, 0) == 0u &&
               ShaderPixelParameterLocation(pixel, active, 1) == 2u &&
@@ -1523,6 +1538,7 @@ void CheckRectListShaders() {
   vertex.stage.program = &vertex_program;
   vertex.stage.resources = &empty_snapshot;
   ShaderPixelInputInfo pixel{};
+  pixel.parameter_mode = ShaderPixelParameterMode::Rectangle;
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
@@ -1616,7 +1632,32 @@ void CheckRectListShaders() {
   ValidateSpirv(name, position_only.evaluation);
 }
 
-void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
+// Words without OpName/OpString/OpLine, which only graphics debug dumps emit.
+size_t SpirvCodeWords(const std::vector<u32> &spirv) {
+  size_t words = spirv.size();
+  for (size_t offset = 5; offset < spirv.size(); offset += spirv[offset] >> 16u) {
+    const auto opcode = static_cast<spv::Op>(spirv[offset] & 0xffffu);
+    if (opcode == spv::OpName || opcode == spv::OpString || opcode == spv::OpLine)
+      words -= spirv[offset] >> 16u;
+  }
+  return words;
+}
+
+void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
+  std::vector<u32> result_types(spirv[3]);
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    bool has_result = false, has_type = false;
+    spv::HasResultAndType(opcode, &has_result, &has_type);
+    if (has_result && has_type) result_types[words[2]] = words[1];
+    if (opcode == spv::OpBitcast) {
+      Require(test.name, "bitcast changes representation",
+              words[1] != result_types[words[3]],
+              "emitted a redundant bitcast between identical SPIR-V types");
+    }
+    offset += words.size();
+  }
   if (test.required_spirv.empty() && test.forbidden_spirv.empty()) {
     return;
   }
@@ -1660,7 +1701,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
+  options.profile = test.profile;
   options.dump_ir = true;
+  options.emit_debug_info = true; // Checks find variables and functions by OpName.
   auto compute_info = test.compute_info;
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
@@ -1675,12 +1718,14 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
   ShaderRecompiler::IR::ResourceSnapshot resources;
   ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const std::array workgroup_counts{test.dispatch_x, test.dispatch_y, test.dispatch_z};
   const ShaderRecompiler::IR::SrtRuntime runtime{
       .user_data = options.user_data,
       .shader_base = reinterpret_cast<uint64_t>(test.code.data()),
       .read_memory = ReadTestMemory,
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
+      .workgroup_counts = workgroup_counts,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -1710,15 +1755,11 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
             image != result.program.info.images.end() &&
                 image->mip_count == test.expected_mip_descriptors,
             "runtime descriptor range did not specialize the mip count");
-    const auto resource =
-        static_cast<u32>(image - result.program.info.images.begin());
     const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(*image);
-    const auto *binding = kind ? ShaderRecompiler::IR::FindBinding(
-                                     result.program.bindings, *kind) : nullptr;
     Require(test.name, "dynamic mip binding",
-            binding != nullptr &&
-                std::ranges::count(binding->resources, resource) ==
-                    test.expected_mip_descriptors,
+            kind && image->descriptor_index != UINT32_MAX &&
+                image->descriptor_index + image->mip_count <=
+                    result.program.bindings.descriptor_counts[static_cast<size_t>(*kind)],
             "dynamic image did not receive one descriptor per mip");
   }
   if (test.expand_shader_data_storage) {
@@ -1731,49 +1772,54 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       block.AppendNewInst(ShaderRecompiler::IR::ValueOpcode::ReferenceU32,
                           {ShaderRecompiler::IR::Value(&user_data)});
     }
-    result.program.bindings = {};
-    result.program.binding_layout_complete = false;
-    ShaderRecompiler::IR::AllocateBindings(result.program);
-    const auto *shader_data = ShaderRecompiler::IR::FindBinding(
-        result.program.bindings,
-        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData);
+    result.program.shader_info_complete = false;
+    ShaderRecompiler::IR::CollectShaderInfo(result.program, options.input_info);
+    result.spirv = ShaderRecompiler::Spirv::EmitProgram(
+        result.program, options.input_info, 0u, *options.profile, true);
+    const auto shader_data = result.program.bindings.descriptor_counts[
+        static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)];
     Require(test.name, "binding layout",
-            result.program.bindings.user_data_registers.size() == 33 &&
+            result.program.info.user_data_registers.size() == 33 &&
                 !result.program.bindings.UsesPushData() &&
-                shader_data != nullptr,
+                shader_data != 0,
             "oversized shader data did not use its storage fallback");
-    result.spirv = ShaderRecompiler::Spirv::EmitProgram(result.program,
-                                                        options.input_info);
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvText(test, result.spirv);
-  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+  CheckSpirvEmission(test, result.spirv);
+  if (test.max_spirv_words != 0u) {
+    const auto words = SpirvCodeWords(result.spirv);
+    Require(test.name, "emitted shader size", words <= test.max_spirv_words,
+            "SPIR-V words=" + std::to_string(words) +
+                ", limit=" + std::to_string(test.max_spirv_words));
+    std::printf("[compute] %s wave=%u SPIR-V words=%zu\n", test.name,
+                result.program.wave_size, words);
+  }
   if (test.expected_buffer_resources) {
+    std::vector<u32> resources;
+    for (u32 i = 0; i < result.program.info.buffers.size(); ++i) {
+      if (result.program.info.buffers[i].descriptor_index != UINT32_MAX) resources.push_back(i);
+    }
     Require(test.name, "live buffer bindings",
-            buffer_binding != nullptr &&
-                buffer_binding->resources == *test.expected_buffer_resources,
+            resources == *test.expected_buffer_resources,
             "dead buffer changed the surviving descriptor order");
   }
   std::vector<u32> packed_user_data;
-  for (const auto reg : result.program.bindings.user_data_registers) {
+  for (const auto reg : result.program.info.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count = result.program.bindings.memory_offset_count;
-  for (u32 i = 0; i < buffer_count; i++) {
-    u32 offset = 0;
-    const auto resource = buffer_binding->resources[i];
-    if (resource < test.storage_buffer_offsets.size()) {
-      offset = test.storage_buffer_offsets[resource];
-    }
+  for (u32 resource = 0; resource < result.program.info.buffers.size(); ++resource) {
+    const auto index = result.program.info.buffers[resource].descriptor_index;
+    if (index == UINT32_MAX) continue;
+    const auto offset = resource < test.storage_buffer_offsets.size()
+                            ? test.storage_buffer_offsets[resource] : 0u;
     Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
-    packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
-        offset << ((i % 4u) * 8u);
+    packed_user_data[result.program.bindings.memory_offset_dword + index / 4u] |=
+        offset << ((index % 4u) * 8u);
   }
   return {std::move(result.spirv), std::move(result.program),
           std::move(resources), std::move(packed_user_data)};
@@ -1824,13 +1870,18 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
           ? 1u
           : static_cast<u32>(test.pixel_interpolator_settings.size());
   pixel_info.ps_no_perspective = test.pixel_no_perspective;
+  pixel_info.parameter_mode = test.provoking_vtx_last ? ShaderPixelParameterMode::LastVertex
+                                                    : ShaderPixelParameterMode::FirstVertex;
   pixel_info.ps_ancillary = test.pixel_ancillary;
   pixel_info.ps_front_face = test.pixel_front_face;
+  pixel_info.ps_front_face_all_bits = test.pixel_front_face_all_bits;
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
   pixel_info.ps_system_input_base = 2;
+  pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  pixel_info.object_primitive_id = !test.object_ids.empty();
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -1842,6 +1893,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
+  options.profile = &Maintenance8Profile;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -1861,12 +1913,13 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
               resource_plan, runtime, resources, specialization),
           "translated resources could not be materialized");
   auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+      std::move(translated), options, specialization,
+      static_cast<u32>(pixel_info.object_primitive_id));
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   std::vector<u32> packed_user_data;
-  for (const auto reg : result.program.bindings.user_data_registers) {
+  for (const auto reg : result.program.info.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
@@ -1979,6 +2032,12 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
+  // Host float min/max is used on AMD GPUs, as in Kyty.
+  [[nodiscard]] bool SupportsNativeFloatMinMax() const {
+    vk::PhysicalDeviceProperties properties;
+    m_physical_device.getProperties(&properties);
+    return properties.vendorID == 0x1002u;
+  }
 
   VulkanHarness(const VulkanHarness &) = delete;
   VulkanHarness &operator=(const VulkanHarness &) = delete;
@@ -2001,7 +2060,6 @@ public:
     u32 height = 0;
     u32 layers = 1;
     u32 mip_levels = 1;
-    u32 dwords_per_pixel = 0;
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
@@ -2010,6 +2068,9 @@ public:
     vk::PhysicalDeviceProperties2 properties{};
     properties.pNext = &subgroup;
     m_physical_device.getProperties2(&properties);
+    Require("VulkanHarness", "subgroup vote support",
+            bool(subgroup.supportedOperations & vk::SubgroupFeatureFlagBits::eVote),
+            "device does not support subgroup All/Any votes");
     return subgroup.subgroupSize;
   }
   // A consumer GPU may lack the production rasterization features the fragment
@@ -2173,12 +2234,12 @@ public:
     ShaderRecompiler::IR::CompiledShaderInfo vertex_program{};
     vertex_program.stage = ShaderType::Vertex;
     vertex_program.bindings.push_data_start_dword = 2;
-    vertex_program.bindings.user_data_registers = {0, 1};
+    vertex_program.info.user_data_registers = {0, 1};
     vertex_program.bindings.memory_offset_dword = 2;
     ShaderRecompiler::IR::CompiledShaderInfo pixel_program{};
     pixel_program.stage = ShaderType::Pixel;
     pixel_program.bindings.push_data_start_dword = 0;
-    pixel_program.bindings.user_data_registers = {0, 1};
+    pixel_program.info.user_data_registers = {0, 1};
     pixel_program.bindings.memory_offset_dword = 2;
     ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex_snapshot.user_data = {0x11111111u, 0x22222222u};
@@ -2409,6 +2470,7 @@ public:
 
     constexpr uint64_t base = 0x0000000200000000ull;
     constexpr uint64_t page = 0x4000;
+    const auto cpu_only_tick = scheduler.CurrentTick();
     resources.MapMemory(base, page * 4);
     resources.MapMemory(base + page * 2, page * 4);
     Require("GpuMappedRangeLifecycle", "union",
@@ -2441,8 +2503,9 @@ public:
     resources.MapMemory(new_prt, page * 6);
     Require("GpuMappedRangeLifecycle", "PRT replacement",
             !resources.IsMapped(old_prt, page * 4) &&
-                resources.IsMapped(new_prt, page * 6),
-            "old-unmap/new-map did not replace full PRT coverage");
+                resources.IsMapped(new_prt, page * 6) &&
+                scheduler.CurrentTick() == cpu_only_tick,
+            "CPU-only unmaps submitted GPU work or lost full PRT coverage");
 
     scheduler.Finish();
     context.ShutdownGpu();
@@ -2633,6 +2696,31 @@ public:
       packet[4] = value;
     };
 
+    const auto cache_ticks = [&] {
+      std::pair<uint64_t, uint64_t> ticks;
+      gpu.SendCommandSync([&] {
+        ticks = {TextureCacheTestAccess::GcTick(context.GetTextureCache()),
+                 BufferCacheTestAccess::GcTick(context.GetBufferCache())};
+      });
+      return ticks;
+    };
+    const auto initial_cache_ticks = cache_ticks();
+    uint32_t graphics_value = 0;
+    uint32_t async_value = 0;
+    std::array<uint32_t, 5> graphics_list{}, compute_list{};
+    write(graphics_list.data(), &graphics_value, 17);
+    write(compute_list.data(), &async_value, 29);
+    // A frame can contain many lists; completing them must not age either cache.
+    for (uint32_t i = 0; i < 32; ++i) {
+      gpu.Submit(graphics_list, {});
+      gpu.SubmitCompute(0x20, compute_list);
+    }
+    finish();
+    Require(name, "command-list cache lifetime",
+            graphics_value == 17 && async_value == 29 &&
+                cache_ticks() == initial_cache_ticks,
+            "individual graphics or compute lists aged the caches within a frame");
+
     gpu.SendCommandSync([&] {
       setup.BufferInit();
       SubmitInfo blocked;
@@ -2667,6 +2755,10 @@ public:
     parser.join();
     Require(name, "marker insertion", parser_nonblocking,
             "inserting a suspend point blocked the GPU command thread");
+    Require(name, "frame cache maintenance",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 1,
+                                      initial_cache_ticks.second + 1},
+            "a suspend point did not age both caches exactly once");
 
     std::binary_semaphore second_entered{0};
     std::binary_semaphore second_returned{0};
@@ -2704,6 +2796,10 @@ public:
             "or the host command lane");
     Require(name, "frame count", gpu.GetFrameNum() == 2,
             "suspend-point insertion did not advance the frame counter once");
+    Require(name, "async cache lifetime",
+            cache_ticks() == std::pair{initial_cache_ticks.first + 2,
+                                      initial_cache_ticks.second + 2},
+            "asynchronous work aged the caches between frame boundaries");
 
     // A marker must stay behind a stalled graphics stream, then clear its
     // predicate before the next stream. Async compute releases that stream.
@@ -2886,10 +2982,20 @@ public:
       alignas(uint64_t) uint64_t interrupt_only_gds_label = UINT64_MAX;
       alignas(uint64_t) uint64_t cb_db_release_label = UINT64_MAX;
       bool parser_kept_nonblocking_boundaries = false;
+      bool host_resource_retired = false;
+      bool cpu_unmap_did_not_submit = false;
       std::jthread no_gpu_wait([&] {
         gpu.SendCommandSync([&] {
           processor->BufferInit();
           const auto tick_before = gpu_scheduler.CurrentTick();
+          gpu_scheduler.DeferOperation([&] { host_resource_retired = true; });
+          constexpr uint64_t cpu_only_address = 0x0000000200400000ull;
+          context.MapMemory(cpu_only_address, 0x4000);
+          context.UnmapMemory(cpu_only_address, 0x4000);
+          cpu_unmap_did_not_submit =
+              gpu_scheduler.CurrentTick() == tick_before &&
+              !host_resource_retired &&
+              !context.IsMapped(cpu_only_address, 0x4000);
           processor->TriggerEvent(0x16u, 0u);
           auto packet = make_release_mem(0, 0, nullptr, 0);
           Pm4Execution execution;
@@ -2955,6 +3061,10 @@ public:
       no_gpu_wait.join();
       gpu.SendCommandSync([&] { gpu_scheduler.Finish(); });
       m_runtime_context.device.destroySemaphore(blocked_timeline, nullptr);
+      Require("GpuCommandLane", "CPU-only unmap with pending host retirement",
+              parser_did_not_wait_gpu && cpu_unmap_did_not_submit &&
+                  host_resource_retired,
+              "CPU-only unmap submitted or waited for unrelated native work");
       Require("GpuCommandLane", "nonblocking GPU packets",
               parser_did_not_wait_gpu && parser_kept_nonblocking_boundaries,
               "a cache event, GL2 writeback, DE counter, or interrupt boundary "
@@ -2997,14 +3107,13 @@ public:
         const bool gds_waited_once =
             gpu_scheduler.CurrentTick() == gds_tick + 1;
 
-        // An interrupt-only event is queued for its tick and batched a few events deep.
         auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
         Pm4Execution interrupt_execution;
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_batched =
-            gpu_scheduler.CurrentTick() == interrupt_tick;
+        const bool interrupt_split_once =
+            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -3017,7 +3126,7 @@ public:
         release_mem_submission_counts =
             gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_batched &&
+            interrupt_split_once &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -3029,8 +3138,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required readback, retained a redundant GPU "
-              "wait, or split a batchable fence write");
+              "RELEASE_MEM lost its required split/readback or retained a "
+              "redundant GPU wait");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
@@ -3390,13 +3499,14 @@ public:
             "an unrelated unmap waited for a blocked PM4 submission");
 
     auto &scheduler = context.GetCommandScheduler();
-    std::atomic<bool> normal_completed{false};
-    gpu.SendCommandSync(
-        [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
+    std::atomic<bool> completion_published{false};
+    gpu.SendCommandSync([&] {
+      scheduler.DeferPriorityOperation([&] { completion_published = true; });
+    });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
     Require("GpuCommandLane", "unmap native completion",
-            normal_completed.load() &&
+            completion_published.load() &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
             "unmap returned before an earlier native guest-memory callback");
 
@@ -4169,6 +4279,13 @@ public:
               cache.IsRegionRegistered(index_begin - 1, index_span + 2),
           "indexed lookup mishandled a half-open boundary, gap, or broad "
           "overlap");
+      const auto clean_unmap_tick = scheduler.CurrentTick();
+      resources.UnmapMemory(index_begin, index_page);
+      Require(name, "clean cached buffer unmap drain",
+              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
+                  !resources.IsMapped(index_begin, index_page),
+              "unmapping a clean cached buffer did not drain native work");
+      resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
       Require(name, "registered-range merge",
@@ -4469,7 +4586,6 @@ public:
       cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
                        false);
 
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4488,48 +4604,20 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
                                               &second_before_completion,
                                               sizeof(second_before_completion));
-      // An aged dirty Buffer is published and dropped under normal pressure as well: a
-      // retained one keeps owning its pages, and images sharing them are re-sourced from
-      // its stale bytes.
-      Require(name, "normal dirty publication",
-              first_before_completion == first_value &&
-                  second_before_completion == second_value &&
-                  !cache.IsRegionRegistered(base, allocation_size) &&
-                  !cache.IsRegionGpuModified(base + first_offset,
-                                             sizeof(first_value)) &&
-                  !cache.IsRegionGpuModified(base + second_offset,
-                                             sizeof(second_value)) &&
-                  !cache.HasGpuDirtyBytes(base + first_offset,
-                                          sizeof(first_value)) &&
-                  !cache.HasGpuDirtyBytes(base + second_offset,
-                                          sizeof(second_value)) &&
-                  scheduler.CurrentTick() > gc_submission_tick,
-              "normal GC retained or failed to publish an aged dirty Buffer");
-
-      // Re-arm the same dirty state, aged past the critical policy's 80 ticks, for the
-      // publication-ordering check below.
-      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
-                                            sizeof(first_stale));
-      Libs::LibKernel::Memory::WriteBacking(base + second_offset, &second_stale,
-                                            sizeof(second_stale));
-      MarkGpuWrite(base + first_offset, sizeof(first_value));
-      MarkGpuWrite(base + second_offset, sizeof(second_value));
-      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
-                       false);
-      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
-                       false);
-      BufferCacheTestAccess::SetGarbageCollectionThresholds(
-          cache, std::numeric_limits<uint64_t>::max(),
-          std::numeric_limits<uint64_t>::max());
-      BufferCacheTestAccess::PresentFrames(cache, 8);
-      for (uint32_t tick = 0; tick < 160; tick++) {
-        cache.RunGarbageCollector();
-      }
-      Require(name, "re-armed dirty Buffer",
-              cache.IsRegionRegistered(base, allocation_size) &&
+      Require(name, "normal dirty retention",
+              first_before_completion == first_stale &&
+                  second_before_completion == second_stale &&
+                  cache.IsRegionRegistered(base, allocation_size) &&
+                  cache.IsRegionGpuModified(base + first_offset,
+                                            sizeof(first_value)) &&
+                  cache.IsRegionGpuModified(base + second_offset,
+                                            sizeof(second_value)) &&
                   cache.HasGpuDirtyBytes(base + first_offset,
-                                         sizeof(first_value)),
-              "the re-armed dirty Buffer was reclaimed without pressure");
+                                         sizeof(first_value)) &&
+                  cache.HasGpuDirtyBytes(base + second_offset,
+                                         sizeof(second_value)) &&
+                  scheduler.CurrentTick() == gc_submission_tick,
+              "normal GC retired or synchronized a dirty Buffer");
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto older_publication_tick = scheduler.CurrentTick();
       std::binary_semaphore older_publication_entered{0};
@@ -4592,7 +4680,6 @@ public:
         cache.FillBuffer(address, sizeof(starvation_value), starvation_value,
                          false);
       }
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4603,42 +4690,37 @@ public:
       Require(name, "normal-GC clean candidate",
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
-      const auto starvation_retired =
-          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      // Aged dirty owners are published and dropped under normal pressure, at most 32 per
-      // run, so the 33 dirty ones and the clean candidate take two runs; none of them may
-      // be retained, and the clean candidate must not be hidden behind them.
       cache.RunGarbageCollector();
-      cache.RunGarbageCollector();
-      uint32_t starvation_first_backing = 0;
-      uint32_t starvation_last_backing = 0;
-      std::memcpy(&starvation_first_backing, memory + starvation_offset,
-                  sizeof(starvation_first_backing));
-      std::memcpy(&starvation_last_backing,
-                  memory + starvation_offset +
-                      (starvation_count - 1) * starvation_stride,
-                  sizeof(starvation_last_backing));
       Require(
-          name, "normal-GC dirty publication",
-          starvation_first_backing == starvation_value &&
-              starvation_last_backing == starvation_value &&
-              !cache.IsRegionRegistered(base + starvation_offset,
-                                        sizeof(starvation_value)) &&
-              !cache.IsRegionRegistered(
+          name, "normal-GC dirty bypass",
+          cache.IsRegionRegistered(base + starvation_offset,
+                                   sizeof(starvation_value)) &&
+              cache.IsRegionRegistered(
                   base + starvation_offset +
                       (starvation_count - 1) * starvation_stride,
                   sizeof(starvation_value)) &&
               !cache.IsRegionRegistered(base + starvation_clean_offset,
+                                        sizeof(starvation_value)),
+          "old dirty owners hid an eligible clean Buffer from normal GC");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      const auto starvation_retired =
+          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
+      cache.RunGarbageCollector();
+      Require(name, "critical-GC starvation cleanup",
+              !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
-              !BufferCacheTestAccess::IsBufferAllocated(cache,
-                                                        starvation_retired),
-          "normal GC retained aged dirty owners or hid the clean Buffer");
+                  !cache.IsRegionRegistered(
+                      base + starvation_offset +
+                          (starvation_count - 1) * starvation_stride,
+                      sizeof(starvation_value)) &&
+                  !BufferCacheTestAccess::IsBufferAllocated(
+                      cache, starvation_retired),
+              "critical GC did not immediately free the skipped dirty owners");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
@@ -4651,7 +4733,6 @@ public:
           base + lookup_only_offset, residency_size);
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4718,6 +4799,24 @@ public:
                        sizeof(partial_unmap_survivor_value),
                        partial_unmap_survivor_value, false);
       resources.UnmapMemory(base + 0x8000, 0x4000);
+      Require(
+          name, "partial-invalidation keeps disjoint bytes dirty",
+          resources.IsMapped(base + partial_unmap_survivor_offset,
+                             sizeof(partial_unmap_survivor_value)) &&
+              !cache.IsRegionCpuModified(
+                  base + partial_unmap_survivor_offset,
+                  sizeof(partial_unmap_survivor_value)) &&
+              cache.IsRegionGpuModified(base + partial_unmap_survivor_offset,
+                                        sizeof(partial_unmap_survivor_value)) &&
+              cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
+                                     sizeof(partial_unmap_survivor_value)) &&
+              !cache.HasGpuDirtyBytes(base + partial_unmap_offset,
+                                      sizeof(partial_unmap_value)),
+          "partial invalidation read back an unrelated mapped page");
+      Require(name, "partial-invalidation survivor read fault",
+              resources.HandleFault(PageFaultAccess::Read,
+                                    base + partial_unmap_survivor_offset),
+              "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
       std::memcpy(&partial_unmap_survivor_backing,
                   memory + partial_unmap_survivor_offset,
@@ -4735,7 +4834,8 @@ public:
               !cache.HasGpuDirtyBytes(base + partial_unmap_survivor_offset,
                                       sizeof(partial_unmap_survivor_value)) &&
               partial_unmap_survivor_backing == partial_unmap_survivor_value,
-          "widened partial invalidation mishandled ownership or backing");
+          "partial invalidation or subsequent CPU read mishandled ownership or "
+          "backing");
       resources.MapMemory(base + 0x8000, 0x4000);
       auto survivor =
           cache.ObtainBuffer(base + partial_unmap_survivor_offset,
@@ -4762,7 +4862,6 @@ public:
                 "failed to allocate the large dirty native buffer");
         cache.FillBuffer(base + large_offset, large_size, large_value, false);
         const auto large_submission_tick = scheduler.CurrentTick();
-        BufferCacheTestAccess::PresentFrames(cache, 8);
         for (uint32_t tick = 0; tick <= 160; tick++) {
           cache.RunGarbageCollector();
         }
@@ -4824,7 +4923,6 @@ public:
                        grouped_first_value, false);
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4927,7 +5025,6 @@ public:
                       cache, base + sparse_offset + sparse_owner_stride),
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
       }
@@ -4956,7 +5053,6 @@ public:
                                sizeof(disjoint_value), true, false);
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -5019,7 +5115,6 @@ public:
                                sizeof(reacquire_value), true, false);
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
-      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -5067,6 +5162,289 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckResidentImageHeap() {
+    constexpr const char *name = "ResidentImageHeap";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t idle_table = base + 0x180000;
+    constexpr uint64_t table_size = 0x10000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    // A 4x4 linear 2D texture per index.
+    const auto descriptor = [](uint32_t texture, Format format) {
+      const uint64_t address = base + 0x10000u + texture * 0x1000u;
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(address >> 8u);
+      words[1] = static_cast<uint32_t>(address >> 40u) | (static_cast<uint32_t>(format) << 20u);
+      words[2] = 3u | (3u << 14u);
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    const auto put = [&](uint64_t probe, const std::array<uint32_t, 8> &words) {
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+    };
+    put(0, descriptor(0, Format::k8_8_8_8UNorm));
+    put(1, descriptor(0, Format::k8_8_8_8UNorm));
+    put(5, descriptor(1, Format::k8_8_8_8UNorm));
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      auto unfiltered = sampled;
+      unfiltered.unfiltered_access_only = true;
+      IR::ImageHeapView view{};
+      const auto acquire = [&](const IR::ImageResource &root, uint64_t address = table,
+                               uint64_t count = table_size / 32u) {
+        return heap.Acquire({address, table_size, 32u, 0u, count, &root}, view);
+      };
+      const auto draw = [&] {
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+      const auto write = [&](uint64_t probe, const std::array<uint32_t, 8> &words) {
+        Libs::LibKernel::Memory::WriteBacking(table + probe * 32u, words.data(), sizeof(words));
+        Require(name, "table write", context.InvalidateMemory(table + probe * 32u, sizeof(words)),
+                "the table was not mapped");
+      };
+
+      Require(name, "first view",
+              acquire(sampled) && view.kinds.size() == 1u && view.slot_count == table_size / 4u,
+              "a 64-KiB table was not kept resident");
+      const auto &views = ImageHeapTestAccess::Views(heap);
+      const auto &filtered = *views[0];
+      Require(name, "slot words",
+              filtered.slots[0] != 0u && filtered.slots[8] == filtered.slots[0] &&
+                  filtered.slots[40] != 0u && filtered.slots[40] != filtered.slots[0] &&
+                  filtered.slots[1] == 0u && filtered.slots.back() == 0u &&
+                  ImageHeapTestAccess::ElementCount(heap) == 3u &&
+                  ImageHeapTestAccess::Element(heap, 0u).binding.layout ==
+                      vk::ImageLayout::eShaderReadOnlyOptimal,
+              "probes did not share equal descriptors, left a non-null gap or wrote the null "
+              "element without a sampled layout");
+      Require(name, "second view",
+              acquire(unfiltered) && views.size() == 2u &&
+                  ImageHeapTestAccess::ElementCount(heap) == 5u,
+              "a second root profile did not get its own view");
+      const auto &idle = *views[1];
+      draw();
+      const auto resident = ImageHeapTestAccess::ImageOf(heap, filtered.slots[0]);
+      Require(name, "resident images",
+              resident && textures.GetImage(resident).heap_refs.load() == 2u,
+              "resolved elements did not pin their image");
+
+      // Only acquired views take table changes; the idle one must not allocate.
+      const auto idle_slot = idle.slots[40];
+      for (uint32_t texture = 2; texture < 4u; ++texture) {
+        write(5, descriptor(texture, Format::k8_8_8_8UNorm));
+        Require(name, "changed table", acquire(sampled), "a changed table was declined");
+        draw();
+      }
+      Require(name, "idle view",
+              idle.slots[40] == idle_slot && ImageHeapTestAccess::ElementCount(heap) <= 6u,
+              "an idle view took table changes or leaked released elements");
+      Require(name, "reactivated view", acquire(unfiltered), "the idle view was declined");
+      draw();
+      Require(name, "deferred probes",
+              ImageHeapTestAccess::ImageOf(heap, idle.slots[40]) ==
+                      ImageHeapTestAccess::ImageOf(heap, filtered.slots[40]) &&
+                  ImageHeapTestAccess::ElementCount(heap) <= 7u,
+              "a reactivated view missed the changes made while it was idle");
+
+      // All programs of one draw see the table and kinds of its first acquire.
+      Require(name, "draw kinds", acquire(sampled), "the view was declined");
+      write(7, descriptor(12, Format::k8_8_8_8UInt));
+      Require(name, "stable kinds",
+              acquire(sampled) && view.kinds.size() == 1u && filtered.slots[56] == 0u,
+              "a later program of a draw saw a kind the first one lacked");
+      draw();
+      Require(name, "next draw kinds",
+              acquire(sampled) && view.kinds.size() == 2u &&
+                  filtered.slots[56] >> IR::ImageHeapKindShift == 1u,
+              "the next draw did not take the new kind");
+      draw();
+
+      Require(name, "bounded view",
+              acquire(sampled, table, 4u) && views.size() == 3u && views[2]->slots[0] != 0u &&
+                  views[2]->slots[40] == 0u,
+              "a view probed descriptors past the guest table bound");
+      draw();
+
+      // Only leaving the read state invalidates resident images.
+      auto &image = textures.GetImage(resident);
+      const auto epoch = Libs::Graphics::Image::heap_epoch.load();
+      for (uint32_t pass = 0; pass < 2u; ++pass) {
+        image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+                      scheduler.Current().Handle());
+      }
+      Require(name, "write epoch", Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
+              "repeated writes after leaving the read state bumped the heap epoch again");
+      Require(name, "read again", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "read layout",
+              image.backing.state.layout == vk::ImageLayout::eShaderReadOnlyOptimal &&
+                  Libs::Graphics::Image::heap_epoch.load() == epoch + 1u,
+              "commit did not return a resident image to its read layout");
+
+      // An image freed during a draw's discovery lives until the tick ends, and the draw's
+      // slots still select it.
+      write(9, descriptor(13, Format::k8_8_8_8UNorm));
+      Require(name, "freed image", acquire(sampled), "the view was declined");
+      heap.Rebind(executor);
+      const auto freed = ImageHeapTestAccess::ImageOf(heap, filtered.slots[72]);
+      textures.UnmapMemory(base + 0x10000u + 13u * 0x1000u, 0x1000u);
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      Require(name, "freed image layout",
+              !textures.GetImage(freed).registered &&
+                  textures.GetImage(freed).backing.state.layout ==
+                      vk::ImageLayout::eShaderReadOnlyOptimal,
+              "commit skipped the read transition of a freed but sampled image");
+      scheduler.Finish();
+      heap.BeginDraw();
+
+      // A draw skipped after its programs acquired views still leaves the next draw a fresh
+      // table.
+      Require(name, "skipped draw", acquire(sampled), "the view was declined");
+      heap.BeginDraw();
+      write(11, descriptor(16, Format::k8_8_8_8UNorm));
+      Require(name, "draw after a skipped one", acquire(sampled) && filtered.slots[88] != 0u,
+              "a draw sampled the table of a skipped draw");
+      // The skipped draw's view stays acquired. Another view refreshing the table must not let
+      // a stale element take a newer kind from it.
+      heap.BeginDraw();
+      write(5, descriptor(15, Format::k8_8_8_8SInt));
+      Require(name, "other view", acquire(unfiltered), "the view was declined");
+      textures.UnmapMemory(base + 0x10000u + 3u * 0x1000u, 0x1000u);
+      draw();
+      Require(name, "stale rescan",
+              filtered.kinds.size() == 2u &&
+                  ImageHeapTestAccess::Element(heap, filtered.slots[40]).value.dwords ==
+                      descriptor(3, Format::k8_8_8_8UNorm),
+              "a stale element's rescan took a kind its view's programs lack");
+
+      // Tables keep the descriptors of unmapped textures, which PS5 never samples. Their words
+      // stay null in every view, even when the memory is mapped again before the next draw,
+      // until one of their own words changes.
+      const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+      write(20, descriptor(20, Format::k8_8_8_8UNorm));
+      Require(name, "live texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "live image",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, filtered.slots[160])),
+              "a mapped texture was not resolved");
+      context.UnmapMemory(texture(20), 0x1000u);
+      context.MapMemory(texture(20), 0x1000u);
+      heap.BeginDraw();
+      Require(name, "dead in a new view",
+              acquire(sampled, table, 64u) && views.back()->slots[160] == 0u,
+              "a view created after the remap resolved a dead descriptor");
+      Require(name, "remapped texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "dead descriptor",
+              filtered.slots[160] == 0u && !textures.IsRegionRegistered(texture(20), 0x1000u),
+              "the descriptor of an unmapped texture was resolved again after a remap");
+      write(19, descriptor(19, Format::k8_8_8_8UNorm));
+      write(21, descriptor(21, Format::k8_8_8_8UNorm));
+      Require(name, "neighbour writes", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "dead reprobe", filtered.slots[160] == 0u,
+              "rescanning changed neighbours revived a dead descriptor");
+      write(24, descriptor(20, Format::k8_8_8_8UNorm));
+      Require(name, "republished texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "republished descriptor",
+              filtered.slots[160] == 0u && ImageHeapTestAccess::ImageOf(heap, filtered.slots[192]),
+              "the same descriptor in another word was not resolved");
+      write(20, descriptor(22, Format::k8_8_8_8UNorm));
+      Require(name, "rewritten word", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "rewritten descriptor",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, filtered.slots[160])),
+              "a new descriptor in a dead word was not resolved");
+      // A view that a skipped draw left acquired buries before its rescan.
+      Require(name, "skipped draw view", acquire(sampled), "the view was declined");
+      context.UnmapMemory(texture(22), 0x1000u);
+      context.MapMemory(texture(22), 0x1000u);
+      heap.BeginDraw();
+      draw();
+      Require(name, "dead after a skipped draw", filtered.slots[160] == 0u,
+              "the rescan of a view left acquired resolved a dead descriptor");
+      // A new descriptor over unmapped memory is never resolved.
+      context.UnmapMemory(texture(23), 0x1000u);
+      write(23, descriptor(23, Format::k8_8_8_8UNorm));
+      Require(name, "unmapped texture", acquire(sampled), "the view was declined");
+      draw();
+      Require(name, "unmapped descriptor", !textures.IsRegionRegistered(texture(23), 0x1000u),
+              "a descriptor over unmapped memory was resolved");
+
+      heap.UnmapMemory(table, table_size);
+      Require(name, "unmapped table",
+              ImageHeapTestAccess::MemoryCount(heap) == 0u &&
+                  textures.GetImage(resident).heap_refs.load() == 0u,
+              "unmapping the table kept its images pinned");
+      // The idle table stays watched; destroying the heap must unwatch it before the page
+      // manager fails on live watches.
+      Require(name, "idle table",
+              acquire(sampled, idle_table) && view.kinds.empty() &&
+                  ImageHeapTestAccess::MemoryCount(heap) == 1u,
+              "an all-null table was not kept resident");
+      draw();
+      context.UnmapMemory(base, idle_table - base);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -5091,7 +5469,7 @@ public:
     for (const auto mode : {0x41u, 0x61u}) {
       for (const auto &groups : empty_dispatches) {
         context.GetRenderExecutor().DispatchDirect(
-            0, scheduler.Current(), groups[0], groups[1], groups[2], mode);
+            0, scheduler.Current(), groups[0], groups[1], groups[2], mode, false);
       }
     }
     Require(name, "HTile fixture",
@@ -5174,10 +5552,270 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBdaSyncUploads() {
+    constexpr const char *name = "BdaSyncUploads";
+    constexpr auto page = BufferCache::CACHING_PAGESIZE;
+    EnsureRuntimeContext();
+    const auto base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, 3 * page, Common::VirtualMemory::Mode::ReadWrite, "bda_sync_uploads");
+    Require(name, "allocation", base != 0, "guest allocation failed");
+    auto *words = reinterpret_cast<u32 *>(base);
+    std::fill_n(words, 3 * page / sizeof(u32), 0x12345678u);
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    auto &cache = context.GetBufferCache();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.MapMemory(base, page);
+    context.MapMemory(base + 2 * page, page);
+    const auto id = cache.FindBuffer(base, 3 * page);
+    auto &buffer = cache.GetBuffer(id);
+    auto readback = CreateHostBuffer(name, 6 * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+    const auto snapshot = [&](uint64_t offset, uint32_t index) {
+      const vk::BufferCopy copy{offset, index * sizeof(u32), sizeof(u32)};
+      scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1, &copy);
+    };
+    context.PrepareBda();
+    Require(name, "mapped intersection",
+            !cache.IsRegionCpuModified(base, page) &&
+                cache.IsRegionCpuModified(base + page, page) &&
+                !cache.IsRegionCpuModified(base + 2 * page, page),
+            "BDA upload missed a mapped range or uploaded an unmapped hole");
+    snapshot(0, 0);
+    snapshot(2 * page, 1);
+
+    cache.InvalidateMemory(base + 17, 1);
+    words[4] = 0x87654321u;
+    words[TRACKER_PAGE_SIZE / sizeof(u32) - 1] = 0xabcdef01u;
+    context.PrepareBda();
+    snapshot(16, 2);
+    snapshot(TRACKER_PAGE_SIZE - sizeof(u32), 3);
+    Require(name, "whole-page upload", !cache.IsRegionCpuModified(base, TRACKER_PAGE_SIZE),
+            "one-byte invalidation did not upload and consume its whole page");
+
+    context.MapMemory(base + page, page);
+    context.PrepareBda();
+    snapshot(page, 4);
+    Require(name, "new mapping", !cache.IsRegionCpuModified(base + page, page),
+            "mapping into an existing buffer did not queue its dirty pages");
+    context.UnmapMemory(base + 2 * page, page);
+    words[2 * page / sizeof(u32)] = 0xfedcba98u;
+    context.PrepareBda();
+    Require(name, "unmapped dirty page", cache.IsRegionCpuModified(base + 2 * page, page),
+            "BDA synchronization consumed dirtiness outside mapped memory");
+    context.MapMemory(base + 2 * page, page);
+    context.PrepareBda();
+    snapshot(2 * page, 5);
+
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "GPU contents", ReadBuffer(name, readback, 6) ==
+        std::vector<u32>{0x12345678u, 0x12345678u, 0x87654321u, 0xabcdef01u,
+                        0x12345678u, 0xfedcba98u},
+        "initial, re-dirtied, newly mapped or remapped bytes were stale on the GPU");
+    context.UnmapMemory(base, 3 * page);
+    scheduler.Finish();
+    DestroyBuffer(&readback);
+    Require(name, "release", LibKernel::Memory::FreeGuestMemory(base, 3 * page),
+            "guest allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckBdaPageTableUploads() {
+    constexpr const char *name = "BdaPageTableUploads";
+    constexpr uintptr_t base = 0x0000000207b00000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr std::array<uint64_t, 3> page_counts{2, 521, 525};
+    constexpr uint64_t result_entries = page_counts[0] + page_counts[1] + page_counts[2];
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &cache = context.GetBufferCache();
+    // A small real ring exercises chunking and waits for same-command-buffer reuse.
+    BufferCacheTestAccess::SetUnusedStagingBufferSize(cache, 4096);
+    auto &table = *cache.GetBdaPageTableBuffer();
+    const auto table_offset = BufferCache::PageIndex(base) * sizeof(vk::DeviceAddress);
+    auto readback = CreateHostBuffer(name, result_entries * sizeof(vk::DeviceAddress),
+                                    vk::BufferUsageFlagBits::eTransferDst, {});
+    std::vector<uint64_t> expected;
+    expected.reserve(result_entries);
+    for (const auto pages : page_counts) {
+      // The destination has a preceding GPU write and, after the first iteration,
+      // a preceding read. Registration must preserve both ordering requirements.
+      table.Fill(table_offset, pages * sizeof(vk::DeviceAddress), 0xa5a5a5a5u);
+      const auto previous_tick = scheduler.CurrentTick();
+      const auto id = cache.FindBuffer(base, pages * page);
+      const auto &buffer = cache.GetBuffer(id);
+      const auto destination_offset = expected.size() * sizeof(vk::DeviceAddress);
+      for (uint64_t index = 0; index < pages; ++index) {
+        expected.push_back(buffer.BufferDeviceAddress() + index * page);
+      }
+      const vk::BufferCopy copy{table_offset, destination_offset,
+                                pages * sizeof(vk::DeviceAddress)};
+      scheduler.Current().Handle().copyBuffer(table.Handle(), readback.buffer, 1, &copy);
+      Require(name, "chunked registration",
+              buffer.CpuAddress() == base && buffer.Size() == pages * page &&
+                  (pages == page_counts.front() || scheduler.CurrentTick() > previous_tick),
+              "BDA registration failed to replace its owner or wait for staging-ring reuse");
+    }
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    const auto words = ReadBuffer(name, readback, result_entries * 2);
+    for (size_t index = 0; index < expected.size(); ++index) {
+      const auto actual = uint64_t{words[index * 2]} | (uint64_t{words[index * 2 + 1]} << 32);
+      Require(name, "GPU page-table snapshot", actual == expected[index],
+              "staged BDA updates were stale, overwritten before their read, or incompletely flushed");
+    }
+    DestroyBuffer(&readback);
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckLargeSparseImageUpload() {
+    constexpr const char *name = "LargeSparseImageUpload";
+    constexpr uint64_t size = 576ull << 20, ring_size = 512ull << 20, page = 0x10000;
+    constexpr uint64_t base = 0x0000000250000000ull;
+    constexpr std::array<uint64_t, 3> mapped_offsets{0, ring_size, size - page};
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    void *reservation = reinterpret_cast<void *>(base);
+    Require(name, "sparse reservation", LibKernel::Memory::KernelReserveVirtualRange(
+        &reservation, size, 0x10, page) == 0, "large sparse reservation failed");
+    int64_t direct = -1;
+    Require(name, "physical pages", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), 3u * page, page, 0, &direct) == 0,
+        "sparse physical allocation failed");
+    for (u32 index = 0; index < mapped_offsets.size(); ++index) {
+      void *mapped = reinterpret_cast<void *>(base + mapped_offsets[index]);
+      Require(name, "map sparse page", LibKernel::Memory::KernelMapDirectMemory(
+          &mapped, page, 0x3, 0x10, direct + index * page, page) == 0,
+          "sparse page mapping failed");
+      auto *words = static_cast<u32 *>(mapped);
+      std::fill_n(words, page / sizeof(u32), 0u);
+      words[0] = 0x00020001u + index * 0x100u;
+      words[1] = 0x00040003u + index * 0x100u;
+      words[page / sizeof(u32) - 1u] = 0xabcdef01u;
+      context.MapMemory(base + mapped_offsets[index], page);
+    }
+    auto &cache = context.GetBufferCache();
+    // Exercise the ordinary ring before requesting the captured 576-MiB footprint.
+    const auto ring_slice = cache.ObtainBufferForImage(base, page);
+    auto readback = CreateHostBuffer(name, 8u * sizeof(u32),
+        vk::BufferUsageFlagBits::eTransferDst, {});
+    const vk::BufferCopy small_copy{ring_slice.second, 0, sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(ring_slice.first->Handle(), readback.buffer, 1, &small_copy);
+    const auto large = cache.ObtainBufferForImage(base, size);
+    Require(name, "temporary image source", large.first != nullptr && large.first != ring_slice.first &&
+        large.first->Size() == size && ring_slice.first->Size() == ring_size,
+        "oversized image upload resized the ring or truncated its source");
+    constexpr std::array<uint64_t, 5> probes{0, page, ring_size - 4u, ring_size, size - 4u};
+    std::array<vk::BufferCopy, probes.size()> copies{};
+    for (u32 index = 0; index < probes.size(); ++index)
+      copies[index] = {large.second + probes[index], (index + 1u) * sizeof(u32), sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(large.first->Handle(), readback.buffer,
+                                            copies.size(), copies.data());
+    // A compute consumer requires the same storage-buffer capability as the detiler.
+    const auto converted = TextureCacheTestAccess::Tiler(context.GetTextureCache()).TransformColor(
+        {large.first->Handle(), large.second + ring_size, 8u}, ColorTransform::SwapBgra16, true);
+    const vk::BufferCopy converted_copy{converted.offset, 6u * sizeof(u32), 8u};
+    scheduler.Current().Handle().copyBuffer(converted.buffer, readback.buffer, 1, &converted_copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "sparse upload and deferred lifetime",
+        ReadBuffer(name, readback, 8) == std::vector<u32>{0x00020001u, 0x00020001u, 0u, 0u,
+            0x00020101u, 0xabcdef01u, 0x00020103u, 0x00040101u},
+        "upload lost sparse holes, boundary bytes, compute access, or in-flight lifetime");
+    // Cached uploads must read reserved holes without faulting back into the tracker,
+    // while retaining the private-memory sources accepted by ordinary buffer reads.
+    const auto private_base = LibKernel::Memory::AllocateRuntimeMemory(
+        0, page, Common::VirtualMemory::Mode::ReadWrite, "private_buffer_upload");
+    Require(name, "private source allocation", private_base != 0, "private allocation failed");
+    auto *private_words = reinterpret_cast<u32 *>(private_base);
+    private_words[0] = 0x55667788u;
+    private_words[page / sizeof(u32) - 1u] = 0x99aabbccu;
+    context.MapMemory(private_base, page);
+    context.MapMemory(base + page, 2u * page);
+    const auto sparse_buffer = cache.ObtainBuffer(base, 2u * page, false);
+    const auto private_buffer = cache.ObtainBuffer(private_base, page, false);
+    const auto sparse_stream = cache.ObtainBuffer(base + 2u * page, sizeof(u32), false);
+    Require(name, "sparse stream source",
+        sparse_stream.first == &cache.GetUtilityBuffer(MemoryUsage::Stream),
+        "small sparse read did not exercise the stream path");
+    const std::array<vk::BufferCopy, 2> sparse_copies{{
+        {sparse_buffer.second, 0, sizeof(u32)},
+        {sparse_buffer.second + page, sizeof(u32), sizeof(u32)}}};
+    const std::array<vk::BufferCopy, 2> private_copies{{
+        {private_buffer.second, 2u * sizeof(u32), sizeof(u32)},
+        {private_buffer.second + page - sizeof(u32), 3u * sizeof(u32), sizeof(u32)}}};
+    scheduler.Current().Handle().copyBuffer(sparse_buffer.first->Handle(), readback.buffer,
+        sparse_copies.size(), sparse_copies.data());
+    scheduler.Current().Handle().copyBuffer(private_buffer.first->Handle(), readback.buffer,
+        private_copies.size(), private_copies.data());
+    const vk::BufferCopy stream_copy{sparse_stream.second, 4u * sizeof(u32), sizeof(u32)};
+    scheduler.Current().Handle().copyBuffer(sparse_stream.first->Handle(), readback.buffer,
+        1, &stream_copy);
+    scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "cached sparse and private upload",
+        ReadBuffer(name, readback, 5) == std::vector<u32>{0x00020001u, 0u, 0x55667788u, 0x99aabbccu, 0u} &&
+        !cache.IsRegionGpuModified(base, 2u * page) &&
+        !cache.IsRegionGpuModified(private_base, page),
+        "cached upload lost sparse/private data or changed read-only GPU ownership");
+    context.UnmapMemory(private_base, page);
+    context.UnmapMemory(base + page, 2u * page);
+    Require(name, "private source release", LibKernel::Memory::FreeGuestMemory(private_base, page),
+        "private allocation release failed");
+    DestroyBuffer(&readback);
+    for (const auto offset : mapped_offsets) context.UnmapMemory(base + offset, page);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "release mappings", LibKernel::Memory::KernelMunmap(base, size) == 0,
+        "sparse mappings release failed");
+    Require(name, "release physical pages",
+        LibKernel::Memory::KernelReleaseDirectMemory(direct, 3u * page) == 0,
+        "sparse physical release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
-    constexpr uint64_t allocation_size = 0x2800000;
+    constexpr uint64_t allocation_size = 0x3000000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
@@ -5219,23 +5857,10 @@ public:
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
 
-      ImageDesc sampled{};
-      sampled.type = BindingType::Texture;
-      sampled.info.data = {base, sizeof(initial)};
-      sampled.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
-      sampled.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
-      sampled.info.type = Prospero::ImageType::kColor2D;
-      sampled.info.extent = {1, 1, 1};
-      sampled.info.resources = {1, 1};
-      sampled.info.pitch = 1;
-      sampled.info.bytes_per_block = 4;
-      sampled.info.samples = 1;
-      sampled.info.tile_mode = Prospero::TileMode::kLinear;
-      sampled.info.mip_layout[0] = {0, 4, 1, 1};
-      sampled.view_info.format = sampled.info.pixel_format;
-      sampled.view_info.type = vk::ImageViewType::e2D;
-      sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
-      sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      auto sampled =
+          MakeLinearDesc(base, sizeof(initial), vk::Format::eR8G8B8A8Srgb,
+                         Prospero::BufferFormat::k8_8_8_8Srgb,
+                         Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
 
       auto &command = scheduler.Current();
       auto first_desc = sampled;
@@ -5390,7 +6015,7 @@ public:
           name, "dynamic views",
           first_view != nullptr && repeated_view == first_view &&
               mapped_view != nullptr && mapped_view != first_view &&
-              image.views.size() == 2 && !image.usage.texture &&
+              image.views.size() == 2 &&
               !image.IsGpuModified() && !image.IsCpuDirty() &&
               !TextureCacheTestAccess::PendingDownload(texture_cache, first),
           "TextureCache::FindTexture did not preserve sampled view "
@@ -5410,8 +6035,9 @@ public:
       underspecified.info.extent = {2, 1, 1};
       underspecified.info.resources = {1, 1};
       underspecified.info.pitch = 2;
-      underspecified.info.mip_layout[0] = {0, 8, 2, 1};
-      underspecified.info.mip_layout[1] = {8, 4, 1, 1};
+      underspecified.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
+      underspecified.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+      underspecified.info.linear_slice_stride = 0;
       underspecified.view_info.format = underspecified.info.pixel_format;
       underspecified.view_info.level_count = 1;
       const auto underspecified_id = texture_cache.FindImage(underspecified);
@@ -5477,14 +6103,23 @@ public:
               "non-exact lookup did not retain the last compatible "
               "registration");
 
-      auto null_desc = sampled;
-      null_desc.info.data = {};
-      auto null_repeat_desc = null_desc;
-      const auto null_image = texture_cache.FindImage(null_desc);
-      const auto null_repeat = texture_cache.FindImage(null_repeat_desc);
-      Require(name, "null image",
-              null_image && null_repeat == null_image && null_image != exact,
-              "typed null-image lookup was not stable");
+      ShaderRecompiler::IR::ImageResource null_resource{};
+      null_resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      null_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      null_resource.read = true;
+      ShaderRecompiler::IR::DescriptorValue null_descriptor{};
+      null_descriptor.dword_count = 8;
+      for (u32 attempt = 0; attempt < 2; ++attempt) {
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            context.GetRenderExecutor(), null_resource, null_descriptor);
+        const auto native = MakeImageInfo(binding);
+        Require(name, "null image binding",
+                !binding.image_id && binding.image_view == nullptr &&
+                    native.imageView == nullptr &&
+                    native.imageLayout == vk::ImageLayout::eGeneral &&
+                    TextureCacheTestAccess::Contains(texture_cache, exact),
+                "a null descriptor acquired a cache image or disturbed a real image");
+      }
 
       constexpr uint64_t extent_alias_offset = 0x2400000;
       auto narrow_target = sampled;
@@ -5497,7 +6132,7 @@ public:
       narrow_target.info.pitch = 128;
       narrow_target.info.bytes_per_block = 8;
       narrow_target.info.tile_mode = Prospero::TileMode::kRenderTarget;
-      narrow_target.info.mip_layout[0] = {0, 0x10000, 128, 1};
+      narrow_target.info.UpdateSize();
       narrow_target.view_info.format = narrow_target.info.pixel_format;
       narrow_target.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto narrow_target_id = texture_cache.FindImage(narrow_target);
@@ -5506,6 +6141,7 @@ public:
 
       auto wide_target = narrow_target;
       wide_target.info.extent.width = 9;
+      wide_target.info.UpdateSize();
       const auto wide_target_id = texture_cache.FindImage(wide_target);
       const auto wide_target_view =
           texture_cache.FindRenderTarget(wide_target_id, wide_target);
@@ -5625,6 +6261,7 @@ public:
             }
           }
         }
+        desc.info.UpdateSize();
         const auto id = texture_cache.FindImage(desc);
         Require(name, "distinct mip-layout backing", id && id != previous,
                 "different guest mip layouts reused the same native image");
@@ -5668,6 +6305,7 @@ public:
           {256, 256, 1}, 1, 16, 1);
       raw_alias.type = BindingType::RenderTarget;
       raw_alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      raw_alias.info.UpdateSize();
       raw_alias.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       const auto raw_alias_id = texture_cache.FindImage(raw_alias);
       (void)texture_cache.FindRenderTarget(raw_alias_id, raw_alias);
@@ -5712,6 +6350,7 @@ public:
         bc5_expected.insert(bc5_expected.end(), bc5_guest.begin() + word,
                             bc5_guest.begin() + word + 4);
       }
+      bc5_alias.info.UpdateSize();
       const auto bc5_alias_id = texture_cache.FindImage(bc5_alias);
       Require(name, "BC5 alias owner separation",
               bc5_alias_id != raw_alias_id &&
@@ -5734,6 +6373,82 @@ public:
               ReadBuffer(name, bc5_readback, bc5_expected.size()) == bc5_expected,
               "raw render-target copying overwrote the BC5 guest mip layout");
       DestroyBuffer(&bc5_readback);
+
+      {
+        constexpr uint64_t tiled_array_offset = 0x2c00000;
+        constexpr uint32_t tiled_levels = 5, tiled_layers = 6;
+        TileSurfaceLayout surface{};
+        Require(name, "tiled array alias layout",
+                TileGetTiledTextureLayout(
+                    {Prospero::BufferFormat::k32UInt, Prospero::TileMode::kStandard64KB,
+                     TileSurfaceDimension::Dim2D, 256, 256, 1, tiled_levels, tiled_layers},
+                    surface) && surface.total_size == 0x240000 &&
+                    surface.block_slice_size == 0x60000 &&
+                    surface.mips[0].offset + surface.mips[0].size * tiled_layers == 0x1a0000,
+                "fixture lost the gap between an array mip span and its full backing");
+        auto tiled_array = MakeLinearDesc(
+            base + tiled_array_offset, surface.total_size, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {256, 256, 1}, tiled_layers, sizeof(uint32_t), 1);
+        tiled_array.info.tile_mode = Prospero::TileMode::kStandard64KB;
+        tiled_array.info.resources.levels = tiled_levels;
+        tiled_array.view_info.level_count = tiled_levels;
+        for (uint32_t level = 0; level < tiled_levels; ++level) {
+          const auto &mip = surface.mips[level];
+          tiled_array.info.mip_layout[level] = {
+              mip.offset, mip.size * tiled_layers, mip.padded_width, mip.padded_height};
+        }
+        tiled_array.info.UpdateSize();
+        std::memset(memory + tiled_array_offset, 0, surface.total_size);
+        const auto tiled_array_id = texture_cache.FindImage(tiled_array);
+        (void)texture_cache.FindTexture(tiled_array_id, tiled_array);
+        constexpr uint32_t all_mips = 0x12345678u, last_mip = 0x89abcdefu;
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = all_mips;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), tiled_array_id,
+            {vk::ImageAspectFlagBits::eColor, 0, tiled_levels, 0, tiled_layers}, clear);
+        clear.color.uint32[0] = last_mip;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), tiled_array_id,
+            {vk::ImageAspectFlagBits::eColor, tiled_levels - 1, 1, tiled_layers - 1, 1}, clear);
+        Libs::Graphics::Buffer full_array(
+            m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+            tiled_array.info.data.address, AllFlags, surface.total_size);
+        Libs::Graphics::Buffer partial_array(
+            m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+            tiled_array.info.data.address, AllFlags, 0x1a0000);
+        Require(name, "tiled array alias containment",
+                BufferCacheTestAccess::SynchronizeBufferFromImage(
+                    resources.GetBufferCache(), full_array,
+                    tiled_array.info.data.address, surface.total_size) &&
+                    !BufferCacheTestAccess::SynchronizeBufferFromImage(
+                        resources.GetBufferCache(), partial_array,
+                        tiled_array.info.data.address, 0x1a0000),
+                "full array synchronization failed or accepted an incomplete slice chain");
+        auto readback = CreateHostBuffer(name, 2 * sizeof(uint32_t),
+                                        vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        TransferReadBarrier(full_array.Handle(), surface.total_size);
+        for (uint32_t probe = 0; probe < 2; ++probe) {
+          const auto &mip = surface.mips[probe == 0 ? 0 : tiled_levels - 1];
+          uint32_t within_block = 0;
+          Require(name, "tiled array probe address",
+                  TileGetBlockOffset(surface.texture.block, mip.tail_x, mip.tail_y,
+                                     0, within_block),
+                  "last-layer mip origin has no guest address");
+          const vk::BufferCopy copy{
+              (tiled_layers - 1) * surface.block_slice_size + mip.offset + within_block,
+              probe * sizeof(uint32_t), sizeof(uint32_t)};
+          command.Handle().copyBuffer(full_array.Handle(), readback.buffer, 1, &copy);
+        }
+        HostReadBarrier(readback.buffer, readback.size, vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "tiled array last-layer contents",
+                ReadBuffer(name, readback, 2) == std::vector<u32>{all_mips, last_mip},
+                "array synchronization lost GPU contents beyond the first mip span");
+        DestroyBuffer(&readback);
+      }
 
       // A formatted Buffer read must use the private
       // Exercise the cache-native image-copy path. Use a request larger
@@ -5779,6 +6494,7 @@ public:
             mip_sizes[level].offset, mip_sizes[level].size,
             mip_padded[level].width, mip_padded[level].height};
       }
+      mip_desc.info.UpdateSize();
       const auto mip_image = texture_cache.FindImage(mip_desc);
       (void)texture_cache.FindTexture(mip_image, mip_desc);
       texture_cache.MarkGpuWritten(mip_image);
@@ -5859,7 +6575,7 @@ public:
                          vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
                          Prospero::ImageType::kColor2D, {1, 1, 1}, 2, 4, 1);
       array_desc.info.pitch = volume_pitch;
-      array_desc.info.mip_layout[0].pitch = volume_pitch;
+      array_desc.info.UpdateSize();
       const auto array_image = texture_cache.FindImage(array_desc);
       (void)texture_cache.FindTexture(array_image, array_desc);
       texture_cache.MarkGpuWritten(array_image);
@@ -5867,6 +6583,7 @@ public:
       volume_desc.info.type = Prospero::ImageType::kColor3D;
       volume_desc.info.extent = {1, 1, 2};
       volume_desc.info.resources.layers = 1;
+      volume_desc.info.UpdateSize();
       volume_desc.view_info.type = vk::ImageViewType::e3D;
       volume_desc.view_info.layer_count = 1;
       const auto volume_image = texture_cache.FindImage(volume_desc);
@@ -5931,9 +6648,11 @@ public:
           Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(float), 1);
       depth_containment.type = BindingType::DepthTarget;
       depth_containment.info.resources.levels = 2;
-      depth_containment.info.mip_layout[0] = {0, 2 * sizeof(float), 2, 1};
-      depth_containment.info.mip_layout[1] = {2 * sizeof(float), sizeof(float),
-                                              1, 1};
+      depth_containment.info.mip_layout[0] = {
+          0, 2 * sizeof(float), 2, 1, 0, 2 * sizeof(float), 2};
+      depth_containment.info.mip_layout[1] = {
+          2 * sizeof(float), sizeof(float), 1, 1, 2 * sizeof(float), sizeof(float), 1};
+      depth_containment.info.linear_slice_stride = 0;
       depth_containment.view_info.format = vk::Format::eD32Sfloat;
       depth_containment.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth_containment.view_info.usage =
@@ -6109,6 +6828,75 @@ public:
           "sampling");
       DestroyBuffer(&layered_raw_d16_readback);
 
+      // RE2 converts a prefix of a 32-layer HTile depth array to R32F storage.
+      constexpr uint32_t htile_layers = 32;
+      constexpr uint64_t htile_slice_size = 0x10000;
+      auto htile_depth = MakeLinearDesc(
+          base + 0x2800000, htile_layers * htile_slice_size,
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {128, 128, 1}, htile_layers, 4, 1);
+      htile_depth.type = BindingType::DepthTarget;
+      htile_depth.info.tile_mode = Prospero::TileMode::kDepth;
+      htile_depth.info.UpdateSize();
+      htile_depth.info.metadata.kind = ImageMetadataKind::Htile;
+      htile_depth.info.metadata.range = {base + 0x2a00000, htile_layers * 0x8000};
+      htile_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      htile_depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto htile_depth_image = texture_cache.FindImage(htile_depth);
+      vk::ClearValue htile_clear{};
+      htile_clear.depthStencil.depth = 0.25f;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), htile_depth_image,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, htile_layers}, htile_clear);
+
+      auto htile_storage = htile_depth;
+      htile_storage.type = BindingType::Storage;
+      htile_storage.info.pixel_format = vk::Format::eR32Sfloat;
+      htile_storage.info.metadata = {};
+      htile_storage.view_info.format = vk::Format::eR32Sfloat;
+      htile_storage.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      htile_storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      ImageId htile_storage_image{};
+      for (uint32_t layers : {1u, 2u}) {
+        htile_storage.info.data.size = layers * htile_slice_size;
+        htile_storage.info.resources.layers = layers;
+        htile_storage.info.mip_layout[0].size = htile_storage.info.data.size;
+        htile_storage.view_info.layer_count = layers;
+        const auto id = texture_cache.FindImage(htile_storage);
+        const auto &owner = texture_cache.GetImage(id);
+        Require(name, "HTile depth storage prefix layout",
+                id != htile_depth_image &&
+                    (!htile_storage_image || id == htile_storage_image) &&
+                    owner.info.data == htile_depth.info.data &&
+                    owner.info.resources == htile_depth.info.resources &&
+                    owner.info.mip_layout == htile_depth.info.mip_layout &&
+                    owner.backing.layers == htile_layers &&
+                    !owner.info.HasMetadata(),
+                "partial storage conversion separated array layers from their guest layout");
+        Require(name, "HTile depth storage prefix view",
+                texture_cache.FindTexture(id, htile_storage) != nullptr,
+                "converted depth prefix has no storage view");
+        htile_storage_image = id;
+      }
+      auto htile_readback = CreateHostBuffer(
+          name, htile_layers * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(htile_layers));
+      vk::BufferImageCopy htile_copy{};
+      htile_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, htile_layers};
+      htile_copy.imageExtent = {1, 1, 1};
+      texture_cache.GetImage(htile_storage_image).Download(
+          std::span<const vk::BufferImageCopy>(&htile_copy, 1), htile_readback.buffer,
+          0, htile_readback.size);
+      HostReadBarrier(htile_readback.buffer, htile_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "HTile depth storage array contents",
+              ReadBuffer(name, htile_readback, htile_layers) ==
+                  std::vector<u32>(htile_layers, std::bit_cast<u32>(0.25f)),
+              "partial storage conversion lost native depth data outside its view");
+      DestroyBuffer(&htile_readback);
+
       auto layered_stencil_desc = MakeLinearDesc(
           base + 0x27d4000, 6 * 4 * sizeof(float),
           vk::Format::eD32SfloatS8Uint, Prospero::BufferFormat::k32Float,
@@ -6227,6 +7015,51 @@ public:
               "Image::CopyImage did not retain pinned "
               "source/destination states");
 
+      auto wide_volume_info = native_volume_info;
+      wide_volume_info.extent = {85, 5, 5};
+      wide_volume_info.pitch = 85;
+      auto narrow_volume_info = wide_volume_info;
+      narrow_volume_info.extent.width = 20;
+      narrow_volume_info.pitch = 20;
+      Libs::Graphics::Image wide_volume(m_runtime_context, scheduler,
+                                        wide_volume_info);
+      Libs::Graphics::Image narrow_volume(m_runtime_context, scheduler,
+                                          narrow_volume_info);
+      std::vector<uint32_t> volume_source_words(85 * 5 * 5);
+      for (uint32_t i = 0; i < volume_source_words.size(); ++i)
+        volume_source_words[i] = i + 1;
+      auto volume_upload = CreateHostBuffer(
+          name, volume_source_words.size() * sizeof(uint32_t),
+          vk::BufferUsageFlagBits::eTransferSrc, volume_source_words);
+      auto shrinking_readback =
+          CreateHostBuffer(name, 20 * 5 * 5 * sizeof(uint32_t),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferImageCopy volume_region{};
+      volume_region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0,
+                                        1};
+      volume_region.imageExtent = wide_volume_info.extent;
+      wide_volume.Upload(std::span{&volume_region, 1}, volume_upload.buffer, 0,
+                         volume_upload.size);
+      narrow_volume.CopyImage(wide_volume);
+      volume_region.imageExtent = narrow_volume_info.extent;
+      narrow_volume.Download(std::span{&volume_region, 1},
+                             shrinking_readback.buffer, 0,
+                             shrinking_readback.size);
+      HostReadBarrier(shrinking_readback.buffer, shrinking_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto volume_copied_words =
+          ReadBuffer(name, shrinking_readback, 20 * 5 * 5);
+      for (uint32_t row = 0; row < 5 * 5; ++row)
+        Require(name, "shrinking volume copy contents",
+                std::equal(volume_copied_words.begin() + row * 20,
+                           volume_copied_words.begin() + (row + 1) * 20,
+                           volume_source_words.begin() + row * 85),
+                "85x5x5 to 20x5x5 copy lost a row or depth slice");
+      DestroyBuffer(&shrinking_readback);
+      DestroyBuffer(&volume_upload);
+
       ImageInfo resolve_source_info{};
       resolve_source_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
       resolve_source_info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
@@ -6327,8 +7160,7 @@ public:
               texture_cache.GetImage(ms_depth_image).backing.state.layout ==
                   vk::ImageLayout::eDepthStencilAttachmentOptimal &&
               texture_cache.GetImage(ms_depth_image).IsGpuModified() &&
-              texture_cache.GetImage(ms_depth_image).info.htile_clear_mask ==
-                  0 &&
+              !texture_cache.GetImage(ms_depth_image).info.htile_initial_clear &&
               texture_cache.GetImage(ms_depth_image).info.metadata.range ==
                   ms_depth_desc.info.metadata.range &&
               texture_cache.IsMeta(ms_htile_address) &&
@@ -6391,7 +7223,7 @@ public:
           first_stencil_association &&
               first_stencil_association != ms_depth_image &&
               texture_cache.GetImage(first_stencil_association)
-                      .info.pixel_format == vk::Format::eUndefined &&
+                      .info.pixel_format == vk::Format::eS8Uint &&
               texture_cache.GetImage(first_stencil_association).backing.image ==
                   nullptr &&
               texture_cache.GetImage(first_stencil_association).depth_id ==
@@ -6559,6 +7391,99 @@ public:
               "to the image");
       texture_cache.MarkGpuWritten(mirror_refresh);
 
+      // Unity copies BC mip regions and packed mip tails through integer images.
+      // The CPU allocation remains white; later array sampling must see GPU writes.
+      for (uint32_t format_index = 0; format_index < 3; ++format_index) {
+        constexpr std::array formats{vk::Format::eBc4UnormBlock,
+                                     vk::Format::eBc5UnormBlock,
+                                     vk::Format::eBc7UnormBlock};
+        constexpr std::array guest_formats{Prospero::BufferFormat::kBc4UNorm,
+                                           Prospero::BufferFormat::kBc5UNorm,
+                                           Prospero::BufferFormat::kBc7UNorm};
+        constexpr uint32_t width = 128, levels = 8, layers = 3;
+        const uint32_t block_bytes = format_index == 0 ? 8 : 16;
+        const uint64_t address = base + 0x1900000 + format_index * 0x40000;
+        auto array = MakeLinearDesc(address, 0, formats[format_index],
+            guest_formats[format_index], Prospero::ImageType::kColor2D,
+            {width, width, 1}, layers, block_bytes, 1);
+        array.info.resources.levels = levels;
+        array.info.tile_mode = Prospero::TileMode::kStandard4KB;
+        array.info.UpdateSize();
+        array.view_info.level_count = levels;
+        std::memset(memory + address - base, 0xff, array.info.data.size);
+        auto value_for = [&](uint32_t layer, uint64_t offset) {
+          return 0x7c000000u | (format_index << 16) | (layer << 8) |
+                 static_cast<uint32_t>(offset / 4096);
+        };
+        auto write_raw = [&](uint32_t layer, uint32_t level, uint32_t value) {
+          const auto &mip = array.info.mip_layout[level];
+          auto raw = MakeLinearDesc(
+              address + layer * array.info.tiled_slice_stride + mip.offset, 0,
+              block_bytes == 8 ? vk::Format::eR32G32Uint
+                               : vk::Format::eR32G32B32A32Uint,
+              block_bytes == 8 ? Prospero::BufferFormat::k32_32UInt
+                               : Prospero::BufferFormat::k32_32_32_32UInt,
+              Prospero::ImageType::kColor2D, {mip.pitch, mip.height, 1},
+              1, block_bytes, 1);
+          raw.type = BindingType::Storage;
+          raw.info.tile_mode = array.info.tile_mode;
+          raw.info.UpdateSize();
+          raw.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+          const auto producer = texture_cache.FindImage(raw);
+          (void)texture_cache.FindTexture(producer, raw);
+          vk::ClearValue clear{};
+          std::fill_n(clear.color.uint32.data(), 4, value);
+          TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
+              producer, {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+        };
+        for (const uint32_t layer : {0u, 2u}) {
+          uint64_t previous_offset = UINT64_MAX;
+          for (uint32_t level = 0; level < levels; ++level) {
+            const auto offset = array.info.mip_layout[level].offset;
+            if (offset == previous_offset) continue;
+            previous_offset = offset;
+            write_raw(layer, level, value_for(layer, offset));
+          }
+        }
+        std::vector<vk::BufferImageCopy> probes;
+        std::vector<uint32_t> expected;
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          for (uint32_t level = 0; level < levels; ++level) {
+            vk::BufferImageCopy copy{};
+            copy.bufferOffset = expected.size() * sizeof(uint32_t);
+            copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, layer, 1};
+            copy.imageExtent = {std::min(width >> level, 4u),
+                                std::min(width >> level, 4u), 1};
+            probes.push_back(copy);
+            expected.insert(expected.end(), block_bytes / sizeof(uint32_t),
+                layer == 1 ? UINT32_MAX
+                           : value_for(layer, array.info.mip_layout[level].offset));
+          }
+        }
+        auto verify_array = [&] {
+          const auto consumer = texture_cache.FindImage(array);
+          (void)texture_cache.FindTexture(consumer, array);
+          auto readback = CreateHostBuffer(name, expected.size() * sizeof(uint32_t),
+              vk::BufferUsageFlagBits::eTransferDst, std::vector<uint32_t>(expected.size()));
+          texture_cache.GetImage(consumer).Download(probes, readback.buffer, 0, readback.size);
+          HostReadBarrier(readback.buffer, readback.size, vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          Require(name, "raw image producers populate BC array",
+                  ReadBuffer(name, readback, expected.size()) == expected,
+                  "BC array lost GPU mip/tail writes or overwrote an untouched layer");
+          DestroyBuffer(&readback);
+        };
+        verify_array();
+        constexpr uint32_t replacement = 0x13579bdfu;
+        write_raw(2, array.info.first_tail_level, replacement);
+        for (uint32_t level = array.info.first_tail_level; level < levels; ++level) {
+          const auto word = (2 * levels + level) * block_bytes / sizeof(uint32_t);
+          std::fill_n(expected.begin() + word, block_bytes / sizeof(uint32_t), replacement);
+        }
+        verify_array();
+      }
+
       // A write through a separate buffer must not replace untouched image
       // texels with stale backing bytes. Exact-base writes still refresh it.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;
@@ -6688,8 +7613,9 @@ public:
           {13, 11, 1}, 2, 4, 1);
       stencil_clear_desc.info.stencil = {base + 0x27e2000, 0x1000};
       stencil_clear_desc.info.resources.levels = 2;
-      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11};
-      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5};
+      stencil_clear_desc.info.mip_layout[0] = {0, 0x800, 13, 11, 0, 0x400, 13};
+      stencil_clear_desc.info.mip_layout[1] = {0x800, 0x800, 6, 5, 0x800, 0x400, 6};
+      stencil_clear_desc.info.linear_slice_stride = 0x400;
       stencil_clear_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       const auto stencil_clear_id = texture_cache.FindImage(stencil_clear_desc);
@@ -6932,6 +7858,48 @@ public:
               texture_cache.GetImage(fault_b_image).IsGpuModified(),
           "the surviving image could not reconcile its CPU write");
 
+      // Further writes on the unprotected page must retain the first baseline.
+      Require(name, "same-page repeated-write fault",
+              resources.HandleFault(PageFaultAccess::Write,
+                                    base + padding_fault_offset),
+              "the padding write fault was not handled");
+      constexpr uint32_t fault_a_cpu = 0x81828384u;
+      std::memcpy(memory + 0x8000, &fault_a_cpu, sizeof(fault_a_cpu));
+      texture_cache.InvalidateMemory(base + padding_fault_offset, 1);
+      Require(name, "repeated same-page invalidation",
+              texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
+                  !texture_cache.GetImage(fault_a_image).IsDefinitelyCpuDirty(),
+              "a repeated padding notification lost maybe-dirty ownership");
+      texture_cache.InvalidateMemory(base + 0x8010, sizeof(fault_b));
+      Require(name, "definite write supersedes maybe-dirty state",
+              texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty() &&
+                  !texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty(),
+              "an overlapping CPU write retained the padding-only dirty state");
+      texture_cache.UpdateImage(fault_a_image);
+      texture_cache.UpdateImage(fault_b_image);
+
+      auto fault_readback = CreateHostBuffer(
+          name, 2 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+      vk::BufferImageCopy fault_copy{};
+      fault_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+      fault_copy.imageExtent = {1, 1, 1};
+      for (const auto id : {fault_a_image, fault_b_image}) {
+        texture_cache.GetImage(id).Download(
+            {&fault_copy, 1}, fault_readback.buffer, fault_copy.bufferOffset,
+            sizeof(uint32_t));
+        fault_copy.bufferOffset += sizeof(uint32_t);
+      }
+      HostReadBarrier(fault_readback.buffer, fault_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "same-page CPU refresh contents",
+              ReadBuffer(name, fault_readback, 2) ==
+                  std::vector<u32>{fault_a_cpu, fault_b_cpu},
+              "repeated padding invalidation lost a CPU write or definite "
+              "invalidation failed to refresh the native image");
+      DestroyBuffer(&fault_readback);
+
       constexpr uint64_t publish_image_offset = 0x26000;
       constexpr uint64_t publish_buffer_offset = 0x26010;
       constexpr uint32_t publish_image_value = 0x31415926u;
@@ -7011,7 +7979,7 @@ public:
       dcc_array.type = BindingType::RenderTarget;
       dcc_array.info.tile_mode = Prospero::TileMode::kRenderTarget;
       dcc_array.info.pitch = TileGetRenderTargetPitch(128, 8);
-      dcc_array.info.mip_layout[0].pitch = dcc_array.info.pitch;
+      dcc_array.info.UpdateSize();
       dcc_array.info.metadata.kind = ImageMetadataKind::Dcc;
       dcc_array.info.metadata.range = {alias_dcc_address, 0x2000};
       dcc_array.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
@@ -7025,7 +7993,7 @@ public:
       auto dcc_alias = dcc_array;
       dcc_alias.info.data = {dcc_array.info.data.address + 0x10000, 0x10000};
       dcc_alias.info.resources.layers = 1;
-      dcc_alias.info.mip_layout[0].size = 0x10000;
+      dcc_alias.info.UpdateSize();
       dcc_alias.info.metadata.range = {alias_dcc_address + 0x1000, 0x1000};
       dcc_alias.view_info.type = vk::ImageViewType::e2D;
       dcc_alias.view_info.layer_count = 1;
@@ -7100,7 +8068,7 @@ public:
       };
       auto metadata_depth_a = MakeMetadataDepth(metadata_data_a, metadata_a);
       auto metadata_depth_b = MakeMetadataDepth(metadata_data_b, metadata_b);
-      metadata_depth_a.info.htile_clear_mask = 0;
+      metadata_depth_a.info.htile_initial_clear = false;
       const auto metadata_depth_a_id =
           texture_cache.FindImage(metadata_depth_a);
       const auto metadata_depth_b_id =
@@ -7118,6 +8086,8 @@ public:
               metadata_depth_a_view != nullptr &&
                   metadata_depth_b_view != nullptr &&
                   !texture_cache.IsMetaCleared(base + metadata_a, 0) &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 86) &&
+                  !texture_cache.IsMetaCleared(base + metadata_a, 8191) &&
                   texture_cache.ClearMeta(base + metadata_a) &&
                   texture_cache.ClearMeta(base + metadata_b),
               "shared-page metadata did not retain logical clear state");
@@ -7154,6 +8124,32 @@ public:
               texture_cache.TouchMeta(base + metadata_b, 0, false) &&
               !texture_cache.IsMetaCleared(base + metadata_b, 0),
           "per-slice metadata update incorrectly required prior GPU ownership");
+      constexpr std::array htile_slices{31u, 32u, 63u, 64u, 86u, 8191u};
+      Require(name, "HTile clear across slice words",
+              texture_cache.ClearMeta(base + metadata_b),
+              "registered metadata did not accept a full clear");
+      for (const auto slice : htile_slices) {
+        Require(name, "independent high HTile slice",
+                texture_cache.IsMetaCleared(base + metadata_b, slice) &&
+                    texture_cache.TouchMeta(base + metadata_b, slice, false) &&
+                    !texture_cache.IsMetaCleared(base + metadata_b, slice) &&
+                    texture_cache.IsMetaCleared(base + metadata_b, 0),
+                "high slice clear state was missing or aliased a lower slice");
+      }
+      (void)texture_cache.FindDepthTarget(metadata_depth_b_id, metadata_depth_b);
+      Require(name, "HTile registration retains consumed slices",
+              std::ranges::none_of(htile_slices, [&](uint32_t slice) {
+                return texture_cache.IsMetaCleared(base + metadata_b, slice);
+              }) && texture_cache.TouchMeta(base + metadata_b, 86, true) &&
+                  texture_cache.IsMetaCleared(base + metadata_b, 86) &&
+                  !texture_cache.IsMetaCleared(base + metadata_b, 64) &&
+                  !texture_cache.IsMetaCleared(base + metadata_b, 8192) &&
+                  !texture_cache.TouchMeta(base + metadata_b, 8192, true) &&
+                  texture_cache.ClearMeta(base + metadata_b) &&
+                  std::ranges::all_of(htile_slices, [&](uint32_t slice) {
+                    return texture_cache.IsMetaCleared(base + metadata_b, slice);
+                  }),
+              "registration reset consumed slices or full clear failed to rearm them");
       resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
                                             0, false);
       Require(
@@ -7166,7 +8162,7 @@ public:
       auto reused_depth = MakeMetadataDepth(0x12300, 0x28000);
       reused_depth.info.pixel_format = vk::Format::eD32SfloatS8Uint;
       reused_depth.info.stencil = {base + 0x12200, 0x80};
-      reused_depth.info.htile_clear_mask = 0;
+      reused_depth.info.htile_initial_clear = false;
       reused_depth.view_info.format = vk::Format::eD32SfloatS8Uint;
       reused_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth |
                                       vk::ImageAspectFlagBits::eStencil;
@@ -7229,12 +8225,24 @@ public:
                          Prospero::ImageType::kColor2D, {2048, 1, 1}, 1, 4, 1);
       const auto partial_unmap_image_id =
           texture_cache.FindImage(partial_unmap_image);
-      texture_cache.UnmapMemory(partial_unmap_image.info.data.address, 0x1000);
+      const auto image_address = partial_unmap_image.info.data.address;
+      Require(name, "registered image boundaries",
+              texture_cache.IsRegionRegistered(image_address, 1) &&
+                  texture_cache.IsRegionRegistered(image_address + 0x1fff, 1) &&
+                  !texture_cache.IsRegionRegistered(image_address - 1, 1) &&
+                  !texture_cache.IsRegionRegistered(image_address + 0x2000, 1) &&
+                  texture_cache.IsRegionRegistered(image_address - 1, 0x2002),
+              "image lookup mishandled a partial overlap or adjacent range");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      const auto image_unmap_tick = scheduler.CurrentTick();
+      resources.UnmapMemory(image_address + 0x1000, 0x1000);
       Require(name, "partial image unmap tracking",
               partial_unmap_image_id &&
-                  !texture_cache.FindImageFromRange(
-                      partial_unmap_image.info.data.address, 0x2000, false),
-              "partial unmap left the deleted image's mapped tail tracked");
+                  scheduler.CurrentTick() == image_unmap_tick + 1 &&
+                  !texture_cache.IsRegionRegistered(image_address, 0x2000) &&
+                  !texture_cache.FindImageFromRange(image_address, 0x2000, false),
+              "partial image unmap skipped its drain or retained the image");
 
       constexpr uint64_t unformatted_alias_offset = 0x2500000;
       auto unformatted_alias =
@@ -7264,30 +8272,34 @@ public:
                                                  0.5f, 0.625f, 0.75f, 0.875f,
                                                  1.0f, 0.0625f};
       std::memset(memory + layered_offset, 0, layered_guest_size);
-      const auto layered_layout = TextureCalcUploadLayout(
+      const auto layered_layout = MakeTilingImage(
           Prospero::BufferFormat::k32Float, 2, 2, 2, 2,
-          Prospero::TileMode::kLinear, layered_guest_size, false,
-          "UnifiedTextureCacheFlow");
-      const auto layered_upload_regions =
-          TextureBuildImageCopies(layered_layout);
-      Require(name, "layered guest layout", layered_upload_regions.size() == 4,
-              "unexpected layered/mipped upload-region count");
+          Prospero::TileMode::kLinear, layered_guest_size, false);
+      const auto layered_upload_regions = layered_layout.BufferCopies();
+      Require(name, "layered guest layout", layered_upload_regions.size() == 2,
+              "linear array upload did not batch each mip");
       for (const auto &region : layered_upload_regions) {
-        for (uint32_t y = 0; y < region.imageExtent.height; y++) {
-          for (uint32_t x = 0; x < region.imageExtent.width; x++) {
-            const uint32_t logical =
-                region.imageSubresource.mipLevel == 0
-                    ? region.imageSubresource.baseArrayLayer * 4 + y * 2 + x
-                    : 8 + region.imageSubresource.baseArrayLayer;
-            const uint64_t byte_offset =
-                region.bufferOffset +
-                (static_cast<uint64_t>(y) * region.bufferRowLength + x) *
-                    sizeof(float);
-            Require(name, "layered guest layout bounds",
-                    byte_offset + sizeof(float) <= layered_guest_size,
-                    "layered guest texel lies outside its backing range");
-            std::memcpy(memory + layered_offset + byte_offset,
-                        &layered_values[logical], sizeof(float));
+        for (uint32_t layer = 0; layer < region.imageSubresource.layerCount;
+             ++layer) {
+          for (uint32_t y = 0; y < region.imageExtent.height; ++y) {
+            for (uint32_t x = 0; x < region.imageExtent.width; ++x) {
+              const uint32_t absolute_layer =
+                  region.imageSubresource.baseArrayLayer + layer;
+              const uint32_t logical = region.imageSubresource.mipLevel == 0
+                                           ? absolute_layer * 4 + y * 2 + x
+                                           : 8 + absolute_layer;
+              const uint64_t byte_offset =
+                  region.bufferOffset +
+                  ((uint64_t{layer} * region.bufferImageHeight + y) *
+                       region.bufferRowLength +
+                   x) *
+                      sizeof(float);
+              Require(name, "layered guest layout bounds",
+                      byte_offset + sizeof(float) <= layered_guest_size,
+                      "layered guest texel lies outside its backing range");
+              std::memcpy(memory + layered_offset + byte_offset,
+                          &layered_values[logical], sizeof(float));
+            }
           }
         }
       }
@@ -7299,29 +8311,35 @@ public:
       layered_color.info.mip_layout[0] = {0, 32, 2, 2};
       layered_color.info.mip_layout[1] = {32, 8, 1, 1};
       layered_color.view_info.level_count = 2;
+      layered_color.info.UpdateSize();
       const auto layered_color_image = texture_cache.FindImage(layered_color);
       (void)texture_cache.FindTexture(layered_color_image, layered_color);
       texture_cache.MarkGpuWritten(layered_color_image);
       auto layered_depth = layered_color;
       layered_depth.type = BindingType::DepthTarget;
       layered_depth.info.resources = {1, 4};
+      layered_depth.info.mip_layout = {};
+      layered_depth.info.mip_layout[0] = {0, layered_guest_size, 2, 2};
       layered_depth.view_info.level_count = 1;
+      layered_depth.view_info.layer_count = 4;
       layered_depth.info.pixel_format = vk::Format::eD32Sfloat;
       layered_depth.view_info.format = vk::Format::eD32Sfloat;
       layered_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       layered_depth.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      layered_depth.info.UpdateSize();
       const auto layered_depth_image = texture_cache.FindImage(layered_depth);
       const auto &layered_native = texture_cache.GetImage(layered_depth_image);
-      Require(name, "layered mipped depth alias",
-              layered_depth_image != layered_color_image &&
-                  layered_native.backing.layers == 2 &&
-                  layered_native.backing.mip_levels == 2 &&
-                  layered_native.info.resources ==
-                      layered_color.info.resources &&
-                  layered_native.IsGpuModified(),
-              "depth/color conversion did not use the lexicographic "
-              "resource maximum");
+      Require(
+          name, "layered mipped depth alias",
+          layered_depth_image != layered_color_image &&
+              layered_native.backing.layers == 4 &&
+              layered_native.backing.mip_levels == 1 &&
+              layered_native.info.resources == layered_depth.info.resources &&
+              layered_native.info.mip_layout == layered_depth.info.mip_layout &&
+              layered_native.IsGpuModified(),
+          "depth/color conversion mixed the source mip count with the "
+          "requested layout");
       const volatile auto layered_guest_byte =
           *reinterpret_cast<const volatile uint8_t *>(memory + layered_offset);
       (void)layered_guest_byte;
@@ -7612,29 +8630,19 @@ public:
                       vk::AccessFlagBits::eTransferWrite);
 
       auto layered_readback = CreateHostBuffer(
-          name, sizeof(layered_values), vk::BufferUsageFlagBits::eTransferDst,
-          std::vector<u32>(sizeof(layered_values) / sizeof(u32), 0));
+          name, 8 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(8, 0));
       auto &layered_depth_native = texture_cache.GetImage(layered_depth_image);
       layered_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
                                    vk::AccessFlagBits2::eTransferRead, {},
                                    command.Handle());
-      std::array<vk::BufferImageCopy, 2> layered_copies{};
-      layered_copies[0].bufferOffset = 0;
-      layered_copies[0].imageSubresource.aspectMask =
-          vk::ImageAspectFlagBits::eDepth;
-      layered_copies[0].imageSubresource.mipLevel = 0;
-      layered_copies[0].imageSubresource.layerCount = 2;
-      layered_copies[0].imageExtent = {2, 2, 1};
-      layered_copies[1].bufferOffset = 32;
-      layered_copies[1].imageSubresource.aspectMask =
-          vk::ImageAspectFlagBits::eDepth;
-      layered_copies[1].imageSubresource.mipLevel = 1;
-      layered_copies[1].imageSubresource.layerCount = 2;
-      layered_copies[1].imageExtent = {1, 1, 1};
+      vk::BufferImageCopy layered_copy{};
+      layered_copy.imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 2};
+      layered_copy.imageExtent = {2, 2, 1};
       command.Handle().copyImageToBuffer(
           layered_depth_native.backing.image,
           vk::ImageLayout::eTransferSrcOptimal, layered_readback.buffer,
-          static_cast<uint32_t>(layered_copies.size()), layered_copies.data());
+          1, &layered_copy);
       HostReadBarrier(layered_readback.buffer, layered_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
@@ -7847,21 +8855,19 @@ public:
                   std::vector<u32>{0x40004200u, 0x44003c00u},
               "GPU BGRA16 swap did not publish RGBA half-word order");
       scheduler.Finish();
-      const auto layered_words =
-          ReadBuffer(name, layered_readback, layered_values.size());
-      const std::array<float, 10> layered_expected{
+      const auto layered_words = ReadBuffer(name, layered_readback, 8);
+      const std::array<float, 8> layered_expected{
           layered_values[0], layered_values[1], layered_values[2],
           layered_values[3], layered_values[4], layered_values[5],
-          layered_values[6], layered_values[7], layered_values[8],
-          layered_values[9]};
+          layered_values[6], layered_values[7]};
       bool layered_content = layered_words.size() == layered_expected.size();
       for (uint32_t index = 0;
            layered_content && index < layered_expected.size(); index++) {
         layered_content &=
             layered_words[index] == std::bit_cast<u32>(layered_expected[index]);
       }
-      Require(name, "layered mipped depth content", layered_content,
-              "depth/color conversion changed a mip or array-layer value");
+      Require(name, "layered depth common-mip content", layered_content,
+              "depth/color conversion changed a shared array-layer value");
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
@@ -7917,9 +8923,11 @@ public:
       texture_cache.UnmapMemory(ms_depth_desc.info.data.address,
                                 ms_depth_desc.info.data.size);
       Require(name, "depth unmap proxy retirement",
-              !texture_cache.FindImageFromRange(base + second_stencil_offset,
-                                                ms_stencil_size, false),
-              "unmapping depth retained its re-associated stencil proxy");
+              !texture_cache.FindImageFromRange(base + ms_stencil_offset,
+                                                ms_stencil_size, false) &&
+                  !texture_cache.FindImageFromRange(base + second_stencil_offset,
+                                                    ms_stencil_size, false),
+              "unmapping depth retained one of its stencil proxies");
 
       auto reused_stencil_color = MakeLinearDesc(
           base + 0x2200000, 0x40000, vk::Format::eR8Unorm,
@@ -7974,8 +8982,31 @@ public:
               ReadCachedTexel(name, context, reused_stencil_color_id, {},
                               {4, 1, 1}) == std::vector<u32>{0xffffffffu},
               "stencil address reuse changed the native R8 clear contents");
+      auto successor_depth = reused_stencil_depth;
+      successor_depth.info.data.address += successor_depth.info.data.size;
+      const auto successor_depth_id = texture_cache.FindImage(successor_depth);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, successor_depth_id, successor_depth.info.stencil);
       texture_cache.UnmapMemory(reused_stencil_depth.info.data.address,
                                 reused_stencil_depth.info.data.size);
+      Require(name, "reparented stencil survives old depth retirement",
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                reused_stencil_depth_id) &&
+                  TextureCacheTestAccess::Contains(texture_cache,
+                                                   successor_depth_id) &&
+                  texture_cache.FindImageFromRange(
+                      successor_depth.info.stencil.address,
+                      successor_depth.info.stencil.size, false) ==
+                      reused_stencil_proxy &&
+                  texture_cache.GetImage(reused_stencil_proxy).depth_id ==
+                      successor_depth_id,
+              "retiring the previous depth owner removed its reparented proxy");
+      texture_cache.UnmapMemory(successor_depth.info.data.address,
+                                successor_depth.info.data.size);
+      Require(name, "reparented stencil retires with new depth",
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                reused_stencil_proxy),
+              "retiring the new depth owner retained its reparented proxy");
       texture_cache.UnmapMemory(reused_stencil_color.info.data.address,
                                 reused_stencil_color.info.data.size);
 
@@ -8244,8 +9275,9 @@ public:
       for (uint32_t index = 0; index < linear_depth_words; index++) {
         linear_depth_guest[index] = 0x51000000u + index;
       }
-      constexpr std::array<uint8_t, 8> linear_stencil_guest{
-          0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x37, 0x28};
+      constexpr std::array<uint8_t, 16> linear_stencil_guest{
+          0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x37, 0x28,
+          0x19, 0x2a, 0x3b, 0x4c, 0x5d, 0x6e, 0x7f, 0x80};
       std::memcpy(memory + linear_depth_offset, linear_depth_guest.data(),
                   sizeof(linear_depth_guest));
       std::memcpy(memory + linear_stencil_offset, linear_stencil_guest.data(),
@@ -8263,6 +9295,7 @@ public:
       linear_depth_desc.info.mip_layout[0] = {0, sizeof(linear_depth_guest),
                                               linear_depth_pitch,
                                               linear_depth_height};
+      linear_depth_desc.info.UpdateSize();
       linear_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       linear_depth_desc.view_info.usage =
@@ -8364,6 +9397,7 @@ public:
       tiled_depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       tiled_depth_desc.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      tiled_depth_desc.info.UpdateSize();
       const auto tiled_depth_image = texture_cache.FindImage(tiled_depth_desc);
       Require(name, "tiled depth native clear",
               texture_cache.ClearImageFromBuffer(
@@ -8413,28 +9447,18 @@ public:
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint32_t),
                                  depth_block),
               "failed to describe the tiled depth test surface");
-      std::array<GpuTileInfo, tiled_depth_layers> tiled_depth_tiles{};
-      for (uint32_t layer = 0; layer < tiled_depth_layers; layer++) {
-        const uint64_t offset = tiled_depth_slice * layer;
-        tiled_depth_tiles[layer] = {depth_block.family,
-                                    depth_block.bytes_per_element,
-                                    offset,
-                                    tiled_depth_slice,
-                                    offset,
-                                    tiled_depth_slice,
-                                    0,
-                                    tiled_depth_width,
-                                    tiled_depth_height,
-                                    1,
-                                    tiled_depth_pitch};
-        tiled_depth_tiles[layer].surface_z = layer;
-      }
+      auto tiled_depth_info =
+          MakeTilingImage(Prospero::BufferFormat::k32Float, tiled_depth_width,
+                          tiled_depth_height, 1, tiled_depth_layers,
+                          Prospero::TileMode::kDepth, tiled_depth_size, false);
+      tiled_depth_info.linear_slice_stride = tiled_depth_slice;
+      tiled_depth_info.mip_layout[0].linear_size = tiled_depth_slice;
+      tiled_depth_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_depth_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_depth_after);
       auto tiled_depth_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_depth_input.buffer, 0, tiled_depth_size,
-                      tiled_depth_size, tiled_depth_tiles);
+              .Detile(tiled_depth_input.buffer, 0, tiled_depth_info);
       auto tiled_depth_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_depth_guest.size(), 0));
@@ -8498,6 +9522,7 @@ public:
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       tiled_d16_desc.view_info.usage =
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      tiled_d16_desc.info.UpdateSize();
       const auto tiled_d16_image = texture_cache.FindImage(tiled_d16_desc);
       Require(name, "tiled D16 native clear",
               texture_cache.ClearImageFromBuffer(
@@ -8530,32 +9555,22 @@ public:
                                             sizeof(uint32_t));
       std::memcpy(tiled_d16_words.data(), tiled_d16_after.data(),
                   tiled_depth_size);
-      std::array<GpuTileInfo, tiled_depth_layers> tiled_d16_tiles{};
       Require(name, "tiled D16 block layout",
               TileGetBlockLayout(TileBlockFamily::Depth64KB, sizeof(uint16_t),
                                  depth_block),
               "failed to describe the tiled D16 test surface");
-      for (uint32_t layer = 0; layer < tiled_depth_layers; layer++) {
-        const uint64_t offset = tiled_depth_slice * layer;
-        tiled_d16_tiles[layer] = {depth_block.family,
-                                  depth_block.bytes_per_element,
-                                  offset,
-                                  tiled_depth_slice,
-                                  offset,
-                                  tiled_depth_slice,
-                                  0,
-                                  tiled_depth_width,
-                                  tiled_depth_height,
-                                  1,
-                                  tiled_depth_pitch};
-        tiled_d16_tiles[layer].surface_z = layer;
-      }
+      auto tiled_d16_info =
+          MakeTilingImage(Prospero::BufferFormat::k16UNorm, tiled_depth_width,
+                          tiled_depth_height, 1, tiled_depth_layers,
+                          Prospero::TileMode::kDepth, tiled_depth_size, false);
+      tiled_d16_info.linear_slice_stride = tiled_depth_slice;
+      tiled_d16_info.mip_layout[0].linear_size = tiled_depth_slice;
+      tiled_d16_info.mip_layout[0].linear_pitch = tiled_depth_pitch;
       auto tiled_d16_input =
           CreateHostBuffer(name, tiled_depth_size, AllFlags, tiled_d16_words);
       auto tiled_d16_linear =
           TextureCacheTestAccess::Tiler(texture_cache)
-              .Detile(tiled_d16_input.buffer, 0, tiled_depth_size,
-                      tiled_depth_size, tiled_d16_tiles);
+              .Detile(tiled_d16_input.buffer, 0, tiled_d16_info);
       auto tiled_d16_output =
           CreateHostBuffer(name, tiled_depth_size, AllFlags,
                            std::vector<uint32_t>(tiled_d16_words.size(), 0));
@@ -8814,6 +9829,7 @@ public:
           {tile_alias_extent, tile_alias_extent, 1}, 1, 4, 1);
       render_target_alias.type = BindingType::Storage;
       render_target_alias.info.tile_mode = Prospero::TileMode::kRenderTarget;
+      render_target_alias.info.UpdateSize();
       render_target_alias.view_info.usage = vk::ImageUsageFlagBits::eStorage;
       const auto render_target_alias_image =
           texture_cache.FindImage(render_target_alias);
@@ -8821,6 +9837,7 @@ public:
       auto standard_4kb_alias = render_target_alias;
       standard_4kb_alias.type = BindingType::Texture;
       standard_4kb_alias.info.tile_mode = Prospero::TileMode::kStandard4KB;
+      standard_4kb_alias.info.UpdateSize();
       standard_4kb_alias.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto standard_4kb_alias_image =
           texture_cache.FindImage(standard_4kb_alias);
@@ -8974,7 +9991,7 @@ public:
       desc.info.samples = 1;
       desc.info.tile_mode = tile;
       desc.info.bgra16 = true;
-      desc.info.mip_layout[0] = {mip.offset, mip.size, pitch, 1};
+      desc.info.UpdateSize();
       desc.view_info.format = desc.info.pixel_format;
       desc.view_info.type = vk::ImageViewType::e2D;
       desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -9176,7 +10193,10 @@ public:
 
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",
-                color.desc.info.mip_layout[0] == ImageMipInfo{0, 0x10000, 128, 64},
+                color.desc.info.mip_layout[0].offset == 0 &&
+                    color.desc.info.mip_layout[0].size == 0x10000 &&
+                    color.desc.info.mip_layout[0].pitch == 128 &&
+                    color.desc.info.mip_layout[0].height == 64,
                 "the render target lost the expected padded block height");
       }
 
@@ -9555,6 +10575,32 @@ public:
                   ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
                       std::vector<u32>{0x5a5a5a5a},
               "clearing one volume slice changed untouched slice contents");
+      // A GPU writer clears slice 9's metadata; its bind selects the clear on the GPU.
+      auto [writer, writer_offset] = resources.GetBufferCache().ObtainBuffer(
+          dcc_address + 9 * metadata_slice_size, metadata_slice_size, true);
+      writer->Fill(writer_offset, metadata_slice_size, 0);
+      Common::DebugCounters::SetEnabled(true);
+      const auto readbacks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
+      const auto checks =
+          Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      registers.SetColorView(0, {.base_array_slice_index = 9, .last_array_slice_index = 9});
+      RenderColorInfo gpu_slice{};
+      RenderExecutorTestAccess::ResolveRenderColorTarget(
+          executor, scheduler.Current(), gpu_slice, 0);
+      Common::DebugCounters::SetEnabled(false);
+      Require(name, "GPU-written volume metadata clears on the GPU",
+              gpu_slice.image_id == color.image_id &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks &&
+                  Common::DebugCounters::Get(
+                      Common::DebugCounters::Counter::ColorMetadataChecks) == checks + 1 &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 9}) ==
+                      std::vector<u32>{0} &&
+                  ReadCachedTexel(name, context, color.image_id, {0, 0, 31}) ==
+                      std::vector<u32>{0x5a5a5a5a},
+              "a volume slice's GPU-written metadata was read back or cleared other slices");
       auto storage_desc = color.desc;
       storage_desc.type = BindingType::Storage;
       storage_desc.info.metadata = {};
@@ -9673,6 +10719,7 @@ public:
       auto expanded = storage_desc;
       expanded.info.extent.depth = 56;
       expanded.info.data.size = allocation_size;
+      expanded.info.UpdateSize();
       const auto expanded_id = texture_cache.FindImage(expanded);
       Require(name, "3D storage depth expansion",
               expanded_id != color.image_id &&
@@ -9731,9 +10778,24 @@ public:
     desc.info.samples = samples;
     desc.info.tile_mode = Prospero::TileMode::kLinear;
     desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+    desc.info.tiling.texel_width = desc.info.IsBlock() ? 4u : 1u;
+    desc.info.tiling.texel_height = desc.info.IsBlock() ? 4u : 1u;
+    desc.info.tiling.block.bytes_per_element = bytes_per_block;
+    desc.info.linear_slice_stride =
+        size / (type == Prospero::ImageType::kColor3D ? extent.depth : layers);
+    desc.info.mip_layout[0].pitch =
+        (extent.width + desc.info.tiling.texel_width - 1u) /
+        desc.info.tiling.texel_width;
+    desc.info.mip_layout[0].height =
+        (extent.height + desc.info.tiling.texel_height - 1u) /
+        desc.info.tiling.texel_height;
+    desc.info.mip_layout[0].linear_pitch = desc.info.mip_layout[0].pitch;
+    desc.info.mip_layout[0].linear_size = desc.info.linear_slice_stride;
     desc.view_info.format = format;
-    desc.view_info.type = type == Prospero::ImageType::kColor3D ? vk::ImageViewType::e3D
-        : layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D;
+    desc.view_info.type = type == Prospero::ImageType::kColor3D
+                              ? vk::ImageViewType::e3D
+                          : layers > 1 ? vk::ImageViewType::e2DArray
+                                       : vk::ImageViewType::e2D;
     desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
     desc.view_info.layer_count = layers;
     desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
@@ -9745,22 +10807,34 @@ public:
                                  vk::Extent3D extent = {1, 1, 1}, uint32_t layer = 0,
                                  uint32_t mip = 0) {
     auto &scheduler = context.GetCommandScheduler();
-    auto &image = context.GetTextureCache().GetImage(id);
-    const auto bytes = image.info.bytes_per_block * extent.width *
+    auto *image = &context.GetTextureCache().GetImage(id);
+    std::unique_ptr<Libs::Graphics::Image> resolved;
+    if (image->backing.samples > 1) {
+      auto info = image->info;
+      info.data = {};
+      info.metadata = {};
+      info.samples = 1;
+      info.resources = {1, 1};
+      resolved = std::make_unique<Libs::Graphics::Image>(m_runtime_context, scheduler, info);
+      resolved->Resolve(*image, {mip, 1, layer, 1}, {});
+      image = resolved.get();
+      layer = mip = 0;
+    }
+    const auto bytes = image->info.bytes_per_block * extent.width *
                        extent.height * extent.depth;
     auto probe = CreateHostBuffer(name, bytes,
                                  vk::BufferUsageFlagBits::eTransferDst, {});
     scheduler.Current().EndRendering();
-    image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+    image->Transit(vk::ImageLayout::eTransferSrcOptimal,
                   vk::AccessFlagBits2::eTransferRead, {},
                   scheduler.Current().Handle());
     vk::BufferImageCopy copy{};
-    copy.imageSubresource = {image.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+    copy.imageSubresource = {image->info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
                                                 : vk::ImageAspectFlagBits::eColor, mip, layer, 1};
     copy.imageOffset = offset;
     copy.imageExtent = extent;
     scheduler.Current().Handle().copyImageToBuffer(
-        image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+        image->backing.image, vk::ImageLayout::eTransferSrcOptimal,
         probe.buffer, 1, &copy);
     vk::BufferMemoryBarrier barrier{};
     barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -9779,6 +10853,576 @@ public:
     return result;
   }
 
+  void CheckNullTextureDescriptors() {
+    constexpr const char *name = "NullTextureDescriptors";
+    constexpr uintptr_t base = 0x0000000204900000ull;
+    constexpr uint64_t size = 0x10000;
+    std::vector<u32> reader{
+        EncodeVop2(0x1a, 20, InlineU32(5), 0),
+        EncodeVop1(0x01, 21, InlineU32(0)),
+        EncodeVop1(0x01, 22, InlineU32(0)),
+        EncodeMimg0(0x00, 0xf), EncodeMimg1(1, 21)};
+    AppendVMovLiteral(&reader, 23, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&reader, 24, std::bit_cast<u32>(0.5f));
+    reader.insert(reader.end(), {
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(5, 23, 0, 2),
+        0xbf8c3f70u,
+        EncodeMubuf0(0x1e), EncodeMubuf1(1, 3, 20),
+        EncodeMubuf0(0x1e, 16), EncodeMubuf1(5, 3, 20)});
+    AppendEnd(&reader);
+    std::vector<u32> writer{
+        EncodeVopc(0xd2, InlineU32(0), 0),
+        EncodeVop1(0x01, 21, InlineU32(0)),
+        EncodeVop1(0x01, 22, InlineU32(0))};
+    for (u32 i = 1; i <= 4; ++i)
+      AppendVMovLiteral(&writer, i, std::bit_cast<u32>(-1000000.0f));
+    writer.insert(writer.end(), {EncodeMimg0(0x08, 0xf), EncodeMimg1(1, 21)});
+    AppendEnd(&writer);
+    for (const auto *code : {&reader, &writer})
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "null texture output allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "null texture output mapping failed");
+    std::memset(mapped, 0xa5, size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      auto &executor = context.GetRenderExecutor();
+      for (u32 wave_size : {32u, 64u}) {
+        const auto output_address = [&](u32 phase) {
+          return base + (wave_size == 64 ? 0x8000u : 0u) + 0x100u + phase * 0x2000u;
+        };
+        for (u32 sgpr = 0; sgpr < 16; ++sgpr)
+          shaders.SetCsUserSgpr(sgpr, 0, HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(8, 0x92u, HW::UserSgprType::Unknown);
+        for (u32 phase = 0; phase < 3; ++phase) {
+          const auto &code = phase == 1 ? writer : reader;
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                               .num_thread_x = wave_size, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = static_cast<uint8_t>(wave_size), .user_sgpr = 16});
+          ShaderBufferResource output{};
+          output.UpdateAddress48(output_address(phase));
+          output.fields[2] = wave_size * 8u * sizeof(u32);
+          output.fields[3] = DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+          for (u32 i = 0; i < 4; ++i)
+            shaders.SetCsUserSgpr(12 + i, output.fields[i], HW::UserSgprType::Unknown);
+          ShaderComputeInputInfo input{};
+          (void)context.GetPipelineCache().GetComputeProgram(
+              shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+          PreparedBindings bindings;
+          executor.PrepareBindings(input.stage, bindings);
+          executor.RebindImages(bindings);
+          Require(name, "native null image bindings", !bindings.images.empty() &&
+              std::ranges::all_of(bindings.images, [](const auto &binding) {
+                return !binding.image_id && binding.image_view == nullptr &&
+                    binding.mip_views.empty() &&
+                    MakeImageInfo(binding).imageView == nullptr &&
+                    binding.layout == vk::ImageLayout::eGeneral;
+              }), "an all-zero guest descriptor allocated or bound a backing image");
+          processor.DispatchDirect(1, 1, 1, 0x41u |
+              (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+        }
+        for (u32 phase : {0u, 2u}) {
+          const auto address = output_address(phase);
+          std::vector<u32> actual(wave_size * 8u);
+          context.GetBufferCache().ReadMemory(address, actual.size() * sizeof(u32));
+          Require(name, "null RGBA before and after storage write",
+              LibKernel::Memory::TryReadBacking(address, actual.data(), actual.size() * sizeof(u32)) &&
+                  std::ranges::all_of(actual, [](u32 value) { return value == 0; }),
+              "wave" + std::to_string(wave_size) + " phase" + std::to_string(phase) +
+                  " returned nonzero load/sample components from an unbound texture");
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "null texture output release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckScalarLeafCall() {
+    constexpr const char* name = "ScalarLeafCall";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto table = base + 0x100;
+    constexpr auto first = base + 0x1000;
+    constexpr auto second = base + 0x2000;
+    constexpr auto output = base + 0x4000;
+    std::vector<u32> code{
+        EncodeSMovB32(20, InlineU32(0)),
+        0xbeea03ffu, static_cast<u32>(base), 0xbeeb03ffu, static_cast<u32>(base >> 32u),
+        0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u,
+        0xbf8cc07fu, 0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u,
+        0xbf8cc07fu, 0xbe8e210eu, EncodeVop1(0x01, 1, 20),
+        EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(1, 0, 0)};
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "call fixture allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void*>(base),
+        "call fixture mapping failed");
+    std::memset(mapped, 0, size);
+    const ShaderBufferResource table_desc{{static_cast<u32>(table),
+        static_cast<u32>(table >> 32u) | (16u << 16u), 8, 0x5204u}};
+    LibKernel::Memory::WriteBacking(base, table_desc.fields, sizeof(table_desc.fields));
+    const std::array leaf{EncodeSMovB32(20, 255), 41u, EncodeSop1(0x21, 125, 14)};
+    for (const auto address : {first, second})
+      LibKernel::Memory::WriteBacking(address, leaf.data(), sizeof(leaf));
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto& cache = context.GetBufferCache();
+      auto& shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4});
+      ShaderBufferResource out{};
+      out.UpdateAddress48(output);
+      out.fields[2] = 4;
+      out.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, out.fields[i], HW::UserSgprType::Unknown);
+      uint64_t original_id = 0;
+      struct Case { uint64_t address; u32 value; bool update; u32 field = 0; };
+      for (const auto test : {Case{first, 41, false}, Case{first, 41, false},
+                              Case{second, 41, false}, Case{second, 73, true},
+                              Case{first, 41, false}, Case{first, 6, false, 0x1818},
+                              Case{first, 0, false, 0x0a18}}) {
+        Require(name, "refresh function pointer", context.InvalidateMemory(table + 0x20, 8),
+                "function table escaped mapped memory");
+        const uint64_t target = test.address | 3u;
+        LibKernel::Memory::WriteBacking(table + 0x20, &target, sizeof(target));
+        if (test.field != 0) {
+          Require(name, "refresh hardware-field leaf", context.InvalidateMemory(first, sizeof(leaf)),
+                  "hardware-field leaf escaped mapped memory");
+          const std::array field_leaf{0xb96a0000u | test.field,
+              EncodeSMovB32(20, 106), EncodeSop1(0x21, 125, 14)};
+          LibKernel::Memory::WriteBacking(first, field_leaf.data(), sizeof(field_leaf));
+        }
+        if (test.update) {
+          auto [buffer, offset] = cache.ObtainBuffer(test.address + 4, 4, true);
+          buffer->Fill(offset, 4, test.value);
+          Require(name, "GPU-written function code", cache.HasGpuDirtyBytes(test.address + 4, 4),
+                  "code mutation did not remain GPU-owned before refresh");
+        }
+        ShaderComputeInputInfo input{};
+        const auto program = context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        if (original_id == 0) original_id = program.id;
+        Require(name, "exact function identity",
+                (program.id == original_id) == (test.value == 41),
+                "helper bytes were stale or identical relocated/restored code recompiled");
+        Require(name, "current code dependency",
+                std::ranges::find(input.stage.resources->specialization_reads,
+                    std::pair<uint64_t, uint64_t>{test.address, sizeof(leaf)}) !=
+                    input.stage.resources->specialization_reads.end(),
+                "function relocation retained an old code dependency");
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        cache.ReadMemory(output, sizeof(u32));
+        u32 actual = 0;
+        Require(name, "scalar leaf execution and return",
+                LibKernel::Memory::TryReadBacking(output, &actual, sizeof(actual)) && actual == test.value,
+                "caller did not observe the leaf's scalar result after return");
+      }
+
+      // Each helper reads through its context, masks EXEC, then restores all
+      // caller lanes. The MAD literal occupies a third instruction DWORD.
+      std::array<std::vector<u32>, 2> vector_leaves;
+      for (u32 i = 0; i < vector_leaves.size(); ++i) {
+        auto& helper = vector_leaves[i];
+        helper = {EncodeSop1(0x04, 18, 126), EncodeVopc(0xd4, 6, 0), 0,
+            EncodeSmem0(0x02, 20, 8), EncodeSmem1(0, 125), EncodeSopp(0x0c, 0),
+            EncodeMubuf0(0x0c), EncodeMubuf1(2, 5, 1), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x03, 2, 7, 2)};
+        AppendVop3(&helper, 0x141, 6, 255, Vgpr(2), Vgpr(6));
+        helper.push_back(std::bit_cast<u32>(i == 0 ? 1.5f : 2.5f));
+        helper[2] = EncodeSopp(0x08, static_cast<u32>(helper.size()) - 3u);
+        helper.push_back(EncodeSop1(0x04, 126, 18));
+        helper.push_back(EncodeSop1(0x21, 125, 14));
+        const auto address = i == 0 ? first : second;
+        Require(name, "replace vector helper", context.InvalidateMemory(address, helper.size() * 4),
+                "vector helper escaped mapped memory");
+        LibKernel::Memory::WriteBacking(address, helper.data(), helper.size() * 4);
+      }
+      out.fields[3] |= 3u << 28u;
+      ShaderBufferResource data = out;
+      data.UpdateAddress48(base + 0x5000);
+      data.fields[2] = 64 * sizeof(float);
+      Require(name, "refresh helper context", context.InvalidateMemory(table, sizeof(data.fields)),
+              "helper context escaped mapped memory");
+      LibKernel::Memory::WriteBacking(table, data.fields, sizeof(data.fields));
+      std::array<float, 64> values;
+      for (u32 lane = 0; lane < values.size(); ++lane) values[lane] = float(lane + 1);
+      Require(name, "refresh vector input", context.InvalidateMemory(base + 0x5000, sizeof(values)),
+              "vector input escaped mapped memory");
+      LibKernel::Memory::WriteBacking(base + 0x5000, values.data(), sizeof(values));
+      for (const u32 wave_size : {32u, 64u}) {
+        for (const u32 call_count : {1u, 13u}) {
+          std::vector<u32> caller{EncodeVop2(0x1a, 1, InlineU32(2), 0)};
+          AppendVMovLiteral(&caller, 6, std::bit_cast<u32>(10.0f));
+          for (u32 call = 0; call < call_count; ++call) {
+            AppendSMovLiteral(&caller, 7, std::bit_cast<u32>(float(call + 1)));
+            caller.insert(caller.end(), {
+                EncodeSMovB32(14, call < 8 ? 8 : 12), EncodeSMovB32(15, call < 8 ? 9 : 13),
+                EncodeSMovB32(16, 4), EncodeSMovB32(17, 5), EncodeSop1(0x21, 14, 14)});
+          }
+          caller.insert(caller.end(), {EncodeMubuf0(0x1c), EncodeMubuf1(6, 0, 1)});
+          AppendEnd(&caller);
+          ShaderMapUserData(reinterpret_cast<uint64_t>(caller.data()),
+              {.type = Prospero::ShaderBinaryType::kCs,
+               .code_size_bytes = static_cast<u32>(caller.size() * sizeof(u32))});
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(caller.data()),
+                               .num_thread_x = wave_size, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = static_cast<uint8_t>(wave_size), .user_sgpr = 14});
+          out.fields[2] = wave_size * sizeof(float);
+          std::array<u32, 16> user_data{};
+          std::copy_n(out.fields, 4, user_data.begin());
+          user_data[4] = static_cast<u32>(table);
+          user_data[5] = static_cast<u32>(table >> 32u);
+          user_data[8] = static_cast<u32>(first | 3u);
+          user_data[9] = static_cast<u32>(first >> 32u);
+          user_data[12] = static_cast<u32>(second | 3u);
+          user_data[13] = static_cast<u32>(second >> 32u);
+          uint64_t original_vector_id = 0;
+          for (u32 phase = 0; phase < (call_count == 1 ? 2u : 4u); ++phase) {
+            const u32 active_lanes = phase == 0 ? 0 : 16;
+            if (phase >= 2) {
+              std::swap(user_data[8], user_data[12]);
+              std::swap(user_data[9], user_data[13]);
+            }
+            user_data[6] = active_lanes;
+            for (u32 i = 0; i < user_data.size(); ++i)
+              shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
+            Require(name, "reset caller output", context.InvalidateMemory(output, wave_size * 4),
+                    "caller output escaped mapped memory");
+            std::array<float, 64> actual{};
+            LibKernel::Memory::WriteBacking(output, actual.data(), wave_size * 4);
+            ShaderComputeInputInfo input{};
+            const auto program = context.GetPipelineCache().GetComputeProgram(
+                shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+            if (phase == 1) original_vector_id = program.id;
+            if (phase >= 2)
+              Require(name, "ordered helper identity", (program.id == original_vector_id) == (phase == 3),
+                      "swapped helper targets reused stale code or restored targets recompiled");
+            const auto& reads = input.stage.resources->specialization_reads;
+            for (u32 i = 0; i < (call_count == 1 ? 1u : 2u); ++i)
+              Require(name, "unique helper code dependency", std::ranges::count(reads,
+                  std::pair<uint64_t, uint64_t>{i == 0 ? first : second,
+                      vector_leaves[i].size() * sizeof(u32)}) == 1,
+                  "repeated calls duplicated or omitted a helper code dependency");
+            if (phase == 1) {
+              ShaderRecompiler::CompileOptions options;
+              options.wave_size = wave_size;
+              options.dump_ir = false;
+              options.profile = &Maintenance8Profile;
+              input.host_subgroup_size = SubgroupSize();
+              options.input_info.compute = &input;
+              options.user_data = user_data;
+              const auto read = +[](void*, uint64_t address, std::span<u32> words) {
+                return LibKernel::Memory::TryReadBufferBacking(address, words.data(), words.size_bytes());
+              };
+              const ShaderRecompiler::IR::SrtRuntime runtime{
+                  .user_data = user_data, .shader_base = reinterpret_cast<uint64_t>(caller.data()),
+                  .read_memory = read, .read_specialization_memory = read};
+              auto source = ShaderRecompiler::PrepareShaderSource(caller, options);
+              auto translated = ShaderRecompiler::TranslateProgram(
+                  ShaderRecompiler::RefreshShaderSource(source, runtime), options);
+              auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+              ShaderRecompiler::IR::ResourceSnapshot snapshot;
+              ShaderRecompiler::IR::ResourceSpecialization specialization;
+              Require(name, "vector helper resources", ShaderRecompiler::IR::MaterializeResources(
+                  plan, runtime, snapshot, specialization), "helper V# could not be materialized");
+              auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
+              ValidateSpirv(name, compiled.spirv);
+              CheckSpirvEmission({.name = name, .forbidden_spirv = {"OpLoopMerge"}}, compiled.spirv);
+              const u32 word_budget = wave_size == 32 ? 640 + 224 * (call_count - 1) :
+                                                       1024 + 416 * (call_count - 1);
+              Require(name, "linear call emission", compiled.spirv.size() <= word_budget,
+                      "acyclic calls exceeded their per-call SPIR-V budget");
+              std::printf("[gpu]     %-32s wave%u calls%u: %zu SPIR-V words\n",
+                          name, wave_size, call_count, compiled.spirv.size());
+            }
+            processor.DispatchDirect(1, 1, 1, 0x41u |
+                (wave_size == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+            cache.ReadMemory(output, wave_size * 4);
+            Require(name, "read vector helper output", LibKernel::Memory::TryReadBacking(
+                output, actual.data(), wave_size * 4), "caller output was not readable");
+            for (u32 lane = 0; lane < wave_size; ++lane) {
+              float expected = 10.0f;
+              if (lane < active_lanes)
+                for (u32 call = 0; call < call_count; ++call)
+                  expected += ((call < 8) != (phase == 2) ? 1.5f : 2.5f) *
+                      (values[lane] + float(call + 1));
+              Require(name, "repeated vector calls and EXEC return", actual[lane] == expected,
+                      "wave" + std::to_string(wave_size) + " calls" + std::to_string(call_count) +
+                          " phase" + std::to_string(phase) + " lane" + std::to_string(lane) +
+                          " actual=" + std::to_string(actual[lane]) + " expected=" + std::to_string(expected));
+            }
+          }
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "call fixture release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckZeroStrideBufferBinding() {
+    constexpr const char *name = "ZeroStrideBufferBinding";
+    constexpr uintptr_t base = 0x0000000204c00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr auto output = base + 0x2000;
+    constexpr u32 value = 0x80000578u;
+    std::array<std::vector<u32>, 2> codes;
+    for (u32 scalar = 0; scalar < codes.size(); ++scalar) {
+      auto &code = codes[scalar];
+      if (scalar) {
+        code = {EncodeSmem0(0x08, 16), EncodeSmem1(0, 125),
+                EncodeSopp(0x0c, 0), EncodeVop1(0x01, 1, 16)};
+      } else {
+        code = {EncodeMubuf0(0x00, 0, false, false),
+                EncodeMubuf1(1, 0, 0), EncodeSopp(0x0c, 0)};
+      }
+      code.insert(code.end(), {EncodeVop2(0x1a, 2, InlineU32(2), 0),
+                              EncodeMubuf0(0x1c), EncodeMubuf1(1, 1, 2)});
+      AppendEnd(&code);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    }
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "buffer binding allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 &&
+            mapped == reinterpret_cast<void *>(base), "buffer binding mapping failed");
+    for (const auto prefix : {0u, 8u})
+      Require(name, "input backing", LibKernel::Memory::TryWriteBacking(
+          base + 0x1000 + prefix, &value, sizeof(value)), "input DWORD could not be written");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      struct Case { u32 mode, records; bool scalar; u32 expected; };
+      constexpr Case cases[]{{2, 1, false, value}, {2, 0, false, 0},
+                              {3, 1, false, 0}, {3, 4, false, value},
+                              {2, 1, true, 0}, {2, 4, true, value}};
+      for (const auto wave : {32u, 64u}) {
+        for (const auto prefix : {0u, 8u}) {
+          const auto address = base + 0x1000 + prefix;
+          for (const auto test : cases) {
+            cache.FillBuffer(output, wave * sizeof(u32), 0xa5a5a5a5u, false);
+            shaders.SetCsShader({
+                .data_addr = reinterpret_cast<uint64_t>(codes[test.scalar].data()),
+                .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                .wave_size = static_cast<uint8_t>(wave), .user_sgpr = 8});
+            ShaderBufferResource input{}, out{};
+            input.UpdateAddress48(address);
+            input.fields[2] = test.records;
+            input.fields[3] = DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
+                (test.mode << 28u);
+            out.UpdateAddress48(output);
+            out.fields[2] = wave * sizeof(u32);
+            out.fields[3] = DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
+            for (u32 i = 0; i < 4; ++i) {
+              shaders.SetCsUserSgpr(i, input.fields[i], HW::UserSgprType::Unknown);
+              shaders.SetCsUserSgpr(i + 4, out.fields[i], HW::UserSgprType::Unknown);
+            }
+            processor.DispatchDirect(1, 1, 1, wave == 32 ? 0x8041u : 0x41u);
+            cache.ReadMemory(output, wave * sizeof(u32));
+            std::array<u32, 64> actual{};
+            Require(name, "readback", LibKernel::Memory::TryReadBacking(
+                output, actual.data(), wave * sizeof(u32)), "buffer output was unreadable");
+            Require(name, "vector and scalar range rules",
+                std::all_of(actual.begin(), actual.begin() + wave,
+                            [&](u32 word) { return word == test.expected; }),
+                "wave=" + std::to_string(wave) + " prefix=" + std::to_string(prefix) +
+                    " mode=" + std::to_string(test.mode) +
+                    " records=" + std::to_string(test.records) +
+                    " scalar=" + std::to_string(test.scalar));
+          }
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+        physical, size) == 0, "buffer binding release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckOrderedDispatch() {
+    constexpr const char *name = "OrderedDispatch";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr u32 sentinel = 0xa5a5a5a5u;
+    constexpr u32 terminator = 0xc00c3f00u;
+    // Each wave appends one packet, except the empty second wave. The final
+    // wave's terminator must follow every packet, as in GPU-generated PM4.
+    std::vector<u32> code{EncodeSop2(0x26, 12, 9, 5),
+                          EncodeSop2(0x00, 12, 12, 8),
+                          EncodeSop2(0x26, 12, 12, 4),
+                          EncodeSop2(0x00, 12, 12, 7),
+                          EncodeSopc(0x06, 12, InlineU32(1)),
+                          EncodeSop2(0x0a, 13, InlineU32(0), InlineU32(1)),
+                          EncodeSMovB32(124, InlineU32(0)),
+                          EncodeSop1(0x04, 126, InlineU32(1)),
+                          EncodeVop1(0x01, 2, 13),
+                          EncodeDs0(0x3f, 0x300, true),
+                          EncodeDs1(3, 0, 2),
+                          EncodeSopp(0x0c, 0),
+                          EncodeSop2(0x1e, 14, 12, InlineU32(2)),
+                          EncodeVop1(0x01, 1, 14),
+                          EncodeMubuf0(0x1c),
+                          EncodeMubuf1(3, 0, 1),
+                          EncodeSop2(0x01, 14, 6, InlineU32(1)),
+                          EncodeSop2(0x00, 15, 12, InlineU32(1))};
+    AppendSMovLiteral(&code, 16, terminator);
+    code.insert(code.end(),
+                {EncodeSopc(0x06, 12, 14), EncodeSop2(0x0a, 15, 16, 15),
+                 EncodeVop1(0x01, 2, 15), EncodeVop2(0x1a, 1, InlineU32(2), 3),
+                 EncodeSopc(0x06, 13, InlineU32(0)),
+                 EncodeSop2(0x0b, 126, InlineU32(0), InlineU32(1)),
+                 EncodeMubuf0(0x1c, 16 * sizeof(u32)), EncodeMubuf1(2, 0, 1)});
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size,
+                0, &physical) == 0,
+            "ordered dispatch allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10,
+                                                     physical, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "ordered dispatch mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      for (u32 wave_size : {32u, 64u}) {
+        for (const auto groups :
+             {std::array{3u, 1u, 1u}, std::array{2u, 2u, 2u}}) {
+          const u32 count = groups[0] * groups[1] * groups[2];
+          cache.FillBuffer(base, 64 * sizeof(u32), sentinel, false);
+          cache.FillBuffer(0, sizeof(u32), 0, true);
+          shaders.SetCsShader(
+              {.data_addr = reinterpret_cast<uint64_t>(code.data()),
+               .num_thread_x = wave_size,
+               .num_thread_y = 1,
+               .num_thread_z = 1,
+               .wave_size = static_cast<uint8_t>(wave_size),
+               .user_sgpr = 7,
+               .tgid_x_en = true,
+               .tgid_y_en = true,
+               .tgid_z_en = true});
+          ShaderBufferResource output{};
+          output.UpdateAddress48(base);
+          output.fields[2] = 64 * sizeof(u32);
+          output.fields[3] =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+          for (u32 i = 0; i < 4; ++i)
+            shaders.SetCsUserSgpr(i, output.fields[i],
+                                  HW::UserSgprType::Unknown);
+          for (u32 i = 0; i < 3; ++i)
+            shaders.SetCsUserSgpr(4 + i, i == 2 ? count : groups[i],
+                                  HW::UserSgprType::Unknown);
+          processor.DispatchDirect(groups[0], groups[1], groups[2],
+                                   wave_size == 32 ? 0x8049u : 0x49u);
+          cache.CopyBuffer(base + 63 * sizeof(u32), 0, sizeof(u32), false,
+                           true);
+          cache.ReadMemory(base, 64 * sizeof(u32));
+          std::array<u32, 64> actual{}, expected;
+          expected.fill(sentinel);
+          u32 prefix = 0;
+          for (u32 group = 0; group < count; ++group) {
+            expected[group] = prefix;
+            if (group != 1)
+              expected[16 + prefix++] =
+                  group + 1 == count ? terminator : group + 1;
+          }
+          expected[63] = prefix;
+          Require(name, "readback",
+                  LibKernel::Memory::TryReadBacking(base, actual.data(),
+                                                    sizeof(actual)),
+                  "ordered dispatch output could not be read back");
+          Require(name, "stable packet append", actual == expected,
+                  "ordered append changed packet order, workgroup IDs, "
+                  "empty-wave prefix or GDS count");
+        }
+      }
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "ordered dispatch unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(physical, size) == 0,
+            "ordered dispatch release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -9790,9 +11434,6 @@ public:
       uint32_t mode;
       uint32_t expected_threads;
       bool transfer = false;
-      // The CPU writes the counts: a small CPU-written read, which the buffer cache would
-      // serve from its stream buffer, but the conversion reads them by device address.
-      bool cpu = false;
     };
     constexpr std::array cases{
         DispatchCase{{2, 1, 1}, 0x41u, 8},
@@ -9801,7 +11442,6 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
-        DispatchCase{{8, 1, 1}, 0x61u, 8, true, true},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -9866,6 +11506,34 @@ public:
       auto &cache = context.GetBufferCache();
       auto &shaders = processor.GetShCtx();
       context.MapMemory(base, allocation_size);
+      // Empty CPU-owned arguments must not inspect the shader, even on a GPU-dirty page.
+      constexpr auto empty_args = base + allocation_size - case_size;
+      constexpr auto neighbor = empty_args + 0x100u;
+      constexpr std::array<std::array<u32, 3>, 3> empty_dimensions{{
+          {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+      Require(name, "empty arguments",
+              LibKernel::Memory::TryWriteBacking(empty_args, empty_dimensions.data(),
+                                                 sizeof(empty_dimensions)),
+              "empty indirect arguments could not be written");
+      shaders.SetCsShader({.data_addr = 1});
+      for (const bool dirty_neighbor : {false, true}) {
+        if (dirty_neighbor) {
+          auto [buffer, offset] = cache.ObtainBuffer(neighbor, sizeof(sentinel), true);
+          buffer->Fill(offset, sizeof(sentinel), sentinel + 1u);
+        }
+        Require(name, "exact argument ownership",
+                !cache.HasGpuDirtyBytes(empty_args, sizeof(empty_dimensions)) &&
+                    cache.IsRegionGpuModified(empty_args, sizeof(empty_dimensions)) == dirty_neighbor,
+                "empty arguments did not retain independent byte ownership");
+        const auto tick = scheduler.CurrentTick();
+        for (size_t i = 0; i < empty_dimensions.size(); ++i) {
+          processor.DispatchIndirect(empty_args + i * sizeof(empty_dimensions[0]), 0x41u);
+        }
+        Require(name, "empty dispatch avoids readback",
+                scheduler.CurrentTick() == tick &&
+                    cache.HasGpuDirtyBytes(neighbor, sizeof(sentinel)) == dirty_neighbor,
+                "empty dispatch submitted work or read back neighboring GPU data");
+      }
       const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 records, u32 stride = 0) {
         ShaderBufferResource descriptor{};
         descriptor.UpdateAddress48(address);
@@ -9882,15 +11550,7 @@ public:
         const auto &test = cases[index];
         const auto args = argument_address(index);
         const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
-        if (test.cpu) {
-          std::memcpy(reinterpret_cast<void *>(args), test.dimensions.data(),
-                      sizeof(test.dimensions));
-          // What the write fault on a tracked page does.
-          Require(name, "CPU argument write",
-                  context.InvalidateMemory(args, sizeof(test.dimensions)) &&
-                      cache.IsRegionCpuModified(args, sizeof(test.dimensions)),
-                  "the CPU-written arguments are not CPU-modified");
-        } else if (test.transfer) {
+        if (test.transfer) {
           for (u32 i = 0; i < 3; i++) {
             auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
             buffer->Fill(offset, 4, test.dimensions[i]);
@@ -9907,9 +11567,8 @@ public:
         }
         std::array<u32, 3> stale{};
         Require(name, "GPU-only argument write",
-                test.cpu ||
-                    (LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
-                     stale == std::array<u32, 3>{}),
+                LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                    stale == std::array<u32, 3>{},
                 "argument publication changed the CPU backing before indirect dispatch");
         const auto first_owner = BufferCacheTestAccess::PageOwner(cache, args);
         const auto second_owner = BufferCacheTestAccess::PageOwner(cache, args + 8u);
@@ -9938,10 +11597,9 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
-        // Thread-count arguments are converted on the GPU too, never read back.
-        Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
-                "indirect arguments caused a host submission or readback");
         if (test.mode == 0x41u) {
+          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                  "workgroup-count arguments caused a host submission or readback");
           if (!test.transfer) {
             const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
             Require(name, "argument/output owner merge",
@@ -10141,6 +11799,254 @@ public:
         }
       }
 
+      // GPU-written dispatch counts bound the stride12 selector prefix; only
+      // those keys select the two real descriptor members in each stride192 row.
+      constexpr auto record_args = base + 0xd0000;
+      constexpr auto record_keys = base + 0xd1000;
+      constexpr auto record_table = base + 0xd2000;
+      constexpr auto record_output = base + 0xd7000;
+      for (const bool based : {false, true}) {
+        std::vector<u32> record_shader;
+        if (based) {
+          // The later captured shader starts its prefix at a clean SRT DWORD.
+          record_shader = {EncodeSmem0(0x00, 18, 2), EncodeSmem1(0x234, 125), EncodeSopp(0x0c, 0),
+              EncodeSop2(0x02, 18, 18, 13),
+              EncodeSop2(0x1e, 16, 18, InlineU32(3)),
+              EncodeSop2(0x02, 16, 16, InlineU32(4))};
+        } else record_shader = {EncodeSop2(0x26, 16, 13, InlineU32(12))};
+        record_shader.insert(record_shader.end(), {
+            EncodeSmem0(0x08, 16, 0), EncodeSmem1(0, 16), EncodeSopp(0x0c, 0)});
+        if (based) record_shader.insert(record_shader.end(), {
+            EncodeSop2(0x27, 16, 16, 255), (5u << 16u) | 16u});
+        record_shader.insert(record_shader.end(), {
+            EncodeSop2(0x26, 17, 16, 255), 192u,
+            EncodeSmem0(based ? 0x02 : 0x0a, 20, 2), EncodeSmem1(160, 17),
+            EncodeSmem0(based ? 0x02 : 0x0a, 24, 2), EncodeSmem1(176, 17), EncodeSopp(0x0c, 0),
+            EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 5, 0),
+            EncodeSopp(0x0c, 0)});
+        AppendVop3(&record_shader, 0x346, 8, 13, 12, Vgpr(0));
+        record_shader.insert(record_shader.end(), {
+            EncodeMubuf0(0x1d, 0, true, false), EncodeMubuf1(4, 2, 8)});
+        AppendVMovLiteral(&record_shader, 10, 0x5au);
+        AppendSMovLiteral(&record_shader, 126, 0x55555555u);
+        AppendSMovLiteral(&record_shader, 127, 0x55555555u);
+        record_shader.insert(record_shader.end(), {
+            EncodeMubuf0(0x18, 0, true, false, true), EncodeMubuf1(10, 6, 0)});
+        AppendEnd(&record_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(record_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(record_shader.size() * sizeof(u32))});
+        std::array<u32, 96> records;
+        records.fill(0xdeadbeefu);
+        const std::array<u32, 4> numeric_descriptor{0x640u, 3u, 0x3ba3d70au, 0x3a23d70au};
+        std::copy(numeric_descriptor.begin(), numeric_descriptor.end(), records.begin() + 76u);
+        for (u32 row = 0; row < 2u; ++row) {
+          const auto payload = base + 0xd3000 + row * 0x1000;
+          const auto target = base + 0xd5000 + row * 0x1000;
+          const std::array<u32, 8> descriptors{
+              static_cast<u32>(payload), static_cast<u32>(payload >> 32u) | (8u << 16u), 4u,
+              (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7),
+              static_cast<u32>(target), static_cast<u32>(target >> 32u) | (1u << 16u), 4u, 0x5204u};
+          std::copy(descriptors.begin(), descriptors.end(), records.begin() + row * 48u + 40u);
+          const std::array<u32, 8> data{0x40003c00u + row, 0xc0003800u + row,
+              0x44004200u + row, 0xc400bc00u + row, 0x48004600u + row, 0xc800c600u + row,
+              0x4c004a00u + row, 0xcc00ca00u + row};
+          LibKernel::Memory::WriteBacking(payload, data.data(), sizeof(data));
+        }
+        LibKernel::Memory::WriteBacking(record_table, records.data(), sizeof(records));
+        const auto produce = [&](uint64_t address, u32 stride, std::array<u32, 3> values) {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 word = 0; word < 3u; ++word) {
+            set_buffer(word * 4u, address + word * stride, 4u);
+            shaders.SetCsUserSgpr(12u + word, values[word], HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        };
+        for (const u32 wave : {32u, 64u}) {
+          u32 first = based ? 2u : 0u;
+          for (const auto dimensions : {std::array{2u, 1u, 1u}, std::array{0u, 1u, 1u},
+                                       std::array{2u, 0u, 1u}, std::array{2u, 1u, 0u},
+                                       std::array{1u, 1u, 1u}, std::array{2u, 1u, 1u}}) {
+            const bool empty = std::ranges::find(dimensions, 0u) != dimensions.end();
+            const std::array<u32, 3> stale_args{};
+            std::array<u32, 10> stale_keys;
+            stale_keys.fill(sentinel);
+            Require(name, "record fixture reset", context.InvalidateMemory(record_args, 0x8000),
+                    "record fixture escaped its mapped allocation");
+            LibKernel::Memory::WriteBacking(record_args, stale_args.data(), sizeof(stale_args));
+            LibKernel::Memory::WriteBacking(record_keys, stale_keys.data(), sizeof(stale_keys));
+            LibKernel::Memory::WriteBacking(record_table + 0x234, &first, sizeof(first));
+            std::vector<u32> expected_output(wave * 4u, sentinel);
+            LibKernel::Memory::WriteBacking(record_output, expected_output.data(), expected_output.size() * 4u);
+            const std::array<u32, 4> untouched{sentinel, sentinel, sentinel, sentinel};
+            for (u32 row = 0; row < 2u; ++row)
+              LibKernel::Memory::WriteBacking(base + 0xd5000 + row * 0x1000, untouched.data(), sizeof(untouched));
+            produce(record_args, 4u, dimensions);
+            produce(record_keys + (based ? first * 8u + 4u : 0u), based ? 8u : 12u,
+                    based ? std::array{0x1beefu, 0xbeefu, 0x1fbeefu}
+                          : std::array{1u, 0u, 22369622u});
+            std::array<u32, 3> cpu_args{};
+            std::array<u32, 10> cpu_keys{};
+            Require(name, "GPU record dependencies remain pending",
+                    cache.HasGpuDirtyBytes(record_args, 12u) && cache.HasGpuDirtyBytes(record_keys, sizeof(stale_keys)) &&
+                        LibKernel::Memory::TryReadBacking(record_args, cpu_args.data(), sizeof(cpu_args)) &&
+                        LibKernel::Memory::TryReadBacking(record_keys, cpu_keys.data(), sizeof(cpu_keys)) &&
+                        cpu_args == stale_args && cpu_keys == stale_keys,
+                    "the producer did not leave dispatch counts and selectors GPU-owned");
+            shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(record_shader.data()),
+                                 .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                                 .user_sgpr = 13, .tgid_x_en = true});
+            set_buffer(0, record_keys, based ? 5u : 3u, based ? 8u : 12u);
+            set_buffer(4, record_table, 2u, 192u);
+            if (based) shaders.SetCsUserSgpr(5, record_table >> 32u, HW::UserSgprType::Unknown);
+            set_buffer(8, record_output, wave * 2u, 8u);
+            shaders.SetCsUserSgpr(12, std::countr_zero(wave), HW::UserSgprType::Unknown);
+            processor.DispatchIndirect(record_args, 0x41u |
+                (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+            cache.ReadMemory(record_output, expected_output.size() * 4u);
+            std::vector<u32> actual_output(expected_output.size());
+            Require(name, "record output readback", LibKernel::Memory::TryReadBacking(
+                        record_output, actual_output.data(), actual_output.size() * 4u),
+                    "indirect record output could not be read back");
+            if (!empty)
+              for (u32 group = 0; group < dimensions[0]; ++group) {
+                const auto row = 1u - group;
+                for (u32 lane = 0; lane < wave; ++lane) {
+                  const auto out = (group * wave + lane) * 2u;
+                  expected_output[out] = expected_output[out + 1u] = 0u;
+                  if (lane < 4u)
+                    Require(name, "unchanged formatted input", LibKernel::Memory::TryReadBacking(
+                                base + 0xd3000 + row * 0x1000 + lane * 8u, expected_output.data() + out, 8u),
+                            "the formatted source escaped its mapped allocation");
+                }
+              }
+            Require(name, "coherent exact workgroup selector prefix", actual_output == expected_output,
+                    "GPU counts or selectors were stale, over-enumerated, or selected the wrong record");
+            for (u32 row = 0; row < 2u; ++row) {
+              const auto target = base + 0xd5000 + row * 0x1000;
+              cache.ReadMemory(target, sizeof(untouched));
+              auto expected = untouched;
+              if (!empty && (dimensions[0] == 2u || row == 1u)) expected[0] = 0xa55aa55au;
+              std::array<u32, 4> actual{};
+              Require(name, "selected byte store and canaries", LibKernel::Memory::TryReadBacking(
+                          target, actual.data(), sizeof(actual)) && actual == expected,
+                      "masked/OOB record stores changed an inactive row or adjacent bytes");
+            }
+            if (based) first ^= 2u;
+          }
+        }
+      }
+
+      // The captured material dispatch reaches 132 distinct writable records.
+      // Keep their null row and GPU-only keys on the native renderer/cache path.
+      constexpr u32 material_count = 132, material_rows = material_count + 1u;
+      constexpr u32 material_groups = material_rows + 1u, material_slot = 256;
+      constexpr auto material_keys = base;
+      constexpr auto material_table = base + 0x1000;
+      constexpr auto material_output = base + 0x20000;
+      const auto material_prefix = [](u32 row) { return row % 127u + 1u; };
+      std::vector<u32> material_producer;
+      AppendVop3(&material_producer, 0x346, 1, 4, InlineU32(6), Vgpr(0));
+      material_producer.insert(material_producer.end(), {
+          EncodeVop2(0x1a, 2, InlineU32(16), 1),
+          EncodeMubuf0(0x1c, 0, true, false), EncodeMubuf1(2, 0, 1)});
+      AppendEnd(&material_producer);
+      ShaderMapUserData(reinterpret_cast<uint64_t>(material_producer.data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(material_producer.size() * sizeof(u32))});
+      for (const u32 wave : {32u, 64u}) {
+        Require(name, "large material fixture reset", context.InvalidateMemory(base, 0x50000),
+                "material fixtures escaped the existing mapped allocation");
+        std::vector<u32> records(material_rows * 592u / 4u);
+        std::vector<u32> expected(material_count * material_slot / 4u, sentinel);
+        auto expected_bytes = std::as_writable_bytes(std::span(expected));
+        for (u32 row = 1; row < material_rows; ++row) {
+          const auto target = material_output + (row - 1u) * material_slot + material_prefix(row);
+          const std::array<u32, 4> descriptor{static_cast<u32>(target),
+              static_cast<u32>(target >> 32u) | (1u << 16u), 20u,
+              (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+          std::copy(descriptor.begin(), descriptor.end(), records.begin() + (row * 592u + 448u) / 4u);
+          for (u32 lane = 0; lane < 20u; lane += 2u)
+            expected_bytes[(row - 1u) * material_slot + material_prefix(row) + lane] =
+                std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
+        }
+        const std::vector<u32> untouched(expected.size(), sentinel);
+        const std::vector<u32> stale_keys(material_groups, sentinel);
+        LibKernel::Memory::WriteBacking(material_keys, stale_keys.data(), stale_keys.size() * 4u);
+        LibKernel::Memory::WriteBacking(material_table, records.data(), records.size() * 4u);
+        LibKernel::Memory::WriteBacking(material_output, untouched.data(), untouched.size() * 4u);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(material_producer.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, material_keys, material_groups, 4u);
+        processor.DispatchDirect(3, 1, 1, 0x41u);
+        std::vector<u32> cpu_keys(material_groups);
+        Require(name, "GPU-only material keys",
+                cache.HasGpuDirtyBytes(material_keys, stale_keys.size() * 4u) &&
+                    LibKernel::Memory::TryReadBacking(material_keys, cpu_keys.data(), cpu_keys.size() * 4u) &&
+                    cpu_keys == stale_keys,
+                "material selection did not remain GPU-owned before native compilation");
+
+        std::vector<u32> material_shader{
+            EncodeVop1(0x01, 2, 8),
+            EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(4, 0, 2), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x16, 6, InlineU32(16), 4)};
+        AppendVop3(&material_shader, 0x360, 12, Vgpr(6), InlineU32(0));
+        material_shader.insert(material_shader.end(), {
+            EncodeSop2(0x26, 13, 12, 255), 592u,
+            EncodeSmem0(0x0a, 16, 2), EncodeSmem1(448, 13), EncodeSopp(0x0c, 0),
+            EncodeVop2(0x1a, 10, InlineU32(5), 0),
+            EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+        AppendSMovLiteral(&material_shader, 126, 0x55555555u);
+        AppendSMovLiteral(&material_shader, 127, wave == 64u ? 0x55555555u : 0u);
+        material_shader.insert(material_shader.end(), {
+            EncodeMubuf0(0x04, 0, true, false, true), EncodeMubuf1(10, 4, 0)});
+        AppendEnd(&material_shader);
+        ShaderMapUserData(reinterpret_cast<uint64_t>(material_shader.data()),
+            {.type = Prospero::ShaderBinaryType::kCs,
+             .code_size_bytes = static_cast<u32>(material_shader.size() * sizeof(u32))});
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(material_shader.data()),
+                             .num_thread_x = wave, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = static_cast<uint8_t>(wave), .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, material_keys, material_groups, 4u);
+        set_buffer(4, material_table, material_rows, 592u);
+        ShaderComputeInputInfo input{};
+        input.workgroup_counts[0] = material_groups;
+        input.workgroup_counts[1] = input.workgroup_counts[2] = 1u;
+        (void)context.GetPipelineCache().GetComputeProgram(
+            shaders.GetCs(), processor.GetCtx().GetShaderRegisters(), input);
+        const auto &info = input.stage.program->info;
+        const auto root = std::ranges::find_if(info.buffers, [](const auto &buffer) {
+          return buffer.indirect_resources.size() == material_rows;
+        });
+        const auto &bindings = input.stage.program->bindings;
+        const auto native_count = bindings.descriptor_counts[
+            static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)];
+        Require(name, "native material descriptor array",
+                root != info.buffers.end() && native_count > 64u && root->packed_stride == 0u &&
+                    std::ranges::all_of(root->indirect_resources,
+                        [&](u32 index) { return info.buffers[index].live; }),
+                "material candidates were truncated, left unbound, or lost their null root");
+        Require(name, "large material shader-data buffer", !bindings.UsesPushData() &&
+                    bindings.descriptor_counts[static_cast<size_t>(
+                        ShaderRecompiler::IR::DescriptorBindingKind::ShaderData)] == 1u,
+                "large binding-prefix data did not use the existing shader-data buffer");
+        processor.DispatchDirect(material_groups, 1, 1, 0x41u |
+            (wave == 32u ? 1u << Pm4::COMPUTE_DISPATCH_INITIATOR_CS_W32_EN_SHIFT : 0u));
+        for (u32 row = 1; row < material_rows; ++row)
+          Require(name, "every selected material becomes GPU-owned",
+                  cache.HasGpuDirtyBytes(material_output + (row - 1u) * material_slot + material_prefix(row), 20u),
+                  "a writable material beyond the original descriptor capacity was not tracked");
+        cache.ReadMemory(material_output, expected.size() * 4u);
+        std::vector<u32> actual(expected.size());
+        Require(name, "132 material writes, null/OOB keys, masks and byte canaries",
+                LibKernel::Memory::TryReadBacking(material_output, actual.data(), actual.size() * 4u) &&
+                    actual == expected,
+                "native material selection or per-binding byte offsets corrupted a target or neighboring byte");
+      }
+
       // Exchange values across two waves in the last 512 bytes of each
       // workgroup's 64-KiB LDS, on a host restricted to 48-KiB native shared memory.
       constexpr auto lds_output = base + 0xb0000;
@@ -10230,8 +12136,70 @@ public:
 
   void CheckRenderExecutorColorMetadataClear() {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
+    struct PackedCase {
+      vk::Format format;
+      uint64_t word;
+      std::array<float, 4> channels;
+    };
+    const std::array packed_cases{
+        PackedCase{vk::Format::eR32G32Sfloat, 0xbf8000003f800000ull, {1.0f, -1.0f}},
+        PackedCase{vk::Format::eR32G32Sfloat, 0x7f80000080000000ull,
+                   {-0.0f, std::numeric_limits<float>::infinity()}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0u, {}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x801c03c0u, {1.0f, 0.5f, 2.0f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 1u | (0x7bfu << 11u) | (1u << 22u),
+                   {0x1p-20f, 65024.0f, 0x1p-19f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x7c0u | (0x7c0u << 11u) | (0x3e0u << 22u),
+                   {std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity(),
+                    std::numeric_limits<float>::infinity()}},
+        PackedCase{vk::Format::eR16Sfloat, 0x7bff7bffu, {65504.0f}},
+        PackedCase{vk::Format::eR16G16Sfloat, 0xbc003c00u, {1.0f, -1.0f}},
+        PackedCase{vk::Format::eR16G16B16A16Sfloat, 0x40003800bc003c00ull,
+                   {1.0f, -1.0f, 0.5f, 2.0f}},
+        PackedCase{vk::Format::eR16Sfloat, 0xffff0001u, {0x1p-24f}},
+        PackedCase{vk::Format::eR16Sfloat, 0x00008001u, {-0x1p-24f}},
+        PackedCase{vk::Format::eR16Sfloat, 0x000003ffu, {1023.0f * 0x1p-24f}},
+        PackedCase{vk::Format::eR16Sfloat, 0x00000400u, {0x1p-14f}},
+        PackedCase{vk::Format::eR16G16Sfloat, 0x80000000u, {0.0f, -0.0f}},
+        PackedCase{vk::Format::eR16G16Sfloat, 0xfc007c00u,
+                   {std::numeric_limits<float>::infinity(),
+                    -std::numeric_limits<float>::infinity()}},
+        PackedCase{vk::Format::eR16Unorm, 0x0000ffffu, {1.0f}},
+        PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
+        PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
+                   {1.0f / 65535.0f, 32768.0f / 65535.0f}},
+    };
+    for (const auto &test : packed_cases) {
+      vk::ClearColorValue clear{};
+      Require(name, "packed color clear",
+              DecodePackedColorClear(test.format, test.word, clear) &&
+                  std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
+                      std::bit_cast<std::array<uint32_t, 4>>(test.channels),
+              "packed clear lost channel order, sign, range or unused-channel zeros");
+    }
+    vk::ClearColorValue clear{};
+    Require(name, "half NaN clear",
+            DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
+                std::isnan(clear.float32[0]),
+            "half NaN did not remain NaN");
+    Require(name, "packed unsigned NaN clear",
+            DecodePackedColorClear(vk::Format::eB10G11R11UfloatPack32,
+                0x7c1u | (0x7c1u << 11u) | (0x3e1u << 22u), clear) &&
+                std::isnan(clear.float32[0]) && std::isnan(clear.float32[1]) &&
+                std::isnan(clear.float32[2]),
+            "packed unsigned NaNs did not remain NaN");
+    for (const auto format : {vk::Format::eR16Sfloat, vk::Format::eR16Unorm}) {
+      Require(name, "R16 DWORD fill",
+              !DecodeColorDwordFill(format, 0xbc003c00u, clear) &&
+                  DecodeColorDwordFill(format, 0x3c003c00u, clear),
+              "alternating R16 pixels were treated as a uniform clear");
+    }
+    Require(name, "RG32 DWORD fill",
+            DecodeColorDwordFill(vk::Format::eR32G32Sfloat, 0x3f800000u, clear) &&
+                clear.float32[0] == 1.0f && clear.float32[1] == 1.0f,
+            "a repeated DWORD fill was decoded as a two-register clear");
     constexpr uintptr_t base = 0x0000000204100000ull;
-    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     struct FillCase {
       uint32_t fill;
@@ -10239,13 +12207,52 @@ public:
       bool reuse_unorm = false;
       bool cmask = false;
       bool reuse_mips = false;
+      Prospero::ChannelLayout layout = Prospero::ChannelLayout::k16_16_16_16;
+      Prospero::ChannelType type = Prospero::ChannelType::kFloat;
+      uint32_t clear_word = 0;
+      bool eliminate_fast_clear = false;
+      uint32_t samples_log2 = 0;
+      bool goat = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
         FillCase{0x80808080u, {0x3c003c00u, 0x00003c00u}},
         FillCase{0x40404040u, {0, 0x3c000000u}, true},
-        FillCase{0, {0x804020ffu, 0}, false, true},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .goat = true},
+        FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
+                 .eliminate_fast_clear = true},
+        FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
+                 .eliminate_fast_clear = true},
+        FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k11_11_10, .eliminate_fast_clear = true},
+        FillCase{.fill = 0, .texel = {0x801c03c0u, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k11_11_10, .eliminate_fast_clear = true},
+        FillCase{.fill = 0, .texel = {0, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k32_32, .eliminate_fast_clear = true},
+        FillCase{.fill = 0, .texel = {0x3f800000u, 0xbf800000u}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k32_32, .eliminate_fast_clear = true},
         FillCase{0x40404040u, {0, 0x3c000000u}, false, false, true},
+        FillCase{.fill = 0x20202020u, .texel = {0x7bff7bffu},
+                 .layout = Prospero::ChannelLayout::k16, .clear_word = 0x7bff7bffu},
+        FillCase{.fill = 0x20202020u, .texel = {0xbc003c00u},
+                 .layout = Prospero::ChannelLayout::k16_16, .clear_word = 0xbc003c00u},
+        FillCase{.fill = 0x20202020u, .texel = {0x80008000u},
+                 .layout = Prospero::ChannelLayout::k16,
+                 .type = Prospero::ChannelType::kUNorm, .clear_word = 0x80008000u},
+        FillCase{.fill = 0x20202020u, .texel = {0x0000ffffu},
+                 .layout = Prospero::ChannelLayout::k16_16,
+                 .type = Prospero::ChannelType::kUNorm, .clear_word = 0x0000ffffu},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .samples_log2 = 2},
+        FillCase{.fill = 0, .texel = {0x804020ffu, 0}, .cmask = true,
+                 .layout = Prospero::ChannelLayout::k8_8_8_8,
+                 .type = Prospero::ChannelType::kUNorm, .eliminate_fast_clear = true, .samples_log2 = 2},
+        FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
+                 .eliminate_fast_clear = true, .samples_log2 = 2},
+        FillCase{.fill = 0x40404040u, .texel = {0, 0x3c000000u}, .eliminate_fast_clear = true},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -10278,15 +12285,18 @@ public:
       }
       return words;
     }();
+    // Goat Simulator 3's immediate-zero fill (b0a34a6ed90ebace).
+    static constexpr std::array<uint32_t, 6> goat_fill{
+        0xd7460000u, 0x04010c04u, 0x7e020280u,
+        0xe0102000u, 0x80000100u, 0xbf810000u};
     for (const auto *shader : {&native_fill, &raw_fill}) {
       ShaderMapUserData(reinterpret_cast<uint64_t>(shader->data()),
           {.type = Prospero::ShaderBinaryType::kCs,
            .code_size_bytes = sizeof(native_fill)});
     }
-    TileSizeAlign dcc_size{};
-    (void)TileGetDccSize(512, 256, 1, 8, 1,
-                        Prospero::TileMode::kRenderTarget, dcc_size, 0);
-
+    ShaderMapUserData(reinterpret_cast<uint64_t>(goat_fill.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = sizeof(goat_fill)});
     int64_t direct_offset = -1;
     Require(name, "direct allocation",
             Libs::LibKernel::Memory::KernelAllocateDirectMemory(
@@ -10303,11 +12313,21 @@ public:
     std::memset(mapped, 0, allocation_size);
 
     for (const auto &fill_case : cases) {
-      const uint64_t dcc_address = base + (fill_case.reuse_mips ? 0x160000 : 0x100000);
-      const uint32_t selected_layer = fill_case.cmask ? 1 : 0;
+      const auto layout = fill_case.layout;
+      const auto type = fill_case.type;
+      const auto bytes_per_pixel = TextureGetRenderTargetFormat(
+          layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
+      const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
+      const uint32_t selected_layer = fill_case.cmask || fill_case.eliminate_fast_clear ? 1 : 0;
+      TileSizeAlign dcc_size{};
+      (void)TileGetDccSize(512, 256, selected_layer + 1, bytes_per_pixel, 1,
+                          Prospero::TileMode::kRenderTarget, dcc_size, fill_case.samples_log2);
+      const uint64_t dcc_address = base + (fill_case.samples_log2 != 0 ? 0x800000 :
+                                          fill_case.eliminate_fast_clear ? 0x200000 :
+                                          fill_case.reuse_mips ? 0x160000 : 0x100000);
       const uint64_t metadata_size = fill_case.cmask ? 0x2000 : dcc_size.size;
       const std::vector<u32> expected(
-          fill_case.texel.begin(), fill_case.texel.begin() + (fill_case.cmask ? 1 : 2));
+          fill_case.texel.begin(), fill_case.texel.begin() + std::max(bytes_per_pixel / 4u, 1u));
       RenderContext context(m_runtime_context);
       HW::Context registers{};
       HW::UserConfig user_config{};
@@ -10318,15 +12338,16 @@ public:
         auto &scheduler = context.GetCommandScheduler();
         registers.SetColorBase(0, {.addr = base});
         registers.SetColorInfo(
-            0, {.cmask_fast_clear_enable = !fill_case.reuse_unorm,
+            0, {.fmask_compression_enable = fill_case.samples_log2 != 0,
+                .cmask_fast_clear_enable = !fill_case.reuse_unorm,
                 .dcc_compression_enable = !fill_case.cmask,
-                .format = fill_case.cmask ? Prospero::ChannelLayout::k8_8_8_8
-                                          : Prospero::ChannelLayout::k16_16_16_16,
-                .channel_type = fill_case.cmask ? Prospero::ChannelType::kUNorm
-                                                : Prospero::ChannelType::kFloat,
+                .format = layout,
+                .channel_type = type,
                 .channel_order = Prospero::ChannelOrder::kStandard});
         registers.SetColorView(0, {.base_array_slice_index = selected_layer,
                                    .last_array_slice_index = selected_layer});
+        registers.SetColorAttrib(0, {.num_samples = fill_case.samples_log2,
+                                     .num_fragments = fill_case.samples_log2});
         registers.SetColorAttrib2(0, {.height = 255, .width = 511});
         registers.SetColorAttrib3(0,
                                   {.tile_mode = Prospero::TileMode::kRenderTarget,
@@ -10334,8 +12355,9 @@ public:
                                    .metadata_pipe_aligned = true});
         registers.SetColorDccAddr(0, {.addr = dcc_address});
         registers.SetColorCmask(0, {.addr = dcc_address});
-        registers.SetColorClearWord0(0, {.word0 = fill_case.cmask ? expected[0] : 0});
-        registers.SetColorClearWord1(0, {.word1 = 0});
+        registers.SetColorFmask(0, {.addr = fill_case.samples_log2 != 0 ? base + 0xc00000 : 0});
+        registers.SetColorClearWord0(0, {.word0 = fill_case.cmask ? expected[0] : fill_case.clear_word});
+        registers.SetColorClearWord1(0, {.word1 = fill_case.cmask && expected.size() > 1u ? expected[1] : 0});
         registers.SetRenderTargetMask(0x0f);
         scheduler.Begin(registers, user_config, shaders);
 
@@ -10344,7 +12366,8 @@ public:
         auto &executor = context.GetRenderExecutor();
         resources.MapMemory(base, allocation_size);
         ImageId preexisting_id{};
-        if (fill_case.reuse_unorm || fill_case.reuse_mips) {
+        RenderColorInfo color{};
+        if (fill_case.reuse_unorm || fill_case.reuse_mips || fill_case.eliminate_fast_clear) {
           const auto float_info = registers.GetRenderTarget(0).info;
           const auto single_mip = registers.GetRenderTarget(0).attrib2;
           auto initial_info = float_info;
@@ -10361,6 +12384,7 @@ public:
           RenderExecutorTestAccess::ResolveRenderColorTarget(
               executor, scheduler.Current(), preexisting, 0);
           preexisting_id = preexisting.image_id;
+          color = preexisting;
           (void)texture_cache.FindRenderTarget(preexisting_id, preexisting.desc);
           if (fill_case.reuse_mips) {
             Require(name, "mip chain excludes metadata",
@@ -10373,34 +12397,116 @@ public:
                 texture_cache, scheduler.Current(), preexisting_id,
                 {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1}, clear);
           }
+          if (fill_case.eliminate_fast_clear) {
+            vk::ClearValue stale{};
+            stale.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+            TextureCacheTestAccess::ClearImage(
+                texture_cache, scheduler.Current(), preexisting_id,
+                {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2}, stale);
+          }
           RenderExecutorTestAccess::ResetBindings(executor);
           registers.SetColorInfo(0, float_info);
           registers.SetColorAttrib2(0, single_mip);
         }
         const auto fill_metadata = [&](uint32_t count, bool raw = false) {
-          const auto *shader = &native_fill;
-          if (raw) {
-            shader = &raw_fill;
-          }
-          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader->data()),
+          const bool goat = fill_case.goat && !raw;
+          const auto *shader = goat ? goat_fill.data()
+                                   : raw ? raw_fill.data() : native_fill.data();
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(shader),
                                .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
-                               .wave_size = 64, .user_sgpr = 10, .tgid_x_en = true});
+                               .wave_size = 64, .user_sgpr = goat ? uint8_t{4} : uint8_t{10},
+                               .tgid_x_en = true});
           const std::array<uint32_t, 10> user_data{
               static_cast<uint32_t>(dcc_address),
               static_cast<uint32_t>(dcc_address >> 32u) | (4u << 16u),
               count, 0x00014004u, fill_case.fill, 0, 0x200, 0, count, 1};
-          for (uint32_t i = 0; i < user_data.size(); i++) {
+          for (uint32_t i = 0; i < (goat ? 4u : user_data.size()); i++) {
             shaders.SetCsUserSgpr(i, user_data[i], HW::UserSgprType::Unknown);
           }
-          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u);
+          executor.DispatchDirect(0, scheduler.Current(), (count + 63) / 64, 1, 1, 0x41u, false);
         };
         const auto metadata_words = static_cast<uint32_t>(metadata_size / 4);
+        if (fill_case.goat) {
+          WriteMetadata(context, dcc_address, metadata_size, 0xa5a5a5a5u);
+        }
         fill_metadata(metadata_words);
         Require(name, "metadata before descriptor",
                 !texture_cache.IsMeta(dcc_address),
                 "the native fill guessed an unbound metadata allocation's type");
+        if (fill_case.goat) {
+          std::vector<uint32_t> filled_metadata(metadata_words);
+          Require(name, "Goat metadata fill stays CPU-owned",
+                  !resources.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size) &&
+                      LibKernel::Memory::TryReadBacking(dcc_address, filled_metadata.data(), metadata_size) &&
+                      std::ranges::all_of(filled_metadata,
+                          [&](uint32_t word) { return word == fill_case.fill; }),
+                  "Goat's proven metadata fill required a GPU readback or lost its constant value");
+        }
 
-        RenderColorInfo color{};
+        const auto check_expanded_metadata = [&] {
+          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
+          std::vector<uint8_t> bytes(metadata_size);
+          Require(name, "expanded metadata readback",
+                  LibKernel::Memory::TryReadBacking(dcc_address, bytes.data(), bytes.size()),
+                  "native color metadata could not be read back");
+          const auto selected = bytes.begin() + metadata_size * selected_layer / (selected_layer + 1);
+          Require(name, "selected metadata slice expansion",
+                  std::all_of(bytes.begin(), selected,
+                      [&](uint8_t v) { return v == static_cast<uint8_t>(fill_case.fill); }) &&
+                      std::all_of(selected, bytes.end(), [](uint8_t v) { return v == 0xff; }),
+                  "materialization retained a clear key or changed an unselected slice");
+        };
+
+        const auto paint = [&] {
+          vk::ClearValue clear{};
+          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, selected_layer, 1}, clear);
+        };
+
+        if (fill_case.eliminate_fast_clear) {
+          registers.SetRenderTargetMask(0);
+          registers.SetColorControl({.mode = 2});
+          RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+              {.vertex_count = 3, .instance_count = 1});
+          auto sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          color.image_id = texture_cache.FindImage(sampled);
+          Require(name, "FCE sampled image reuses stale target",
+                  color.image_id == preexisting_id &&
+                      texture_cache.FindTexture(color.image_id, sampled) != nullptr,
+                  "FCE failed to retain the sampled allocation");
+          const std::vector<u32> stale = layout == Prospero::ChannelLayout::k8_8_8_8
+              ? std::vector<u32>{0xffff00ffu} : layout == Prospero::ChannelLayout::k11_11_10
+              ? std::vector<u32>{0x780003c0u} : layout == Prospero::ChannelLayout::k32_32
+              ? std::vector<u32>{0x3f800000u, 0u} : std::vector<u32>{0x00003c00u, 0x3c003c00u};
+          Require(name, "FCE before graphics shader or target binding",
+                  ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 1) == expected &&
+                      ReadCachedTexel(name, context, color.image_id, {511, 255, 0},
+                                      {1, 1, 1}, 1) == expected &&
+                      ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 0) == stale,
+                  "FCE lost a clear register or changed the unselected layer");
+          check_expanded_metadata();
+          paint();
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .instance_count = 1});
+          (void)texture_cache.FindTexture(color.image_id, sampled);
+          Require(name, "repeated indexed FCE preserves expanded color",
+                  ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 1) == stale,
+                  "FCE reapplied the consumed clear after rendering");
+          WriteMetadata(context, dcc_address, metadata_size, fill_case.fill);
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .instance_count = 1});
+          (void)texture_cache.FindTexture(color.image_id, sampled);
+          Require(name, "indexed FCE consumes a new clear",
+                  ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 1) == expected,
+                  "indexed FCE skipped a new metadata clear");
+          resources.UnmapMemory(base, allocation_size);
+          scheduler.Finish();
+          return;
+        }
         RenderExecutorTestAccess::ResolveRenderColorTarget(
             executor, scheduler.Current(), color, 0);
         RenderDepthInfo no_depth{};
@@ -10423,12 +12529,13 @@ public:
                     !texture_cache.IsMeta(dcc_address),
                 "color metadata did not retain its type and full native allocation");
         const auto read_texel = [&] {
-          return ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, selected_layer);
+          return ReadCachedTexel(name, context, color.image_id, {}, {probe_width, 1, 1}, selected_layer);
         };
         Require(name, "GPU color clear value",
                 read_texel() == expected &&
-                    ReadCachedTexel(name, context, color.image_id, {511, 255, 0},
-                                    {1, 1, 1}, selected_layer) == expected,
+                    ReadCachedTexel(name, context, color.image_id,
+                                    {static_cast<int32_t>(512 - probe_width), 255, 0},
+                                    {probe_width, 1, 1}, selected_layer) == expected,
                 "native metadata did not materialize the expected color");
         if (fill_case.reuse_mips) {
           const auto &image = texture_cache.GetImage(color.image_id);
@@ -10443,18 +12550,6 @@ public:
                       std::vector<u32>{0x00003c00u, 0x00003c00u},
                   "clearing mip zero changed its higher mip");
         }
-        const auto check_expanded_metadata = [&] {
-          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
-          std::vector<uint8_t> bytes(metadata_size);
-          Require(name, "expanded metadata readback",
-                  LibKernel::Memory::TryReadBacking(dcc_address, bytes.data(), bytes.size()),
-                  "native color metadata could not be read back");
-          const auto selected = bytes.begin() + (fill_case.cmask ? 0x1000 : 0);
-          Require(name, "selected metadata slice expansion",
-                  std::all_of(bytes.begin(), selected, [](uint8_t v) { return v == 0; }) &&
-                      std::all_of(selected, bytes.end(), [](uint8_t v) { return v == 0xff; }),
-                  "materialization retained a clear key or changed an unselected slice");
-        };
         check_expanded_metadata();
 
         const auto bind = [&] {
@@ -10462,18 +12557,14 @@ public:
           color.image_id = texture_cache.FindImage(color.desc);
           (void)texture_cache.FindRenderTarget(color.image_id, color.desc);
         };
-        const auto paint = [&] {
-          vk::ClearValue clear{};
-          clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
-          TextureCacheTestAccess::ClearImage(
-              texture_cache, scheduler.Current(), color.image_id,
-              {vk::ImageAspectFlagBits::eColor, 0, 1, selected_layer, 1}, clear);
-        };
         std::vector<u32> painted{0x00003c00u, 0x3c003c00u};
         if (fill_case.reuse_unorm) {
           painted = {0x0000ffffu, 0xffffffffu};
         } else if (fill_case.cmask) {
           painted = {0xffff00ffu};
+        } else if (bytes_per_pixel <= 4) {
+          const uint32_t one = type == Prospero::ChannelType::kFloat ? 0x3c00u : 0xffffu;
+          painted = {bytes_per_pixel == 2 ? one | (one << 16u) : one};
         }
         const auto retains_painted_texel = [&] {
           const auto texels = ReadCachedTexel(name, context, color.image_id, {},
@@ -10507,10 +12598,51 @@ public:
                 retains_painted_texel(),
                 "a partial same-value write reused stale clear bytes after rendering");
         fill_metadata(metadata_words, true);
+        fill_metadata(metadata_words);
+        Require(name, "already GPU-owned metadata stays ordered",
+                resources.GetBufferCache().HasGpuDirtyBytes(dcc_address, metadata_size),
+                "a fill discarded pending native writes to its metadata pages");
+        Common::DebugCounters::SetEnabled(true);
+        const auto readbacks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataReadbacks);
         bind();
         Require(name, "same-value raw native re-clear",
                 read_texel() == expected,
                 "a repeated metadata fill did not clear an already drawn target");
+        const auto checks =
+            Common::DebugCounters::Get(Common::DebugCounters::Counter::ColorMetadataChecks);
+        bind();
+        Require(name, "checked metadata skips rebinding",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataChecks) == checks,
+                "rebinding unwritten GPU-checked metadata repeated its clear check");
+        check_expanded_metadata();
+        paint();
+        fill_metadata(metadata_words - 1, true);
+        bind();
+        Require(name, "partial raw native metadata fill", retains_painted_texel(),
+                "a nonuniform GPU-written metadata slice cleared the whole target");
+        fill_metadata(metadata_words, true);
+        bind();
+        Require(name, "complete raw native fill after partial fill", read_texel() == expected,
+                "completing a GPU-written metadata fill did not restore its clear");
+        if (layout == Prospero::ChannelLayout::k16_16_16_16 && !fill_case.cmask &&
+            !fill_case.reuse_unorm) {
+          auto video = color.desc;
+          video.type = BindingType::VideoOut;
+          paint();
+          fill_metadata(metadata_words, true);
+          const bool cleared =
+              texture_cache.FindImage(video) == color.image_id && read_texel() == expected;
+          std::vector<uint32_t> keys(metadata_words);
+          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
+          Require(name, "video-out clear keeps its metadata keys",
+                  cleared &&
+                      LibKernel::Memory::TryReadBacking(dcc_address, keys.data(), metadata_size) &&
+                      std::ranges::all_of(keys,
+                                          [&](uint32_t word) { return word == fill_case.fill; }),
+                  "a video-out bind skipped its clear or expanded the flip's metadata keys");
+        }
         paint();
         WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
         fill_metadata(metadata_words - 1);
@@ -10523,6 +12655,11 @@ public:
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+        Common::DebugCounters::SetEnabled(false);
+        Require(name, "GPU-written metadata stays on the GPU",
+                Common::DebugCounters::Get(
+                    Common::DebugCounters::Counter::ColorMetadataReadbacks) == readbacks,
+                "binding GPU-written color metadata read it back");
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
@@ -10536,7 +12673,7 @@ public:
         metadata_alias.info.extent = {4096, 1, 1};
         metadata_alias.info.pitch = 4096;
         metadata_alias.info.bytes_per_block = sizeof(uint32_t);
-        metadata_alias.info.mip_layout[0] = {0, 0x4000, 4096, 1};
+        metadata_alias.info.UpdateSize();
         metadata_alias.view_info.format = vk::Format::eR32Uint;
         const auto metadata_alias_id = texture_cache.FindImage(metadata_alias);
         vk::ClearValue alias_paint{};
@@ -10584,7 +12721,7 @@ public:
 
         ImageDesc previous_depth{};
         previous_depth.type = BindingType::DepthTarget;
-        previous_depth.info.data = {base + 0x180000, 0x10000};
+        previous_depth.info.data = {base + 0xa00000, 0x10000};
         previous_depth.info.pixel_format = vk::Format::eD32Sfloat;
         previous_depth.info.guest_format = Prospero::BufferFormat::k32Float;
         previous_depth.info.type = Prospero::ImageType::kColor2D;
@@ -10594,10 +12731,10 @@ public:
         previous_depth.info.bytes_per_block = 4;
         previous_depth.info.samples = 1;
         previous_depth.info.tile_mode = Prospero::TileMode::kLinear;
-        previous_depth.info.mip_layout[0] = {0, 0x10000, 128, 128};
+        previous_depth.info.UpdateSize();
         previous_depth.info.metadata.kind = ImageMetadataKind::Htile;
         previous_depth.info.metadata.range = {dcc_address, metadata_size};
-        previous_depth.info.htile_clear_mask = 0;
+        previous_depth.info.htile_initial_clear = false;
         previous_depth.view_info.format = vk::Format::eD32Sfloat;
         previous_depth.view_info.type = vk::ImageViewType::e2D;
         previous_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -10633,6 +12770,212 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "fixed-clear direct-memory allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Cyberpunk 2077 copies its HTile D16 depth target through a kDepth k16UInt image load.
+  void CheckDepthBitsCopy() {
+    constexpr const char *name = "DepthBitsCopy";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x30000;
+    constexpr uint64_t htile_address = base + 0x10000;
+    constexpr uint64_t copy_address = base + 0x20000;
+    constexpr u32 depth_code = 0x2000u;
+    std::vector<u32> copy{EncodeMimg0(0x00, 0x1), EncodeMimg1(4, 0, 2),
+                          EncodeMimg0(0x08, 0x1), EncodeMimg1(4, 0, 0)};
+    AppendEnd(&copy);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(copy.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "depth allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "depth mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      ImageDesc depth{};
+      depth.type = BindingType::DepthTarget;
+      depth.info.data = {base, 0x10000};
+      depth.info.pixel_format = vk::Format::eD16Unorm;
+      depth.info.guest_format = Prospero::BufferFormat::k16UNorm;
+      depth.info.type = Prospero::ImageType::kColor2D;
+      depth.info.extent = {256, 128, 1};
+      depth.info.resources = {1, 1};
+      depth.info.pitch = 256;
+      depth.info.bytes_per_block = 2;
+      depth.info.samples = 1;
+      depth.info.tile_mode = Prospero::TileMode::kDepth;
+      depth.info.UpdateSize();
+      depth.info.metadata.kind = ImageMetadataKind::Htile;
+      depth.info.metadata.range = {htile_address, 0x8000};
+      depth.info.htile_initial_clear = false;
+      depth.view_info.format = vk::Format::eD16Unorm;
+      depth.view_info.type = vk::ImageViewType::e2D;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = textures.FindImage(depth);
+      Require(name, "HTile depth target", textures.FindDepthTarget(depth_id, depth) != nullptr,
+              "the D16 depth target was not created");
+      vk::ClearValue clear{};
+      clear.depthStencil.depth = static_cast<float>(depth_code) / 65535.0f;
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), depth_id,
+          {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, clear);
+
+      // The captured T# with this depth target's size and HTile; the copy writes 2x2 texels.
+      const ShaderTextureResource depth_bits{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k16UInt) << 20u) | (3u << 30u),
+          0x3fu | (127u << 14u),
+          DstSel(4, 0, 0, 1) | (static_cast<u32>(Prospero::TileMode::kDepth) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0x00280000u | (static_cast<u32>(htile_address >> 8u) << 24u),
+          static_cast<u32>(htile_address >> 16u)}};
+      const ShaderTextureResource target{{static_cast<u32>(copy_address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k16UInt) << 20u) | (1u << 30u), 1u << 14u,
+          DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy.data()),
+                           .num_thread_x = 2, .num_thread_y = 2, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 16, .tidig_comp_cnt = 1});
+      for (u32 i = 0; i < 8; i++) {
+        shaders.SetCsUserSgpr(i, target.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(8u + i, depth_bits.fields[i], HW::UserSgprType::Unknown);
+      }
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(target.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.written = true;
+      const auto binding =
+          RenderExecutorTestAccess::ResolveTexture(context.GetRenderExecutor(), resource, value);
+      Require(name, "raw depth bits",
+              ReadCachedTexel(name, context, binding.image_id, {}, {2, 2, 1}) ==
+                  std::vector<u32>(2, depth_code | depth_code << 16u),
+              "the copy did not read the stored D16 codes");
+      Require(name, "depth target retained", TextureCacheTestAccess::Contains(textures, depth_id),
+              "reading depth bits replaced the HTile depth target");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "depth mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "depth allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Cyberpunk 2077 clears a rect of an MSAA color target from compute, one sample per store.
+  void CheckMsaaStorageClear() {
+    constexpr const char *name = "MsaaStorageClear";
+    constexpr uintptr_t base = 0x0000000205000000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    // Captured CS 0xad6c86aca9c0916e: s[8:11] color, s[12:13] origin, s14 width,
+    // s15 height << 16 | samples.
+    std::vector<u32> clear{0xbfa00001u, 0xd7460001u, 0x04050611u, 0xd7460000u, 0x04010610u,
+                           0x7da21ef9u, 0x85060001u, 0x7da8000eu, 0xbf88000fu, 0x4a08000cu,
+                           0x4a0a020du, 0x996b800fu, 0xbeea0380u, 0xbf0a6b6au, 0xbf840009u,
+                           0x7e0c026au, 0x7e000208u, 0x7e020209u, 0x7e04020au, 0x7e06020bu,
+                           0x816a816au, 0xf0200f30u, 0x00000004u, 0xbf82fff5u, 0xbf810000u};
+    ShaderMapUserData(reinterpret_cast<uint64_t>(clear.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<u32>(clear.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "MSAA allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "MSAA mapping failed");
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &textures = context.GetTextureCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      // 8x8 4x MSAA RGBA8: LAST_LEVEL and MAX_MIP hold log2(samples).
+      const ShaderTextureResource target{{static_cast<u32>(base >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k8_8_8_8UNorm) << 20u) | (3u << 30u),
+          1u | (7u << 14u),
+          DstSel(4, 5, 6, 7) | (2u << 16u) |
+              (static_cast<u32>(Prospero::TileMode::kRenderTarget) << 20u) |
+              (static_cast<u32>(Prospero::ImageType::kColor2DMsaa) << 28u),
+          0, 0x00700020u, 0, 0}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(target.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa;
+      resource.written = true;
+      const auto binding =
+          RenderExecutorTestAccess::ResolveTexture(context.GetRenderExecutor(), resource, value);
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), binding.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(clear.data()),
+                           .num_thread_x = 8, .num_thread_y = 8, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 16, .tgid_x_en = true,
+                           .tgid_y_en = true, .tidig_comp_cnt = 1});
+      const std::array<u32, 8> args{std::bit_cast<u32>(1.0f), 0, 0, std::bit_cast<u32>(1.0f),
+                                    1, 1, 2, (2u << 16u) | 4u};
+      for (u32 i = 0; i < 8; i++) {
+        shaders.SetCsUserSgpr(i, target.fields[i], HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(8u + i, args[i], HW::UserSgprType::Unknown);
+      }
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+      for (const int row : {1, 2, 3}) {
+        const u32 inside = row == 3 ? 0u : 0xff0000ffu;
+        Require(name, "every sample in the rect",
+                ReadCachedTexel(name, context, binding.image_id, {0, row, 0}, {4, 1, 1}) ==
+                    std::vector<u32>{0, inside, inside, 0},
+                "the compute clear missed samples or wrote outside its rect");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    context.ShutdownGpu();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "MSAA mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "MSAA allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -10733,6 +13076,78 @@ public:
       context.ShutdownGpu();
       LibKernel::Memory::InstallGpuResources(nullptr);
     }
+    {
+      // PPSA01593 samples a DCC R32 color surface through a comparison sampler.
+      constexpr uint64_t comparison_dcc = base + 0x10000;
+      std::memset(mapped, 0, 0x10000);
+      std::memset(reinterpret_cast<void *>(comparison_dcc), 0xff, 0x1000);
+      RenderContext context(m_runtime_context);
+      context.InitializeGpu(nullptr);
+      LibKernel::Memory::InstallGpuResources(&context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      const ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+          0xc1600000u, 0x000fc00fu, 0x91b00204u, 0, 0x00700000u,
+          0x002b0000u | (static_cast<uint32_t>(comparison_dcc >> 8u) << 24u),
+          static_cast<uint32_t>(comparison_dcc >> 16u)}};
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.written = true;
+      const auto color = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(color.image_id, color.desc);
+      vk::ClearValue paint{};
+      paint.color.float32 = std::array{0.375f, 0.f, 0.f, 0.f};
+      TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), color.image_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, paint);
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      resource.written = false;
+      resource.read = true;
+      resource.depth_compare = true;
+      auto comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      (void)cache.FindTexture(comparison.image_id, comparison.desc);
+      const auto &depth = cache.GetImage(comparison.image_id);
+      Require(name, "expanded DCC comparison alias",
+              comparison.image_id != color.image_id &&
+                  depth.info.pixel_format == vk::Format::eD32Sfloat &&
+                  depth.info.guest_format == Prospero::BufferFormat::k32Float &&
+                  depth.info.tile_mode == Prospero::TileMode::kRenderTarget &&
+                  depth.info.extent == vk::Extent3D{64, 64, 1} &&
+                  depth.info.metadata.kind == ImageMetadataKind::Dcc &&
+                  depth.info.metadata.range == GuestRange{comparison_dcc, 0x1000} &&
+                  ReadCachedTexel(name, context, comparison.image_id) ==
+                      std::vector<u32>{std::bit_cast<u32>(0.375f)},
+              "comparison promotion lost native color data or guest DCC layout");
+      for (const u32 code : {0x40404040u, 0x80808080u}) {
+        WriteMetadata(context, comparison_dcc, 0x1000, code);
+        comparison = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        (void)cache.FindTexture(comparison.image_id, comparison.desc);
+        Require(name, "DCC clear on a comparison backing",
+                ReadCachedTexel(name, context, comparison.image_id, {63, 63, 0}) ==
+                    std::vector<u32>{code == 0x40404040u ? 0u : 0x3f800000u},
+                "DCC clear used the native depth format or color aspect");
+        std::array<uint8_t, 0x1000> metadata{};
+        Require(name, "comparison clear expands metadata",
+                LibKernel::Memory::TryReadBacking(comparison_dcc, metadata.data(),
+                                                 metadata.size()) &&
+                    std::ranges::all_of(metadata, [](uint8_t byte) { return byte == 0xff; }),
+                "comparison clear retained the native DCC clear key");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
     Require(name, "unmap",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "captured scene mapping release failed");
@@ -10780,13 +13195,17 @@ public:
                 target.export_mapping == Prospero::ColorMappingAbgr,
             "shared format resolution changed the existing 1555 render target");
     for (const auto native : {target, TextureGetRenderTargetFormat(
-             Prospero::ChannelLayout::k8, Prospero::ChannelType::kSNorm,
-             Prospero::ChannelOrder::kStandard)}) {
-      const auto upload = TextureCalcUploadLayout(native.guest_format, 4, 1, 1, 1,
-          Prospero::TileMode::kLinear, 256, false, name);
-      Require(name, "render-target guest upload layout",
-              upload.pitch * native.bytes_per_element == 256 && upload.mips[0].size == 256,
-              "retaining the render-target format lost its physical byte width");
+                                          Prospero::ChannelLayout::k8,
+                                          Prospero::ChannelType::kSNorm,
+                                          Prospero::ChannelOrder::kStandard)}) {
+      const auto upload =
+          MakeTilingImage(native.guest_format, 4, 1, 1, 1,
+                          Prospero::TileMode::kLinear, 256, false);
+      Require(
+          name, "render-target guest upload layout",
+          upload.pitch * native.bytes_per_element == 256 &&
+              upload.mip_layout[0].linear_size == 256,
+          "retaining the render-target format lost its physical byte width");
     }
     EnsureRuntimeContext();
     int64_t direct_offset = -1;
@@ -11275,6 +13694,103 @@ public:
     check_layout(false, DstSel(4, 4, 4, 4));
     check_layout(false, DstSel(4, 4, 4, 1));
     check_layout(true, DstSel(4, 0, 0, 1));
+    for (const u32 wave : {32u, 64u}) {
+      TestCase test;
+      test.name = wave == 32u ? "ImageGatherCompareLod32" : "ImageGatherCompareLod64";
+      test.has_user_data = test.has_compute_info = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1u;
+      test.compute_info.lds_size_dwords = 0;
+      ShaderTextureResource descriptor{{static_cast<u32>(base >> 8u),
+          (u32(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u), 3u << 14u,
+          (u32(Prospero::ImageType::kColor2D) << 28u) |
+              (u32(Prospero::TileMode::kStandard4KB) << 20u) | (1u << 16u) | DstSel(4, 4, 4, 4),
+          0, 0x00700000u | (1u << 4u), 0, 0}};
+      ShaderSamplerResource sampler_descriptor{{0x92u | (1u << 12u), 0xfff000u, 1u << 26u, 0}};
+      std::copy_n(descriptor.fields, 8u, test.user_data.begin() + 12u);
+      std::copy_n(sampler_descriptor.fields, 4u, test.user_data.begin() + 20u);
+      test.code.push_back(EncodeVop1(0x01, 40, Vgpr(0)));
+      AppendVMovLiteral(&test.code, 25, std::bit_cast<u32>(0.5f));
+      AppendVMovLiteral(&test.code, 26, std::bit_cast<u32>(0.5f));
+      constexpr std::array mip_depths{0.1f, 0.9f, 0.7f, 0.3f};
+      constexpr std::array gather_order{2u, 3u, 1u, 0u};
+      for (u32 mip = 0; mip < 2u; ++mip) {
+        AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(float(mip)));
+        for (const float reference : {0.2f, 0.5f, 0.8f}) {
+          AppendVMovLiteral(&test.code, 19, std::bit_cast<u32>(reference));
+          // Exact captured NSA order: reference v19, coordinates v25/v26, LOD v22.
+          test.code.insert(test.code.end(), {0xf130010au, 0x00a30013u, 0x00161a19u});
+          for (u32 component = 0; component < 4u; ++component) {
+            AppendStoreVgprAtLaneDwordOffset(&test.code, component, 40, test.expected.size());
+            const float depth = mip == 0u ? 0.6f : mip_depths[gather_order[component]];
+            test.expected.insert(test.expected.end(), wave, reference < depth ? 0x3f800000u : 0u);
+          }
+        }
+      }
+      AppendEnd(&test.code);
+      test.user_data[50] = test.expected.size() * sizeof(u32);
+      test.user_data[51] = 3u << 28u;
+      test.initial.assign(test.expected.size(), 0xdeadbeefu);
+      test.expected_mip_descriptors = 2u;
+      test.required_spirv = {"OpImageDrefGather", "OpSwitch"};
+      test.decoded_counts = {{"IMAGE_GATHER4_C_L", 6u}};
+      const auto compiled = CompileCase(test, SubgroupSize());
+      Require(test.name, "comparison mip resource", compiled.program.info.images.size() == 1u &&
+                  compiled.program.info.images[0].depth_compare,
+              "explicit comparison gather lost its depth resource");
+      std::memset(mapped, 0, allocation_size);
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &executor = context.GetRenderExecutor();
+      auto binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, compiled.program.info.images[0], compiled.resources.images[0]);
+      auto &cache = context.GetTextureCache();
+      Image sampled;
+      sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+      auto &image = cache.GetImage(binding.image_id);
+      Require(test.name, "native depth mip backing",
+              image.info.pixel_format == vk::Format::eD32Sfloat && image.backing.mip_levels == 2u,
+              "comparison gather did not allocate both depth mips");
+      std::vector<u32> pixels(16u, std::bit_cast<u32>(0.6f));
+      for (const auto depth : mip_depths) pixels.push_back(std::bit_cast<u32>(depth));
+      auto staging = CreateHostBuffer(test.name, pixels.size() * sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferSrc, pixels);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                    {}, scheduler.Current().Handle());
+      std::array<vk::BufferImageCopy, 2> copies{};
+      for (u32 mip = 0; mip < 2u; ++mip) {
+        copies[mip].bufferOffset = mip == 0u ? 0u : 16u * sizeof(u32);
+        copies[mip].imageSubresource = {vk::ImageAspectFlagBits::eDepth, mip, 0, 1};
+        copies[mip].imageExtent = {4u >> mip, 4u >> mip, 1u};
+      }
+      scheduler.Current().Handle().copyBufferToImage(staging.buffer, image.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, copies.size(), copies.data());
+      image.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead,
+                    {}, scheduler.Current().Handle());
+      scheduler.Finish();
+      DestroyBuffer(&staging);
+      sampled.image = image.backing.image;
+      sampled.format = image.info.pixel_format;
+      sampled.mip_levels = 2u;
+      sampled.layout = image.backing.state.layout;
+      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor, false);
+      auto output = CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      Dispatch(test, compiled, output, nullptr, &sampled, nullptr, nullptr, sampler);
+      Require(test.name, "explicit LOD, comparison reference and gather component order",
+              ReadBuffer(test.name, output, test.expected.size()) == test.expected,
+              "comparison gather selected the wrong mip, reference or component order");
+      DestroyBuffer(&output);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
     Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
             "comparison texture unmap failed");
     Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
@@ -11748,22 +14264,69 @@ public:
                              block_words + 0x10000 / sizeof(uint32_t) - 4),
               "compressed atlas aliases reloaded stale CPU bytes over GPU-written blocks");
 
-      const auto allocate_bindings =
-          [&](ShaderRecompiler::IR::Program &program) {
-            program.shader_info_complete = true;
-            ShaderRecompiler::IR::AllocateBindings(program);
-          };
+      const auto set_image_bindings = [](ShaderRecompiler::IR::Program &program) {
+        for (auto &image : program.info.images) {
+          const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+          const auto index = static_cast<size_t>(kind);
+          image.descriptor_index = program.bindings.descriptor_counts[index];
+          program.bindings.descriptor_counts[index] += image.mip_count;
+          program.bindings.descriptor_mask |= uint64_t{1} << index;
+        }
+      };
       const auto make_buffer_program =
           [](ShaderType stage, ShaderRecompiler::IR::BufferResource resource) {
             ShaderRecompiler::IR::CompiledShaderInfo program{};
             program.stage = stage;
+            resource.descriptor_index = 0;
             program.info.buffers.push_back(resource);
-            program.bindings.descriptors.push_back(
-                {ShaderRecompiler::IR::DescriptorBindingKind::Buffers, {0}});
-            program.bindings.memory_offset_count = 1;
+            program.bindings.descriptor_counts[0] = 1;
+            program.bindings.descriptor_mask = 1;
             program.bindings.push_data_start_dword = 0;
             return program;
           };
+
+      {
+        constexpr uint64_t page = 0x10000;
+        constexpr uint64_t address = base - page;
+        constexpr u32 resident_value = 0x13572468u;
+        void *reservation = reinterpret_cast<void *>(address);
+        Require(name, "sparse descriptor reservation",
+                LibKernel::Memory::KernelReserveVirtualRange(&reservation, page, 0x10, page) == 0,
+                "leading sparse page reservation failed");
+        resources.MapMemory(address, page);
+        LibKernel::Memory::WriteBacking(base, &resident_value, sizeof(resident_value));
+        const auto program = make_buffer_program(ShaderType::Compute, {.read = true});
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        auto &value = snapshot.buffers.emplace_back();
+        value.dword_count = 4;
+        value.dwords = {static_cast<u32>(address), static_cast<u32>(address >> 32), 2u * page};
+        ShaderStageRuntime runtime{&program, &snapshot};
+        PreparedBindings bindings;
+        executor.PrepareBindings(runtime, bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
+        executor.RebindBuffers(bindings);
+        const auto &source = bindings.buffer_sources[0];
+        const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+        Require(name, "finite sparse descriptor extent",
+                source.address == address && source.size == 2u * page &&
+                    bindings.buffers[0].range == 2u * page,
+                "finite descriptor lost its leading hole or resident tail");
+        auto output = CreateHostBuffer(name, 2u * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferCopy, 2> copies{{
+            {owner.Offset(address), 0, sizeof(u32)},
+            {owner.Offset(base), sizeof(u32), sizeof(u32)}}};
+        scheduler.Current().Handle().copyBuffer(owner.Handle(), output.buffer, copies.size(), copies.data());
+        scheduler.Finish();
+        Require(name, "finite sparse descriptor upload",
+                ReadBuffer(name, output, 2) == std::vector<u32>{0u, resident_value},
+                "sparse descriptor upload lost zero-filled holes or resident bytes");
+        DestroyBuffer(&output);
+        resources.UnmapMemory(address, page);
+        Require(name, "sparse descriptor reservation release",
+                LibKernel::Memory::KernelMunmap(address, page) == 0,
+                "leading sparse page reservation release failed");
+      }
 
       {
         const auto buffer_program = make_buffer_program(ShaderType::Compute, {.read = true});
@@ -11780,7 +14343,8 @@ public:
         value.dword_count = 4;
         PreparedBindings buffer_bindings;
         executor.PrepareBindings(buffer_runtime, buffer_bindings);
-        executor.FindBuffers(buffer_bindings);
+        std::array<PreparedBindings *, 1> buffer_stages{&buffer_bindings};
+        executor.FindBuffers(buffer_stages);
         const auto original_id = buffer_bindings.buffer_sources[0].id;
 
         auto &buffer_cache = resources.GetBufferCache();
@@ -11813,7 +14377,8 @@ public:
         ShaderStageRuntime runtime{&buffer_program, &snapshot};
         PreparedBindings bindings;
         executor.PrepareBindings(runtime, bindings);
-        executor.FindBuffers(bindings);
+        std::array<PreparedBindings *, 1> stages{&bindings};
+        executor.FindBuffers(stages);
         executor.RebindBuffers(bindings);
         const auto &owner = resources.GetBufferCache().GetBuffer(bindings.buffer_sources[0].id);
         Require(name, "halfword buffer base and exact tail",
@@ -11822,6 +14387,74 @@ public:
                     bindings.buffers[0].range == 14 &&
                     bindings.shader_data[buffer_program.bindings.memory_offset_dword] == 2,
                 "native binding lost the byte adjustment or rounded the final halfword range");
+      }
+
+      {
+        constexpr uint64_t address = base + allocation_size - 0x4000 + 12;
+        constexpr uint64_t mapped_tail = base + allocation_size - address;
+        auto writer = make_buffer_program(ShaderType::Vertex, {.written = true});
+        ShaderRecompiler::IR::CompiledShaderInfo reader{};
+        reader.stage = ShaderType::Pixel;
+        ShaderRecompiler::IR::ResourceSnapshot writer_snapshot, reader_snapshot;
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = UINT32_MAX;
+        auto &value = writer_snapshot.buffers.emplace_back();
+        std::copy_n(descriptor.fields, 4, value.dwords.begin());
+        value.dword_count = 4;
+        ShaderStageRuntime writer_runtime{&writer, &writer_snapshot};
+        ShaderStageRuntime reader_runtime{&reader, &reader_snapshot};
+        PreparedBindings writer_bindings, reader_bindings;
+        const auto check_range = [&](uint64_t expected, const char *description) {
+          executor.PrepareBindings(writer_runtime, writer_bindings);
+          executor.PrepareBindings(reader_runtime, reader_bindings);
+          std::array<PreparedBindings *, 2> stages{&reader_bindings, &writer_bindings};
+          executor.FindBuffers(stages);
+          executor.RebindBuffers(writer_bindings);
+          const auto &source = writer_bindings.buffer_sources[0];
+          const auto &binding = writer_bindings.buffers[0];
+          const auto &owner = resources.GetBufferCache().GetBuffer(source.id);
+          Require(name, description, source.address == address && source.size == expected &&
+                      binding.buffer == owner.Handle() && binding.offset <= owner.Offset(address) &&
+                      binding.range == expected + owner.Offset(address) - binding.offset,
+                  "descriptor discovery or rebind changed the write boundary or base adjustment");
+        };
+        writer_snapshot.specialization_reads = {{address + 0x500, 4},
+            {address - 0x40, 0x40}, {address + 0x80, 0}};
+        reader_snapshot.specialization_reads = {{address + 0x300, 4}, {address + 0x100, 4}};
+        check_range(0x100, "unbounded write stops before nearest cross-stage read");
+        reader_snapshot.specialization_reads.clear();
+        check_range(0x500, "unbounded write stops before same-stage read");
+        writer_snapshot.specialization_reads = {{address - 0x40, 0x40},
+                                               {address + mapped_tail + 0x100, 4}};
+        check_range(mapped_tail, "earlier and unmapped reads preserve mapped tail");
+        writer_snapshot.specialization_reads.clear();
+        check_range(mapped_tail, "unbounded write without reads preserves mapped tail");
+        reader_snapshot.specialization_reads = {{address + 0x100, 4}};
+        value.dwords[2] = 0x300;
+        check_range(0x300, "finite write preserves its declared range");
+        value.dwords[2] = UINT32_MAX;
+        writer.info.buffers[0].written = false;
+        writer.info.buffers[0].read = true;
+        check_range(mapped_tail, "read-only sentinel preserves mapped tail");
+        auto &graphics = context.GetGraphics();
+        auto &storage_limit = graphics.physical_device_properties.limits.maxStorageBufferRange;
+        const auto original_limit = storage_limit;
+        storage_limit = 0x2000;
+        value.dwords[1] |= 16u << 16u;
+        check_range(storage_limit - (graphics.StorageMinAlignment() - 1),
+                    "read-only structured sentinel reserves native alignment prefix");
+        Require(name, "read-only native range fits device", writer_bindings.buffers[0].range <= storage_limit,
+                "read-only cap omitted the native descriptor alignment prefix");
+        value.dwords[2] = 0x300; // A finite 12 KiB descriptor remains finite despite the mock limit.
+        std::array<PreparedBindings *, 1> stages{&writer_bindings};
+        executor.FindBuffers(stages);
+        Require(name, "finite read exceeds mock cap unchanged", writer_bindings.buffer_sources[0].size == 0x3000,
+                "read-only window changed a finite descriptor's declared range");
+        storage_limit = original_limit;
+        check_range(0x3000, "finite structured read preserves native range");
+        value.dwords[2] = UINT32_MAX;
+        check_range(mapped_tail, "read-only structured sentinel preserves smaller mapping");
       }
 
       for (const auto format : {Prospero::BufferFormat::k8UNorm,
@@ -11835,7 +14468,7 @@ public:
           auto depth_desc = MakeLinearDesc(alias_address, 256, vk::Format::eD16Unorm,
               format, Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 2, 1);
           depth_desc.info.pitch = 128;
-          depth_desc.info.mip_layout[0] = {0, 256, 128, 1};
+          depth_desc.info.UpdateSize();
           depth_desc.type = BindingType::DepthTarget;
           depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
           depth_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -11915,7 +14548,7 @@ public:
             Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
             {1, 1, 1}, 6, 1, 1);
         array_desc.info.pitch = 256;
-        array_desc.info.mip_layout[0] = {0, 1536, 256, 1};
+        array_desc.info.UpdateSize();
         auto volume_desc = array_desc;
         volume_desc.info.type = Prospero::ImageType::kColor3D;
         volume_desc.info.data.size = 256;
@@ -11991,7 +14624,9 @@ public:
       }
       ShaderRecompiler::IR::ApplyResourceSpecialization(
           null_program, null_specialization);
-      allocate_bindings(null_program);
+      null_program.info.images.back().mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
+      null_program.info.images.back().mip_count = 3;
+      set_image_bindings(null_program);
       ShaderRecompiler::IR::CompiledShaderInfo null_info{};
       null_info.stage = null_program.stage;
       null_info.info = std::move(null_program.info);
@@ -12003,38 +14638,27 @@ public:
       Require(name, "null descriptor count",
               null_bindings.images.size() == 3,
               "null descriptor preparation lost an image binding");
-      const auto null_image_id = null_bindings.images[0].image_id;
-      const auto &null_image = texture_cache.GetImage(null_image_id);
-      Require(name, "one null image per format",
-              null_bindings.images[1].image_id == null_image_id &&
-                  null_bindings.images[2].image_id == null_image_id &&
-                  TextureCacheTestAccess::NullImageCount(texture_cache) == 1,
-              "null view dimension or usage created another image allocation");
-      Require(name, "null descriptors share final cache acquisition",
-              null_image.info.data.Empty() && !null_image.binding.is_bound &&
-                  !null_image.binding.is_target &&
-                  !null_image.binding.needs_rebind &&
-                  null_image.usage.texture && null_image.usage.storage &&
-                  null_image.IsGpuModified() &&
-                  !TextureCacheTestAccess::PendingDownload(texture_cache,
-                                                           null_image_id),
-              "the shared null image did not preserve texture/storage "
-              "acquisition without guest readback or RenderExecutor ownership");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
           executor, scheduler.Current(), null_bindings));
-      Require(name, "null descriptor general layouts",
+      Require(name, "null descriptors have no cache image or native view",
               std::ranges::all_of(null_bindings.images,
                                   [](const auto &binding) {
                                     const auto info = MakeImageInfo(binding);
-                                    return binding.layout ==
+                                    return !binding.image_id &&
+                                           binding.image_view == nullptr &&
+                                           binding.mip_views.empty() &&
+                                           binding.layout ==
                                                vk::ImageLayout::eGeneral &&
-                                           info.imageView ==
-                                               binding.image_view &&
+                                           info.imageView == nullptr &&
                                            info.imageLayout == binding.layout;
-                                  }) &&
-                  null_image.backing.state.layout == vk::ImageLayout::eGeneral,
-              "shared sampled/storage null descriptors did not retain "
-              "the general layout through descriptor generation");
+                                  }),
+              "sampled/storage null descriptors acquired a backing image or lost their general layout");
+      for (u32 mip = 0; mip < 3; ++mip) {
+        const auto info = MakeImageInfo(null_bindings.images.back(), mip);
+        Require(name, "null storage mip descriptors",
+                info.imageView == nullptr && info.imageLayout == vk::ImageLayout::eGeneral,
+                "a null storage mip acquired a backing image");
+      }
 
       constexpr uint64_t target_mip_size = 0x10000;
       const auto make_target_desc = [&](uint64_t address, uint64_t size,
@@ -12051,7 +14675,10 @@ public:
         desc.info.bytes_per_block = 4;
         desc.info.samples = 1;
         desc.info.tile_mode = linear;
-        desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+        desc.info.mip_layout[0] = {
+            0, size, extent.width, extent.height, 0, size, extent.width};
+        desc.info.tiling.block.bytes_per_element = 4;
+        desc.info.linear_slice_stride = size;
         desc.view_info.format = desc.info.pixel_format;
         desc.view_info.type = vk::ImageViewType::e2D;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -12086,7 +14713,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       storage_resource.written = true;
       storage_program.info.images.push_back(storage_resource);
-      allocate_bindings(storage_program);
+      set_image_bindings(storage_program);
       ShaderRecompiler::IR::DescriptorValue storage_descriptor{};
       std::copy(std::begin(storage.fields), std::end(storage.fields),
                 storage_descriptor.dwords.begin());
@@ -12622,7 +15249,7 @@ public:
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_resource.read = true;
       sampled_program.info.images.push_back(sampled_resource);
-      allocate_bindings(sampled_program);
+      set_image_bindings(sampled_program);
       ShaderRecompiler::IR::ResourceSnapshot sampled_snapshot{};
       sampled_snapshot.images.push_back(storage_descriptor);
       ShaderRecompiler::IR::CompiledShaderInfo sampled_info{};
@@ -12686,8 +15313,7 @@ public:
                   texture_cache.GetImage(storage_id).binding.force_general &&
                   texture_cache.GetImage(storage_id).binding.shader_write &&
                   texture_cache.GetImage(storage_id).IsGpuModified() &&
-                  texture_cache.GetImage(storage_id).usage.storage &&
-                  texture_cache.GetImage(storage_id).usage.texture,
+                  texture_cache.GetImage(storage_id).usage.storage,
               "the production graphics binding path did not complete vertex "
               "storage acquisition before pixel sampling");
       descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
@@ -12704,7 +15330,7 @@ public:
       vertex_sampled_program.stage = ShaderType::Vertex;
       vertex_sampled_program.resource_tracking_complete = true;
       vertex_sampled_program.info.images.push_back(sampled_resource);
-      allocate_bindings(vertex_sampled_program);
+      set_image_bindings(vertex_sampled_program);
       ShaderRecompiler::IR::CompiledShaderInfo vertex_sampled_info{};
       vertex_sampled_info.stage = vertex_sampled_program.stage;
       vertex_sampled_info.info = std::move(vertex_sampled_program.info);
@@ -12716,7 +15342,7 @@ public:
       pixel_storage_program.stage = ShaderType::Pixel;
       pixel_storage_program.resource_tracking_complete = true;
       pixel_storage_program.info.images.push_back(storage_resource);
-      allocate_bindings(pixel_storage_program);
+      set_image_bindings(pixel_storage_program);
       ShaderRecompiler::IR::CompiledShaderInfo pixel_storage_info{};
       pixel_storage_info.stage = pixel_storage_program.stage;
       pixel_storage_info.info = std::move(pixel_storage_program.info);
@@ -12768,8 +15394,9 @@ public:
       split_desc.info.bytes_per_block = 4;
       split_desc.info.samples = 1;
       split_desc.info.tile_mode = linear;
-      split_desc.info.mip_layout[0] = {0, 8, 2, 1};
-      split_desc.info.mip_layout[1] = {8, 4, 1, 1};
+      split_desc.info.mip_layout[0] = {0, 8, 2, 1, 0, 8, 2};
+      split_desc.info.mip_layout[1] = {8, 4, 1, 1, 8, 4, 1};
+      split_desc.info.tiling.block.bytes_per_element = 4;
       split_desc.view_info.format = split_desc.info.pixel_format;
       split_desc.view_info.type = vk::ImageViewType::e2D;
       split_desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
@@ -12792,7 +15419,7 @@ public:
       split_ir.stage = ShaderType::Vertex;
       split_ir.resource_tracking_complete = true;
       split_ir.info.images = {storage_resource, sampled_resource};
-      allocate_bindings(split_ir);
+      set_image_bindings(split_ir);
       ShaderRecompiler::IR::CompiledShaderInfo split_program{};
       split_program.stage = split_ir.stage;
       split_program.info = std::move(split_ir.info);
@@ -12885,7 +15512,7 @@ public:
       depth_views_ir.stage = ShaderType::Pixel;
       depth_views_ir.resource_tracking_complete = true;
       depth_views_ir.info.images = {sampled_resource, sampled_resource};
-      allocate_bindings(depth_views_ir);
+      set_image_bindings(depth_views_ir);
       ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
       depth_views_program.stage = depth_views_ir.stage;
       depth_views_program.info = std::move(depth_views_ir.info);
@@ -13012,8 +15639,7 @@ public:
               phased_depth.desc.info.metadata.stencil_compressed &&
               !phased_depth.depth_clear_enable &&
               !texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
-              !texture_cache.GetImage(phased_depth.image_id).IsGpuModified() &&
-              !texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
+              !texture_cache.GetImage(phased_depth.image_id).IsGpuModified(),
           "valid PS5 texture-compatibility policy changed logical depth image "
           "identity or discovery side effects");
 
@@ -13090,13 +15716,12 @@ public:
               phased_rendering.num_color_attachments == 0 &&
               phased_rendering.depth_stencil_attachment.has_depth &&
               phased_rendering.depth_stencil_attachment.depth_clear &&
-              phased_depth.depth_load_clear_enable &&
+              static_cast<bool>(phased_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) &&
               texture_cache.IsMeta(phased_depth.desc.info.metadata.range.address) &&
               !texture_cache.IsMetaCleared(
                   phased_depth.desc.info.metadata.range.address,
                   phased_depth.desc.view_info.base_layer) &&
-              texture_cache.GetImage(phased_depth.image_id).IsGpuModified() &&
-              texture_cache.GetImage(phased_depth.image_id).usage.depth_target,
+              texture_cache.GetImage(phased_depth.image_id).IsGpuModified(),
           "final depth acquisition did not publish and consume HTile "
           "state at the final acquisition boundary");
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -13128,6 +15753,8 @@ public:
       RenderDepthInfo depth_only{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
           executor, scheduler.Current(), depth_only);
+      (void)RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_color, 0, depth_only);
       Require(
           name, "depth-only target with stale stencil state",
           depth_only.image_id && depth_only.desc.view_info.format == vk::Format::eD32Sfloat &&
@@ -13272,7 +15899,7 @@ public:
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
-                    bounds_depth.depth_load_clear_enable == (pass == 0) &&
+                    static_cast<bool>(bounds_depth.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
                     bounds_feedback == (pass == 0
                                             ? vk::ImageAspectFlagBits::eDepth
@@ -13312,6 +15939,66 @@ public:
                   [](uint32_t value) { return value == std::bit_cast<uint32_t>(0.625f); }),
               "pending clear did not use DB_DEPTH_CLEAR or cleared the next acquisition again");
       DestroyBuffer(&bounds_readback);
+
+      // Captured DB_DEPTH_VIEW selects one layer of an 87-layer HTile target.
+      auto high_slice_target = depth_only_target;
+      high_slice_target.z_read_base_addr = base + 0x800000;
+      high_slice_target.z_write_base_addr = high_slice_target.z_read_base_addr;
+      high_slice_target.htile_data_base_addr = base + 0x500000;
+      high_slice_target.depth_view.slice_start = 86;
+      high_slice_target.depth_view.slice_max = 86;
+      high_slice_target.size = {127, 127, true};
+      registers.SetDepthRenderTarget(high_slice_target);
+      registers.SetDepthControl(HW::DepthControl{.depth_bounds_enable = true});
+      registers.SetRenderControl({});
+      RenderDepthInfo high_slice{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), high_slice);
+      (void)texture_cache.FindDepthTarget(high_slice.image_id, high_slice.desc);
+      Require(name, "captured high HTile slice layout",
+              high_slice.desc.info.resources.layers == 87 &&
+                  high_slice.desc.view_info.base_layer == 86 &&
+                  high_slice.desc.view_info.layer_count == 1 &&
+                  high_slice.desc.info.data.End() <= base + 0xe00000 &&
+                  high_slice.desc.info.metadata.range.End() <= base + 0x800000 &&
+                  texture_cache.ClearMeta(high_slice_target.htile_data_base_addr),
+              "single high slice was rejected or changed the backing layer layout");
+      auto high_slice_readback = CreateHostBuffer(
+          name, 4 * sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {});
+      for (uint32_t pass = 0; pass < 2; ++pass) {
+        vk::ClearValue prior_depth{};
+        prior_depth.depthStencil.depth = 0.625f;
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(),
+            high_slice.image_id, {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 87},
+            prior_depth);
+        RenderDepthInfo acquired_high_slice{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(
+            executor, scheduler.Current(), acquired_high_slice);
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, acquired_high_slice);
+        Require(name, "high HTile slice clear consumption",
+                acquired_high_slice.image_id == high_slice.image_id &&
+                    static_cast<bool>(acquired_high_slice.load_clear_aspects & vk::ImageAspectFlagBits::eDepth) == (pass == 0) &&
+                    rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
+                    !texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 86) &&
+                    texture_cache.IsMetaCleared(high_slice_target.htile_data_base_addr, 85),
+                "high slice was cleared repeatedly or consumed its neighbor's state");
+        scheduler.BeginRendering(rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        const vk::BufferImageCopy copy{pass * 2 * sizeof(uint32_t), 0, 0,
+            {vk::ImageAspectFlagBits::eDepth, 0, 85, 2}, {}, {1, 1, 1}};
+        texture_cache.GetImage(high_slice.image_id).Download(
+            std::span{&copy, 1}, high_slice_readback.buffer, 0, high_slice_readback.size);
+      }
+      scheduler.Current().Handle().pipelineBarrier2(bounds_dependency);
+      scheduler.Finish();
+      Require(name, "high HTile slice contents and neighbor",
+              ReadBuffer(name, high_slice_readback, 4) == std::vector<uint32_t>{
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.375f),
+                  std::bit_cast<uint32_t>(0.625f), std::bit_cast<uint32_t>(0.625f)},
+              "layer86 clear missed, repeated, or changed adjacent layer85");
+      DestroyBuffer(&high_slice_readback);
       registers.SetDepthClearValue(0.0f);
 
       // DB override copies run with depth and stencil tests disabled.
@@ -13709,9 +16396,10 @@ public:
       video_parent.info.pixel_format = vk::Format::eR8G8B8A8Srgb;
       video_parent.info.guest_format = Prospero::BufferFormat::k8_8_8_8Srgb;
       video_parent.info.resources.levels = 2;
-      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2};
-      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1,
-                                         1};
+      video_parent.info.mip_layout[0] = {0, target_mip_size, 2, 2,
+                                         0, target_mip_size, 2};
+      video_parent.info.mip_layout[1] = {target_mip_size, target_mip_size, 1, 1,
+                                         target_mip_size, target_mip_size, 1};
       video_parent.view_info.format = video_parent.info.pixel_format;
       video_parent.view_info.usage = vk::ImageUsageFlagBits::eSampled;
       const auto video_parent_id = texture_cache.FindImage(video_parent);
@@ -13797,7 +16485,7 @@ public:
               array_binding.images[0].desc.view_info.layer_count ==
                   2 &&
               expanded_array.backing.layers == 2 &&
-              expanded_array.IsGpuModified() && expanded_array.usage.texture,
+              expanded_array.IsGpuModified(),
           "raw array view did not expand and reuse the Color2D backing");
 
       RenderColorInfo rebound_array_target{};
@@ -13826,8 +16514,14 @@ public:
               "backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      {
-        constexpr uint32_t before = 0x13579bdfu;
+      Require(name, "raw image synchronization default",
+              !Config::SyncRawImageBuffersEnabled(),
+              "raw image synchronization should be disabled by default");
+      for (const auto [sync_raw, formatted] :
+           {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
+        Config::Load({.sync_raw_image_buffers = sync_raw});
+        const bool sync_image = sync_raw || formatted;
+        const uint32_t before = 0x13579bd0u | (uint32_t(sync_raw) << 1u) | uint32_t(formatted);
         constexpr uint32_t guard = 0x2468ace0u;
         constexpr uint32_t after = 0xa1b2c3d4u;
         vk::ClearValue clear{};
@@ -13841,7 +16535,7 @@ public:
             {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
 
         const auto buffer_program = make_buffer_program(
-            ShaderType::Vertex, {.read = true, .formatted = true});
+            ShaderType::Vertex, {.read = true, .formatted = formatted});
 
         constexpr uint64_t buffer_size = 2 * target_mip_size;
         static_assert(buffer_size > BufferCache::CACHING_PAGESIZE);
@@ -13864,13 +16558,14 @@ public:
         RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, stages, std::span{&target, 1u});
         const auto &buffer = buffer_bindings.buffers[0];
-        Require(name, "rediscovered target formatted-buffer read",
+        Require(name, "rediscovered target buffer read",
                 target.image_id == expanded_array_id &&
                     buffer.range == buffer_size &&
                     buffer_bindings.images.empty() &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
-                        vk::ImageLayout::eTransferSrcOptimal,
-                "target discovery did not precede the formatted image-to-buffer copy");
+                        (sync_image ? vk::ImageLayout::eTransferSrcOptimal
+                                    : vk::ImageLayout::eTransferDstOptimal),
+                "image-to-buffer synchronization ignored its setting or formatted reads");
         auto readback = CreateHostBuffer(name, 2 * sizeof(uint32_t),
                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
         const std::array copies{
@@ -13892,12 +16587,12 @@ public:
 
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &target, 1, no_array_depth);
-        Require(name, "attachment layout after formatted-buffer read",
+        Require(name, "attachment layout after buffer read",
                 rendering.color_attachments[0].image_layout ==
                     vk::ImageLayout::eColorAttachmentOptimal &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eColorAttachmentOptimal,
-                "the formatted buffer copy left the render attachment in its transfer layout");
+                "the buffer copy left the render attachment in its transfer layout");
         vk::ClearAttachment clear_attachment{};
         clear_attachment.aspectMask = vk::ImageAspectFlagBits::eColor;
         clear_attachment.colorAttachment = 0;
@@ -13907,17 +16602,19 @@ public:
         scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
-        Require(name, "formatted alias observes prior GPU contents",
-                ReadBuffer(name, readback, 2) == std::vector<u32>{before, guard},
-                "formatted buffer acquisition copied stale guest bytes instead of the image");
+        Require(name, "buffer alias observes prior GPU contents",
+                ReadBuffer(name, readback, 2) ==
+                    (sync_image ? std::vector<u32>{before, guard} : std::vector<u32>{0, 0}),
+                "buffer contents did not match the selected image synchronization mode");
         DestroyBuffer(&readback);
-        Require(name, "rendering after formatted-buffer acquisition",
+        Require(name, "rendering after buffer acquisition",
                 ReadCachedTexel(name, context, target.image_id) == std::vector<u32>{after} &&
                     ReadCachedTexel(name, context, target.image_id, {}, {1, 1, 1}, 1) ==
                         std::vector<u32>{guard},
                 "attachment rendering lost its new color or changed the untouched array layer");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
+      Config::Load({});
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
@@ -14076,7 +16773,7 @@ public:
       depth.info.bytes_per_block = 4;
       depth.info.samples = 1;
       depth.info.tile_mode = linear;
-      depth.info.mip_layout[0] = {0, depth.info.data.size, 1, 1};
+      depth.info.UpdateSize();
       depth.view_info.format = depth.info.pixel_format;
       depth.view_info.type = vk::ImageViewType::e2D;
       depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
@@ -14086,13 +16783,11 @@ public:
               !texture_cache.FindImageFromRange(stencil_address,
                                                 stencil_layout.size, false) &&
                   !texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(depth_id).binding.is_target &&
-                  !texture_cache.GetImage(depth_id).usage.depth_target,
+                  !texture_cache.GetImage(depth_id).binding.is_target,
               "FindImage created depth acquisition state or a stencil proxy");
       RenderExecutorTestAccess::BindRenderTarget(executor, depth_id);
       Require(name, "depth prefetch purity",
               texture_cache.GetImage(depth_id).binding.is_target &&
-                  !texture_cache.GetImage(depth_id).usage.depth_target &&
                   !texture_cache.FindImageFromRange(stencil_address,
                                                     stencil_layout.size, false),
               "depth prefetch performed final target acquisition");
@@ -14102,18 +16797,17 @@ public:
       target_parent.info.resources.levels = 2;
       // PS5 linear rows align to 256 bytes; smaller mips precede larger ones.
       target_parent.info.pitch = 64;
-      target_parent.info.mip_layout[0] = {512, 1024, 64, 4};
-      target_parent.info.mip_layout[1] = {0, 512, 64, 2};
+      target_parent.info.UpdateSize();
       target_parent.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       auto target_base_subresource =
           make_target_desc(base + 512, 1024, {4, 4, 1});
       target_base_subresource.info.pitch = 64;
-      target_base_subresource.info.mip_layout[0] = {0, 1024, 64, 4};
+      target_base_subresource.info.UpdateSize();
       const auto target_base_subresource_id =
           texture_cache.FindImage(target_base_subresource);
       auto target_subresource = make_target_desc(base, 512, {2, 2, 1});
       target_subresource.info.pitch = 64;
-      target_subresource.info.mip_layout[0] = {0, 512, 64, 2};
+      target_subresource.info.UpdateSize();
       const auto target_subresource_id =
           texture_cache.FindImage(target_subresource);
       const auto *target_subresource_owner =
@@ -14224,7 +16918,6 @@ public:
               texture_cache.GetImage(target_parent_id).binding.is_target &&
               texture_cache.GetImage(target_parent_id).usage.render_target &&
               texture_cache.GetImage(target_parent_id).IsGpuModified() &&
-              texture_cache.GetImage(depth_id).usage.depth_target &&
               texture_cache.GetImage(depth_id).IsGpuModified() &&
               TextureCacheTestAccess::PendingDownload(texture_cache,
                                                       target_parent_id) &&
@@ -14310,19 +17003,18 @@ public:
       const auto sampled_stencil_id = prepared.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.images.size() == 1 &&
-                  sampled_stencil_id != depth_id &&
+                  sampled_stencil_id == depth_id &&
                   prepared.images[0].image_view == nullptr &&
                   texture_cache.GetImage(sampled_stencil_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_bound &&
                   !texture_cache.GetImage(stencil_proxy_id).binding.is_target,
-              "the first sampled-stencil lookup did not remain an ordinary "
-              "discovery before final depth acquisition");
+              "the first sampled-stencil lookup did not use the canonical "
+              "depth owner without acquiring the stencil proxy");
 
       context.GetRenderExecutor().RebindImages(prepared);
       Require(name, "first stencil acquisition",
               prepared.images[0].image_id == sampled_stencil_id &&
-                  prepared.images[0].image_view != nullptr &&
-                  texture_cache.GetImage(sampled_stencil_id).usage.texture,
+                  prepared.images[0].image_view != nullptr,
               "the first sampled-stencil image was not finally acquired");
 
       RenderExecutorTestAccess::ResetBindings(executor);
@@ -14332,7 +17024,7 @@ public:
           executor, scheduler.Current(), &no_reassociated_color, 0,
           reassociated_depth);
       Require(name, "existing stencil association selection",
-              texture_cache.GetImage(sampled_stencil_id).depth_id ==
+              texture_cache.GetImage(stencil_proxy_id).depth_id ==
                   reassociated_depth.image_id,
               "final depth acquisition did not associate the existing image "
               "at the stencil guest address");
@@ -14345,14 +17037,13 @@ public:
                   redirected.images[0].image_id == depth_id &&
                   redirected.images[0].image_view == nullptr &&
                   texture_cache.GetImage(depth_id).binding.is_bound &&
-                  !texture_cache.GetImage(sampled_stencil_id).binding.is_bound,
+                  !texture_cache.GetImage(stencil_proxy_id).binding.is_bound,
               "the established stencil association did not redirect the next "
               "discovery to the depth owner");
       context.GetRenderExecutor().RebindImages(redirected);
       Require(name, "second-pass stencil acquisition",
               redirected.images[0].image_id == depth_id &&
-                  redirected.images[0].image_view != nullptr &&
-                  texture_cache.GetImage(depth_id).usage.texture,
+                  redirected.images[0].image_view != nullptr,
               "RebindImages did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
 
@@ -14409,9 +17100,9 @@ public:
           {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
           stencil_initial);
       Require(name, "stencil fill coverage",
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 0, 1, 1, 0x41u) &&
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 2, 1, 1, 0x41u),
           "incomplete or excessive stencil dispatch was consumed");
       auto &stencil_source = stencil_snapshot.buffers[0];
@@ -14419,12 +17110,12 @@ public:
       stencil_source.dwords[0] = static_cast<uint32_t>(stencil_address);
       stencil_source.dwords[1] = static_cast<uint32_t>(stencil_address >> 32) | (4u << 16);
       Require(name, "stencil fill source alias",
-          !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          !RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 1, 1, 1, 0x41u),
           "an aliased scalar load was consumed as a uniform image clear");
       stencil_source = clean_source;
       Require(name, "stencil IMAGE_STORE clear",
-          RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
+          RenderExecutorTestAccess::TryConsumeComputeFill(executor, stencil_compute,
               scheduler.Current(), 1, 1, 1, 0x41u),
           "captured clear attempted an unsupported depth/stencil storage binding");
       auto stencil_readback = CreateHostBuffer(name, 8,
@@ -14466,7 +17157,7 @@ public:
         plane_depth.info.extent = {3, 2, 1};
         plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
         plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
-        plane_depth.info.mip_layout[0] = {0, plane_size, plane_depth.info.pitch, 2};
+        plane_depth.info.UpdateSize();
         const auto plane_depth_id = texture_cache.FindImage(plane_depth);
         auto sampled_plane = plane_depth;
         sampled_plane.type = BindingType::Texture;
@@ -14477,7 +17168,7 @@ public:
         sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
         sampled_plane.info.bytes_per_block = 1;
         sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
-        sampled_plane.info.mip_layout[0] = {0, plane_size, sampled_plane.info.pitch, 2};
+        sampled_plane.info.UpdateSize();
         sampled_plane.view_info.format = vk::Format::eR8Uint;
         sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
         sampled_plane.view_info.usage = vk::ImageUsageFlagBits::eSampled;
@@ -14531,7 +17222,8 @@ public:
         plane_dependency.memoryBarrierCount = 1;
         plane_dependency.pMemoryBarriers = &plane_barrier;
         const auto write_plane = [&] {
-          executor.FindBuffers(plane_bindings);
+          std::array<PreparedBindings *, 1> stages{&plane_bindings};
+          executor.FindBuffers(stages);
           executor.RebindBuffers(plane_bindings);
           const auto &plane_buffer = plane_bindings.buffers[0];
           const vk::BufferCopy plane_copy{0, plane_buffer.offset, plane_size};
@@ -14727,11 +17419,12 @@ public:
     return std::max(value, 1u);
   }
 
-  static size_t ImageMipDwordCount(u32 width, u32 height, u32 dwords_per_pixel,
+  static size_t ImageMipDwordCount(u32 width, u32 height, vk::Format format,
                                    u32 level, u32 layers = 1) {
-    return static_cast<size_t>(MipExtent(width, level)) *
-           static_cast<size_t>(MipExtent(height, level)) * layers *
-           dwords_per_pixel;
+    const auto block = vk::blockExtent(format);
+    const auto blocks_x = (MipExtent(width, level) + block[0] - 1u) / block[0];
+    const auto blocks_y = (MipExtent(height, level) + block[1] - 1u) / block[1];
+    return (size_t{blocks_x} * blocks_y * layers * vk::blockSize(format) + 3u) / 4u;
   }
 
   Image CreateImageMips(const char *shader_name, u32 width, u32 height,
@@ -14750,7 +17443,8 @@ public:
     ret.height = height;
     ret.layers = layers;
     ret.mip_levels = std::max<u32>(static_cast<u32>(initial_mips.size()), 1u);
-    ret.dwords_per_pixel = dwords_per_pixel;
+    Require(shader_name, "image format size", dwords_per_pixel == (vk::blockSize(format) + 3u) / 4u,
+            "image fixture word size disagrees with its native format");
 
     vk::ImageCreateInfo image_info{};
     image_info.sType = vk::StructureType::eImageCreateInfo;
@@ -14823,13 +17517,13 @@ public:
       size_t total_dwords = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         total_dwords +=
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers);
       }
       std::vector<u32> contents(total_dwords, 0);
       size_t offset = 0;
       for (u32 level = 0; level < ret.mip_levels; level++) {
         const auto level_dwords =
-            ImageMipDwordCount(width, height, dwords_per_pixel, level, layers);
+            ImageMipDwordCount(width, height, format, level, layers);
         const auto &src = initial_mips[level];
         for (size_t i = 0; i < src.size() && i < level_dwords; i++) {
           contents[offset + i] = src[i];
@@ -14869,9 +17563,8 @@ public:
   }
 
   std::vector<u32> ReadImage(const char *shader_name, Image *image) {
-    const auto dword_count = static_cast<size_t>(image->width) *
-                             static_cast<size_t>(image->height) *
-                             image->layers * image->dwords_per_pixel;
+    const auto dword_count = ImageMipDwordCount(image->width, image->height,
+                                               image->format, 0, image->layers);
     auto staging = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
                                    vk::BufferUsageFlagBits::eTransferDst, {});
 
@@ -14948,7 +17641,9 @@ public:
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr,
+                std::span<const Image> image_resources = {},
+                std::span<const vk::Sampler> sampler_resources = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -14958,29 +17653,20 @@ public:
       std::copy_n(test.compute_info.dispatch_threads_num, 3,
                   shader_data.begin() + layout.dispatch_thread_dword);
     }
-    auto Binding = [&](Kind kind) {
-      return ShaderRecompiler::IR::FindBinding(layout, kind);
+    auto Count = [&](Kind kind) {
+      return layout.descriptor_counts[static_cast<size_t>(kind)];
     };
     auto Native = [](Kind kind) {
       return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
     };
-    for (const auto &binding : layout.descriptors) {
-      const auto resource_class =
-          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
-        continue;
-      }
-      const auto &image =
-          compiled.program.info.images.at(binding.resources.front());
+    for (const auto &image : compiled.program.info.images) {
       bool supported =
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
           image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      if (image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+                    image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -15008,11 +17694,10 @@ public:
           item.stageFlags = vk::ShaderStageFlagBits::eCompute;
           layout_bindings.push_back(item);
         };
-    for (const auto &binding : layout.descriptors) {
-      add_layout_binding(ShaderRecompiler::IR::NativeBinding(
-                             ShaderType::Compute, binding.kind),
-                         NativeDescriptorType(binding.kind),
-                         NativeDescriptorCount(binding));
+    for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1) {
+      const auto index = std::countr_zero(mask);
+      const auto kind = static_cast<Kind>(index);
+      add_layout_binding(Native(kind), NativeDescriptorType(kind), layout.descriptor_counts[index]);
     }
 
     vk::DescriptorSetLayoutCreateInfo layout_info{};
@@ -15073,9 +17758,9 @@ public:
       }
       pool_sizes.push_back({type, count});
     };
-    for (const auto &binding : layout.descriptors) {
-      add_pool_size(NativeDescriptorType(binding.kind),
-                    NativeDescriptorCount(binding));
+    for (auto mask = layout.descriptor_mask; mask != 0; mask &= mask - 1) {
+      const auto index = std::countr_zero(mask);
+      add_pool_size(NativeDescriptorType(static_cast<Kind>(index)), layout.descriptor_counts[index]);
     }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
@@ -15100,11 +17785,8 @@ public:
 
     std::vector<vk::WriteDescriptorSet> writes;
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
-    std::vector<vk::DescriptorImageInfo> sampled_infos;
+    std::array<std::vector<vk::DescriptorImageInfo>, ShaderRecompiler::IR::ImageBindingCount> image_infos;
     std::vector<vk::ImageView> sampled_mip_views;
-    std::vector<vk::DescriptorImageInfo> storage_infos;
-    std::vector<vk::DescriptorImageInfo> storage_uint_infos;
-    std::vector<vk::DescriptorImageInfo> storage_atomic_infos;
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
     Buffer user_data_buffer;
@@ -15116,7 +17798,7 @@ public:
     vk::DescriptorBufferInfo bda_pagetable_info{};
     vk::DescriptorBufferInfo fault_buffer_info{};
 
-    if (Binding(Kind::SharedMemory) != nullptr) {
+    if (Count(Kind::SharedMemory) != 0) {
       const auto bytes = uint64_t{test.compute_info.lds_size_dwords} * sizeof(u32) *
           test.dispatch_x * test.dispatch_y * test.dispatch_z;
       shared_buffer = CreateHostBuffer(test.name, bytes, vk::BufferUsageFlagBits::eStorageBuffer, {});
@@ -15130,9 +17812,9 @@ public:
       writes.push_back(write);
     }
 
-    const bool uses_bda = Binding(Kind::BdaPagetable) != nullptr;
+    const bool uses_bda = Count(Kind::BdaPagetable) != 0;
     Require(test.name, "dispatch",
-            uses_bda == (Binding(Kind::FaultBuffer) != nullptr),
+            uses_bda == (Count(Kind::FaultBuffer) != 0),
             "BDA page table and fault buffer must be bound together");
     if (uses_bda) {
       EnsureBdaBuffers(test.name);
@@ -15155,16 +17837,22 @@ public:
       }
     }
 
-    const auto *buffers = Binding(Kind::Buffers);
-    if (buffers != nullptr) {
-      buffer_infos.resize(buffers->resources.size());
-      for (u32 i = 0; i < buffer_infos.size(); i++) {
-        auto &info = buffer_infos[i];
+    if (Count(Kind::Buffers) != 0) {
+      buffer_infos.resize(Count(Kind::Buffers));
+      for (u32 resource = 0; resource < compiled.program.info.buffers.size(); ++resource) {
+        const auto index = compiled.program.info.buffers[resource].descriptor_index;
+        if (index == UINT32_MAX) continue;
+        auto &info = buffer_infos[index];
         info.buffer = buffer.buffer;
         info.offset = 0;
         info.range = buffer.size;
-        if (test.storage_buffer_range_bytes != 0) {
-          const auto resource = buffers->resources[i];
+        if (resource < test.storage_buffer_ranges.size()) {
+          const auto [offset, size] = test.storage_buffer_ranges[resource];
+          info.offset = offset;
+          info.range = size;
+          Require(test.name, "dispatch", uint64_t{offset} + size <= buffer.size,
+                  "storage buffer view exceeds its backing buffer");
+        } else if (test.storage_buffer_range_bytes != 0) {
           const auto offset = resource < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[resource]
                                   : 0u;
@@ -15183,16 +17871,7 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
-    // Shader data carries each storage buffer's bound length in dwords, as
-    // RenderExecutor::RebindBuffers does; shaders bound buffer accesses with it.
-    for (u32 i = 0; i < buffer_infos.size(); i++) {
-      const auto slot = layout.BufferLengthDword() + i;
-      if (slot < shader_data.size()) {
-        shader_data[slot] = static_cast<u32>(buffer_infos[i].range / sizeof(u32));
-      }
-    }
-    if (const auto *flattened = Binding(Kind::FlattenedSrt);
-        flattened != nullptr) {
+    if (Count(Kind::FlattenedSrt) != 0) {
       flattened_buffer =
           CreateStorageBuffer(test.name, compiled.resources.flattened_srt,
                               compiled.resources.flattened_srt.size());
@@ -15206,7 +17885,7 @@ public:
       write.pBufferInfo = &flattened_info;
       writes.push_back(write);
     }
-    if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
+    if (Count(Kind::ShaderData) != 0) {
       user_data_buffer =
           CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
@@ -15219,7 +17898,7 @@ public:
       write.pBufferInfo = &user_data_info;
       writes.push_back(write);
     }
-    if (const auto *gds = Binding(Kind::Gds); gds != nullptr) {
+    if (Count(Kind::Gds) != 0) {
       Require(test.name, "dispatch", gds_buffer != nullptr,
               "GDS descriptor requested but no GDS buffer was provided");
       gds_info = {gds_buffer->buffer, 0, gds_buffer->size};
@@ -15232,109 +17911,67 @@ public:
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
-    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
-    for (const auto &binding : layout.descriptors) {
-      const auto resource_class =
-          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
-        continue;
-      }
-      const auto &image =
-          compiled.program.info.images.at(binding.resources.front());
-      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
-        Require(test.name, "dispatch", sampled == nullptr,
-                "Vulkan test harness needs separate sampled images for mixed "
-                "descriptor classes");
-        sampled = &binding;
-      } else if (image.atomic) {
-        storage_atomic = &binding;
-      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
-        storage = &binding;
-      } else {
-        storage_uint = &binding;
-      }
-    }
-    if (sampled != nullptr) {
-      Require(test.name, "dispatch", sampled_image != nullptr,
-              "sampled image descriptor requested but no sampled image was "
-              "provided");
-      sampled_infos.resize(sampled->resources.size());
-      std::vector<u32> mip_indices(compiled.program.info.images.size());
-      for (u32 slot = 0; slot < sampled_infos.size(); slot++) {
-        auto &info = sampled_infos[slot];
-        info.imageView = sampled_image->view;
-        info.imageLayout = sampled_image->layout;
-        const auto resource = sampled->resources[slot];
-        if (compiled.program.info.images[resource].mip_mode ==
-            ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-          const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
-          Require(test.name, "dispatch", mip < sampled_image->mip_levels,
+    Require(test.name, "dispatch", image_resources.empty() ||
+                image_resources.size() == compiled.program.info.images.size(),
+            "image resources must match the logical images");
+    for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+      const auto &image = compiled.program.info.images[resource];
+      const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
+      auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
+      infos.resize(Count(kind));
+      const bool sampled = image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      const auto *source_image = !image_resources.empty() ? &image_resources[resource]
+          : sampled ? sampled_image
+          : image.numeric_class == Prospero::TextureNumericClass::Float
+              ? storage_image : storage_image_uint;
+      Require(test.name, "dispatch", source_image != nullptr,
+              "image descriptor requested but no matching image was provided");
+      for (u32 mip_index = 0; mip_index < image.mip_count; ++mip_index) {
+        auto &info = infos[image.descriptor_index + mip_index];
+        info.imageView = source_image->view;
+        info.imageLayout = source_image->layout;
+        if (sampled && image.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+          const auto mip = test.sampled_image_view_base_mip + mip_index;
+          Require(test.name, "dispatch", mip < source_image->mip_levels,
                   "sampled mip descriptor exceeds the supplied image");
           vk::ImageViewCreateInfo view{};
-          view.image = sampled_image->image;
+          view.image = source_image->image;
           view.viewType = test.sampled_image_view_type;
-          view.format = sampled_image->format;
+          view.format = source_image->format;
           view.subresourceRange = {
-              vk::ImageAspectFlagBits::eColor, mip, 1,
+              image.depth_compare ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor, mip, 1,
               test.sampled_image_view_base_layer,
               test.sampled_image_view_layers != 0
                   ? test.sampled_image_view_layers
-                  : sampled_image->layers - test.sampled_image_view_base_layer};
+                  : source_image->layers - test.sampled_image_view_base_layer};
           RequireVk(test.name, "dispatch",
                     m_device.createImageView(&view, nullptr, &info.imageView),
                     "vkCreateImageView(sampled mip)");
           sampled_mip_views.push_back(info.imageView);
         }
       }
+    }
+    for (u32 group = 0; group < image_infos.size(); ++group) {
+      const auto &infos = image_infos[group];
+      if (infos.empty()) continue;
+      const auto kind = static_cast<Kind>(ShaderRecompiler::IR::FirstImageBinding + group);
       vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
-      write.dstBinding = Native(sampled->kind);
-      write.descriptorCount = static_cast<u32>(sampled_infos.size());
-      write.descriptorType = vk::DescriptorType::eSampledImage;
-      write.pImageInfo = sampled_infos.data();
+      write.dstBinding = Native(kind);
+      write.descriptorCount = static_cast<u32>(infos.size());
+      write.descriptorType = NativeDescriptorType(kind);
+      write.pImageInfo = infos.data();
       writes.push_back(write);
     }
-    const auto BindStorage =
-        [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
-            const Image *image, std::vector<vk::DescriptorImageInfo> *infos) {
-          if (binding == nullptr) {
-            return;
-          }
-          Require(
-              test.name, "dispatch", image != nullptr,
-              "storage image descriptor requested but no matching image was "
-              "provided");
-          infos->resize(binding->resources.size());
-          for (auto &info : *infos) {
-            info.imageView = image->view;
-            info.imageLayout = image->layout;
-          }
-          vk::WriteDescriptorSet write{};
-          write.sType = vk::StructureType::eWriteDescriptorSet;
-          write.dstSet = descriptor_set;
-          write.dstBinding = Native(binding->kind);
-          write.descriptorCount = static_cast<u32>(infos->size());
-          write.descriptorType = vk::DescriptorType::eStorageImage;
-          write.pImageInfo = infos->data();
-          writes.push_back(write);
-        };
-    BindStorage(storage, storage_image, &storage_infos);
-    BindStorage(storage_uint, storage_image_uint, &storage_uint_infos);
-    BindStorage(storage_atomic, storage_image_uint, &storage_atomic_infos);
-    const auto *samplers = Binding(Kind::Samplers);
-    if (samplers != nullptr) {
-      Require(test.name, "dispatch", sampler != nullptr,
-              "sampler descriptor requested but no sampler was provided");
-      sampler_infos.resize(samplers->resources.size());
-      for (auto &info : sampler_infos) {
-        info.sampler = sampler;
+    if (Count(Kind::Samplers) != 0) {
+      Require(test.name, "dispatch", sampler_resources.empty()
+                  ? sampler != nullptr : sampler_resources.size() == Count(Kind::Samplers),
+              "sampler resources must match the native sampler array");
+      sampler_infos.resize(Count(Kind::Samplers));
+      for (u32 index = 0; index < sampler_infos.size(); ++index) {
+        sampler_infos[index].sampler = sampler_resources.empty() ? sampler : sampler_resources[index];
       }
       vk::WriteDescriptorSet write{};
-      write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
       write.dstBinding = Native(Kind::Samplers);
       write.descriptorCount = static_cast<u32>(sampler_infos.size());
@@ -15410,7 +18047,7 @@ public:
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
-    if (buffers != nullptr) {
+    if (Count(Kind::Buffers) != 0) {
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -15440,7 +18077,30 @@ public:
                           vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
                           &barrier, 0, nullptr);
     }
+    Buffer fault_result;
+    if (test.fault_free_address) {
+      Require(test.name, "fault check", uses_bda, "fault check requires BDA");
+      fault_result = CreateHostBuffer(test.name, sizeof(u32),
+                                     vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::MemoryBarrier ready{
+          .srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0, nullptr);
+      const vk::BufferCopy region{(BufferCache::PageIndex(*test.fault_free_address) >> 5u) * sizeof(u32),
+                                   0, sizeof(u32)};
+      cmd.copyBuffer(m_fault_buffer.buffer, fault_result.buffer, 1, &region);
+      const vk::MemoryBarrier readable{.srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                                        .dstAccessMask = vk::AccessFlagBits::eHostRead};
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+                          {}, 1, &readable, 0, nullptr, 0, nullptr);
+    }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (test.fault_free_address) {
+      Require(test.name, "fault check", ReadBuffer(test.name, fault_result, 1)[0] == 0u,
+              "suppressed formatted access touched an unmapped page");
+      DestroyBuffer(&fault_result);
+    }
     for (const auto view : sampled_mip_views) {
       m_device.destroyImageView(view, nullptr);
     }
@@ -15482,6 +18142,7 @@ public:
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
+    constexpr uint64_t index_address = rect_address + 0x1000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -15489,6 +18150,7 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
     scheduler.Begin(registers, user_config, shaders);
     auto &resources = context;
     auto &cache = context.GetTextureCache();
@@ -15524,6 +18186,8 @@ public:
           -0.75f,  0.75f, 0, 0, 0, 1, 0, 0};
       std::memcpy(reinterpret_cast<void *>(rect_address), rect_vertices.data(),
                   sizeof(rect_vertices));
+      constexpr std::array<uint32_t, 3> indices{0, 1, 2};
+      std::memcpy(reinterpret_cast<void *>(index_address), indices.data(), sizeof(indices));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -15535,7 +18199,7 @@ public:
       depth.desc.info.pitch = 64;
       depth.desc.info.bytes_per_block = 4;
       depth.desc.info.tile_mode = Prospero::TileMode::kLinear;
-      depth.desc.info.mip_layout[0] = {0, 256 * extent, 64, extent};
+      depth.desc.info.UpdateSize();
       depth.desc.view_info.format = depth.desc.info.pixel_format;
       depth.desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
       depth.desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
@@ -15613,7 +18277,10 @@ public:
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
     color.desc.info.data = {depth_address + 0x10000, extent * extent * 16};
-    color.desc.info.mip_layout[0] = {0, color.desc.info.data.size, extent, extent};
+    color.desc.info.mip_layout[0] = {
+        0, color.desc.info.data.size, extent, extent, 0, color.desc.info.data.size, extent};
+    color.desc.info.tiling.block.bytes_per_element = 16;
+    color.desc.info.linear_slice_stride = color.desc.info.data.size;
     color.desc.info.pixel_format = vk::Format::eR32G32B32A32Sfloat;
     color.desc.info.guest_format = Prospero::BufferFormat::k32_32_32_32Float;
     color.desc.info.extent = {extent, extent, 1};
@@ -15696,30 +18363,13 @@ public:
       cmd.setDepthTestEnable(depth.depth_test_enable);
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
-      cmd.setDepthBiasEnable(false);
-      if (PipelineDynamicRasterStateEnabled()) {
-        // As SetGraphicsDynamicParams: the cull and front-face registers are dynamic state.
-        const auto &mode = registers.GetModeControl();
-        const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-        vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
-        if (!rect_list && mode.cull_back) {
-          cull_mode |= vk::CullModeFlagBits::eBack;
-        }
-        if (!rect_list && mode.cull_front) {
-          cull_mode |= vk::CullModeFlagBits::eFront;
-        }
-        cmd.setCullMode(cull_mode);
-        cmd.setFrontFace(mode.face ? vk::FrontFace::eClockwise
-                                   : vk::FrontFace::eCounterClockwise);
 #if !defined(__APPLE__)
-        const bool bounds_test = depth.depth_bounds_test_enable &&
-                                 rendering.depth_stencil_attachment.has_depth;
-        cmd.setDepthBoundsTestEnable(bounds_test ? VK_TRUE : VK_FALSE);
-        if (bounds_test) {
-          cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
-        }
-#endif
+      cmd.setDepthBoundsTestEnable(depth.depth_bounds_test_enable);
+      if (depth.depth_bounds_test_enable) {
+        cmd.setDepthBounds(registers.GetDepthBoundsMin(), registers.GetDepthBoundsMax());
       }
+#endif
+      cmd.setDepthBiasEnable(false);
       cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
         const auto set_stencil = [&](vk::StencilFaceFlagBits face,
@@ -15773,6 +18423,26 @@ public:
                           std::bit_cast<uint32_t>(initial_depth(x, y) + 0.375f) &&
                       stored_depth[index] == repeated_pixels[index * 4],
                   "depth feedback lost a prior write or the read-only draw changed depth");
+        }
+      }
+      depth.depth_test_enable = false;
+      for (uint32_t pass = 0; pass < 3; pass++) {
+        depth.depth_bounds_test_enable = pass != 2;
+        registers.SetDepthBoundsMin(pass == 0 ? 0.5f : 0.625f);
+        registers.SetDepthBoundsMax(pass == 0 ? 0.5625f : 0.6875f);
+        Require(name, "dynamic depth bounds pipeline reuse",
+                pipeline(true, 2, 2).pipeline == filled.pipeline,
+                "changing depth bounds or their enable state created another pipeline");
+        draw(filled);
+        const auto bounded_pixels = read_color();
+        for (size_t index = 0; index < stored_depth.size(); index++) {
+          const auto z = std::bit_cast<float>(stored_depth[index]);
+          const bool passes = !depth.depth_bounds_test_enable ||
+                              (z >= registers.GetDepthBoundsMin() &&
+                               z <= registers.GetDepthBoundsMax());
+          Require(name, "dynamic stored-depth bounds",
+                  bounded_pixels[index * 4] == (passes ? stored_depth[index] : 0u),
+                  "depth bounds did not filter stored depth independently of the depth test");
         }
       }
     } else {
@@ -16049,6 +18719,60 @@ public:
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
 
+      static const auto waterfall_vertex = [&] {
+        std::vector<u32> code;
+        AppendVMovU32(&code, 9, 0);
+        // d3e1ae284c4dea3b reconstructs EXEC twice from packed NGG s3.
+        code.insert(code.end(), {0xbefe04c1u, 0x906a8803u, 0x81ea6a80u,
+                                 0x90fe6ac1u, 0x81ea0380u, 0x90fe6ac1u,
+                                 EncodeSop1(0x04, 10, 126)});
+        const auto loop = code.size();
+        code.push_back(EncodeSop1(0x14, 4, 10));
+        AppendVop3(&code, 0x360, 6, Vgpr(5), 4);
+        code.push_back(EncodeVopc(0xc2, 6, 5));
+        code.push_back(EncodeSop1(0x24, 18, 106));
+        AppendVMovLiteral(&code, 9, 0x3f800000u);
+        code.push_back(EncodeSop2(0x15, 10, 10, 106));
+        code.push_back(EncodeSop1(0x04, 126, 18));
+        code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+        const auto base = code.size();
+        code.insert(code.end(), native_vertex.begin(), native_vertex.end());
+        const auto position = std::find(code.begin() + base, code.end(), EncodeExp0(0x0c, 0xf));
+        // Unprocessed vertices keep W=0, making waterfall progress observable.
+        *(position + 1) = EncodeExp1(3, 4, 0, 9);
+        return code;
+      }();
+      native_vertex_regs.es_regs.data_addr = reinterpret_cast<uint64_t>(waterfall_vertex.data());
+      ShaderMapUserData(native_vertex_regs.es_regs.data_addr,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<u32>(waterfall_vertex.size() * sizeof(u32))});
+      registers.SetPsInControl(0x8008);
+      const auto saved_stages = registers.GetShaderStages();
+      for (const u32 wave : {32u, 64u}) {
+        registers.SetShaderStages((saved_stages & ~0x00400000u) |
+                                   (wave == 32u ? 0x00400000u : 0u));
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        vertex_shader = programs.vertex[0];
+        pixel_shader = programs.pixel;
+        vertex = native_vertex_info[0];
+        Require(name, "native NGG waterfall wave",
+                vertex.stage.program->stage == ShaderType::Vertex &&
+                    vertex.stage.program->wave_size == wave,
+                "NGG waterfall bypassed the native vertex path or lost its guest wave width");
+        for (const u32 count : {3u, 6u, 33u}) {
+          draw(pipeline(true, 2, 2), count);
+          const auto pixels = read_color();
+          for (size_t component = 0; component < pixels.size(); ++component)
+            Require(name, "NGG partial-wave waterfall output",
+                    pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "native vertex waterfall did not terminate with every input vertex processed");
+        }
+      }
+      registers.SetShaderStages(saved_stages);
+      native_vertex_regs.es_regs.data_addr = vertex_address;
+
       // Reversed RGBA targets must use logical Sa for RGB, with a separate
       // zero or unit source factor for separate alpha attenuation or accumulation.
       static const auto blend_pixel = [] {
@@ -16229,11 +18953,12 @@ public:
         registers.SetColorAttrib2(slot, {.height = side - 1, .width = side - 1});
         registers.SetColorAttrib3(slot,
             {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
-        registers.SetTargetOutputMode(slot, 4);
       }
+      registers.SetTargetOutputMode(0, 4);
+      registers.SetTargetOutputMode(1, 4);
       stencil_target.z_info.htile_acceleration = true;
       stencil_target.htile_data_base_addr = depth_address + 0x30000;
-      registers.SetDepthRenderTarget(stencil_target);
+      registers.SetStencilClearValue(5);
       registers.SetDepthClearValue(1);
       stencil_control = {};
       stencil_control.stencil_enable = true;
@@ -16243,35 +18968,60 @@ public:
       registers.SetStencilMask({0x80, 0, 0x80, 1, 0x80, 0, 0x80, 1});
       user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
       shaders.SetEsShaderBase(vertex_address);
-      for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
-        const auto &code = null_pixels[discard];
-        const auto address = reinterpret_cast<uint64_t>(code.data());
-        ShaderMapUserData(address,
-            {.type = Prospero::ShaderBinaryType::kPs,
-             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
-        shaders.SetPsShaderBase(address);
-        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
-        (void)cache.FindDepthTarget(depth.image_id, depth.desc);
-        vk::ClearValue zero{};
-        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
-            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
-             0, 1, 0, 1}, zero);
-        Require(name, "pending stencil-pass HTile clear",
-                cache.ClearMeta(stencil_target.htile_data_base_addr),
-                "the stencil pass did not retain its HTile metadata");
-        RenderExecutorTestAccess::DrawAuto(
-            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
-        const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
-                                                  {}, {extent, extent, 1});
-        Require(name, "NULL-export full depth clear",
-                std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
-                "an unexported color target clipped the pending depth clear");
-        const auto stencil = read_stencil();
-        const auto expected = discard == 0 ? 0x80808080u : 0u;
-        Require(name, "NULL-export stencil coverage and discard",
-                std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
-                "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+      // Compressed metadata clears stencil; an uncompressed plane and an explicit
+      // depth-only clear preserve its previous contents. Match Suikoden's stale mask 2.
+      for (uint32_t clear_mode = 0; clear_mode < 3; clear_mode++) {
+        stencil_target.stencil_info.htile_stencil_disabled = clear_mode == 0;
+        registers.SetDepthRenderTarget(stencil_target);
+        registers.SetRenderControl({.depth_clear_enable = clear_mode == 2});
+        for (uint32_t discard = 0; discard < null_pixels.size(); discard++) {
+          const auto &code = null_pixels[discard];
+          const auto address = reinterpret_cast<uint64_t>(code.data());
+          ShaderMapUserData(address,
+              {.type = Prospero::ShaderBinaryType::kPs,
+               .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+          shaders.SetPsShaderBase(address);
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+          (void)cache.FindDepthTarget(depth.image_id, depth.desc);
+          vk::ClearValue zero{};
+          zero.depthStencil.stencil = 2;
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+              {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+               0, 1, 0, 1}, zero);
+          Require(name, "pending stencil-pass HTile clear",
+                  clear_mode == 2
+                      ? cache.TouchMeta(stencil_target.htile_data_base_addr, 0, false)
+                      : cache.ClearMeta(stencil_target.htile_data_base_addr),
+                  "the stencil pass did not retain its HTile metadata");
+          RenderExecutorTestAccess::DrawAuto(
+              executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+          const auto depth_pixels = ReadCachedTexel(name, context, depth.image_id,
+                                                    {}, {extent, extent, 1});
+          Require(name, "NULL-export full depth clear",
+                  std::ranges::all_of(depth_pixels, [](u32 v) { return v == 0x3f800000u; }),
+                  "an unexported color target clipped the pending depth clear");
+          const auto stencil = read_stencil();
+          const auto cleared = clear_mode == 1 ? 0x05050505u : 0x02020202u;
+          const auto expected = cleared | (discard == 0 ? 0x80808080u : 0u);
+          Require(name, "NULL-export stencil coverage and discard",
+                  std::ranges::all_of(stencil, [=](u32 v) { return v == expected; }),
+                  "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
+          Require(name, "HTile clear consumed once",
+                  !cache.IsMetaCleared(stencil_target.htile_data_base_addr, 0),
+                  "the draw retained a pending metadata clear");
+          if (clear_mode == 1 && discard == 1) {
+            zero.depthStencil.stencil = 9;
+            TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+                {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, zero);
+            RenderExecutorTestAccess::DrawAuto(
+                executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+            Require(name, "consumed HTile clear preserves later stencil",
+                    std::ranges::all_of(read_stencil(), [](u32 v) { return v == 0x09090909u; }),
+                    "a consumed metadata clear ran again on the next draw");
+          }
+        }
       }
+      registers.SetRenderControl({});
 
       // A depth-only draw retains the previous PS address and write masks, but
       // SPI_SHADER_COL_FORMAT disables its exports. Compiling this stale PS
@@ -16292,7 +19042,7 @@ public:
       registers.SetDepthShaderControl({});
       registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
                                 .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
-      for (const auto slot : {0u, 3u}) {
+      for (const auto slot : {0u, 1u}) {
         registers.SetTargetOutputMode(slot, 0);
       }
       RenderExecutorTestAccess::DrawAuto(
@@ -16303,35 +19053,216 @@ public:
               std::ranges::all_of(depth_only_pixels, [](u32 v) { return v == 0; }),
               "disabled color exports invoked the stale PS or clipped fixed-function depth");
       registers.SetPsInControl(0x8000);
-      for (const auto slot : {0u, 3u}) {
-        registers.SetTargetOutputMode(slot, 4);
-      }
+      registers.SetTargetOutputMode(0, 4);
 
-      // With MRT0 still bound, an MRT3-only export must retain location3 in
-      // rendering attachments, pipeline formats, blend masks and dynamic write enables.
-      static const auto sparse_pixel = [] {
-        auto code = native_pixel;
-        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
-        return code;
+      // Export ordinals follow CB_SHADER_MASK. A disabled CB_TARGET_MASK slot
+      // still consumes an ordinal, and stale MRT0 must not clip physical MRT3.
+      static const auto sparse_pixels_code = [] {
+        std::array<std::vector<u32>, 2> result{native_pixel, native_pixel};
+        auto &code = result[1];
+        const auto exp = std::ranges::find(code, EncodeExp0(0, 0xf));
+        *exp = EncodeExp0(0, 0xf, false);
+        *(exp + 1) = EncodeExp1(0, 0, 0, 0);
+        code.insert(exp + 2, {EncodeExp0(1, 0xf), EncodeExp1(1, 1, 1, 2)});
+        return result;
       }();
-      const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
-      ShaderMapUserData(sparse_address,
-          {.type = Prospero::ShaderBinaryType::kPs,
-           .code_size_bytes = static_cast<uint32_t>(sparse_pixel.size() * sizeof(u32))});
-      shaders.SetPsShaderBase(sparse_address);
+      registers.SetRenderTargetMask(0xf000);
       registers.SetDepthControl({});
       registers.SetDepthShaderControl({});
-      RenderExecutorTestAccess::DrawAuto(
-            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
       RenderColorInfo sparse_color{};
-      RenderExecutorTestAccess::ResolveRenderColorTarget(
-          executor, scheduler.Current(), sparse_color, 3);
-      const auto sparse_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
-                                                {}, {extent, extent, 1});
-      for (size_t component = 0; component < sparse_pixels.size(); component++) {
-        const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
-        Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
-                "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      for (uint32_t index = 0; index < sparse_pixels_code.size(); index++) {
+        const auto &code = sparse_pixels_code[index];
+        const auto address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(address,
+            {.type = Prospero::ShaderBinaryType::kPs,
+             .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+        shaders.SetPsShaderBase(address);
+        registers.SetShaderMask(index == 0 ? 0xf000 : 0xf00f);
+        registers.SetTargetOutputMode(1, index == 0 ? 0 : 4);
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), sparse_color, 3);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
+          Require(name, "compact export to sparse MRT3", pixels[component] == expected,
+                  "shader output routing used the write mask or clipped MRT3 with stale MRT0");
+        }
+      }
+
+      static const auto snorm_pixel = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 0, 0xc0008000u);
+        AppendVMovLiteral(&code, 1, 0x7fff4000u);
+        code.insert(code.end(), {EncodeExp0(0, 0xf, true, true), EncodeExp1(0, 1, 0, 0)});
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto snorm_address = reinterpret_cast<uint64_t>(snorm_pixel.data());
+      ShaderMapUserData(snorm_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(snorm_pixel.size() * sizeof(u32))});
+      shaders.SetPsShaderBase(snorm_address);
+      registers.SetShaderMask(0xf000);
+      registers.SetTargetOutputMode(0, 6);
+      registers.SetTargetOutputMode(1, 0);
+      RenderExecutorTestAccess::DrawAuto(
+          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      const auto snorm_pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+      constexpr std::array<float, 4> snorm_expected{-1, -16384.0f / 32767,
+                                                    16384.0f / 32767, 1};
+      for (size_t component = 0; component < snorm_pixels.size(); component++) {
+        Require(name, "compressed SNORM16 color export",
+                std::abs(std::bit_cast<float>(snorm_pixels[component]) -
+                         snorm_expected[component % 4]) < 0.00001f,
+                "SNORM16 export lost its sign, normalization or negative endpoint clamp");
+      }
+      registers.SetTargetOutputMode(0, 4);
+
+      // Indirect arguments also reach s8/s9. Native VS prologs must add them
+      // exactly once, for both indexed and automatically generated indices.
+      static const auto indirect_vertex = [&] {
+        auto code = native_vertex;
+        for (auto &word : code) {
+          if (word == EncodeVopc(0xc2, InlineU32(1), 5))
+            word = EncodeVopc(0xc2, InlineU32(8), 5);
+          else if (word == EncodeVopc(0xc2, InlineU32(2), 5))
+            word = EncodeVopc(0xc2, InlineU32(9), 5);
+        }
+        code.insert(code.begin(), {EncodeVop2(0x25, 5, 8, 5),
+                                   EncodeVop2(0x25, 8, 9, 8)});
+        const auto position = std::ranges::find(code, EncodeExp0(0x0c, 0xf));
+        code.insert(position, {EncodeVopc(0xc2, InlineU32(5), 8),
+                               EncodeVop2(0x01, 3, Vgpr(1), 3),
+                               EncodeVop2(0x01, 4, Vgpr(1), 4)});
+        return code;
+      }();
+      const auto indirect_vs = reinterpret_cast<uint64_t>(indirect_vertex.data());
+      ShaderMapUserData(indirect_vs,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<uint32_t>(indirect_vertex.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(indirect_vs);
+      shaders.SetPsShaderBase(pixel_address);
+      shaders.SetGsShaderResource2({.user_sgpr = 2});
+      shaders.SetGsUserSgpr(0, 7, HW::UserSgprType::Unknown);
+      shaders.SetGsUserSgpr(1, 5, HW::UserSgprType::Unknown);
+      user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+      for (const bool indexed : {false, true}) {
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        if (indexed) {
+          RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+              {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+               .instance_count = 1, .index_type_and_size = 1, .base_vertex = 7, .first_instance = 5,
+               .offset_source = DrawOffsetSource::IndirectArgs});
+        } else {
+          RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+              {.vertex_count = 3, .instance_count = 1, .first_vertex = 7, .first_instance = 5,
+               .offset_source = DrawOffsetSource::IndirectArgs});
+        }
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (size_t component = 0; component < pixels.size(); component++) {
+          Require("NativeIndirectDrawOffsets", indexed ? "indexed" : "auto",
+                  pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                  "native vertex or instance offset was applied twice");
+        }
+      }
+
+      // Indirect records come from the GPU copy; the CPU backing holds zeros. In each pair the
+      // first record draws nothing and the second covers the target, through vertex offset 7
+      // for embedded fetches.
+      {
+        constexpr uint64_t vertices_address = depth_address + 0x38000;
+        constexpr uint64_t args_address = vertices_address + 0x100;
+        std::array<float, 40> positions{};
+        constexpr std::array<float, 12> triangle{-1, -1, 0, 1, 3, -1, 0, 1, -1, 3, 0, 1};
+        std::ranges::copy(triangle, positions.begin() + 28);
+        std::memcpy(reinterpret_cast<void *>(vertices_address), positions.data(),
+                    sizeof(positions));
+        constexpr uint32_t stride = 32;
+        const vk::DrawIndexedIndirectCommand indexed_records[]{
+            {3, 1, 0, 0, 5}, {3, 1, 0, 7, 5}, {0, 1, 0, 0, 0}, {3, 1, 0, 0, 0}};
+        const vk::DrawIndirectCommand auto_records[]{{3, 1, 0, 5}, {3, 1, 7, 5}, {0, 1, 0, 0},
+                                                     {3, 1, 0, 0}};
+        for (u32 i = 0; i < 4; i++) {
+          std::memcpy(reinterpret_cast<void *>(args_address + i * stride), &indexed_records[i],
+                      sizeof(indexed_records[i]));
+          std::memcpy(reinterpret_cast<void *>(args_address + (4 + i) * stride), &auto_records[i],
+                      sizeof(auto_records[i]));
+        }
+        // Larger than a caching page, so the arguments are cached instead of streamed.
+        (void)context.GetBufferCache().ObtainBuffer(
+            vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
+        const std::array<u32, 8 * stride / 4> zeros{};
+        Require("GpuIndirectDraw", "CPU backing",
+                LibKernel::Memory::TryWriteBacking(args_address, zeros.data(), sizeof(zeros)),
+                "the CPU copy of the arguments could not be cleared");
+        static const auto fetch_vertex = [] {
+          std::vector<u32> code{EncodeSMovB32(0, InlineU32(0)), EncodeSmem0(0x02u, 20, 4),
+                                EncodeSmem1(0), EncodeVop2(0x01u, 0, Vgpr(8), 5),
+                                EncodeMubuf0(0x03u, 0, true), EncodeMubuf1(9, 5, 0),
+                                EncodeExp0(0x0c, 0xf), EncodeExp1(9, 10, 11, 12)};
+          code.insert(code.end(), std::ranges::find(native_vertex, EncodeExp0(0x20, 0xf)),
+                      native_vertex.end());
+          return code;
+        }();
+        static std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1>
+            fetch_offsets;
+        fetch_offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+        fetch_offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+        static ShaderUserData fetch_user_data{
+            .direct_resource_offset = fetch_offsets.data(),
+            .direct_resource_count = static_cast<uint16_t>(fetch_offsets.size())};
+        static ShaderSemantic semantic{.hardware_mapping = 9, .size_in_elements = 4};
+        static const uint32_t vertex_buffer[]{
+            static_cast<u32>(vertices_address),
+            static_cast<u32>(vertices_address >> 32u) | (16u << 16u), 10,
+            DstSel(4, 5, 6, 7) |
+                (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 12u)};
+        static const uint32_t attribute =
+            static_cast<u32>(Prospero::VertexAttribFormat::k32_32_32_32Float) << 5u;
+        const auto fetch_vs = reinterpret_cast<uint64_t>(fetch_vertex.data());
+        ShaderMapUserData(fetch_vs,
+            {.type = Prospero::ShaderBinaryType::kGs, .user_data = &fetch_user_data,
+             .input_semantics = &semantic, .num_input_semantics = 1,
+             .code_size_bytes = static_cast<uint32_t>(fetch_vertex.size() * sizeof(u32))});
+        const uint64_t tables[]{reinterpret_cast<uint64_t>(vertex_buffer),
+                                reinterpret_cast<uint64_t>(&attribute)};
+        shaders.SetGsShaderResource2({.user_sgpr = 4});
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)),
+                                HW::UserSgprType::Unknown);
+        }
+        const auto check = [&](const char *step, uint64_t vertex_shader, bool indexed, u32 first) {
+          shaders.SetEsShaderBase(vertex_shader);
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+          const DrawIndirectArgs records{args_address + first * stride, 2, stride};
+          const bool drawn = indexed
+              ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
+                    {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
+                     .index_type_and_size = 1, .indirect = records})
+              : RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                   {.indirect = records});
+          const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                              {}, {extent, extent, 1});
+          for (size_t component = 0; component < pixels.size(); component++) {
+            Require("GpuIndirectDraw", step,
+                    drawn && pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    "the draw did not take every record, offsets included, from the GPU");
+          }
+        };
+        check("indexed embedded fetch", fetch_vs, true, 0);
+        check("auto embedded fetch", fetch_vs, false, 4);
+        check("indexed native fetch", vertex_address, true, 2);
+        check("auto native fetch", vertex_address, false, 6);
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
@@ -16359,7 +19290,7 @@ public:
         }
         AppendVMovU32(&code, 22, 0);
         AppendVMovLiteral(&code, 23, 0x3f800000u);
-        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        code.insert(code.end(), {EncodeExp0(0, 0xf), EncodeExp1(20, 21, 22, 23)});
         AppendEnd(&code);
         return code;
       }();
@@ -16409,6 +19340,175 @@ public:
           }
         }
       }
+      // Captured format30 uses uncompressed mode9 at MRT2. Keep a blended
+      // floating-point MRT live beside it, including sparse export routing.
+      constexpr uint64_t packed_address = depth_address + 0x28000;
+      static const auto packed_pixels = [] {
+        std::array<std::vector<u32>, 2> result;
+        constexpr std::array<std::array<u32, 3>, 2> inputs{{
+            {0x3aa01403u, 0x3ae01c04u, 0x3c282a0bu}, // just above 2.5/3.5/10.5 LSB
+            {0xbf800000u, 0x40000000u, 0x3e800000u}}};
+        for (u32 i = 0; i < result.size(); ++i) {
+          auto &code = result[i];
+          for (u32 component = 0; component < 3; ++component)
+            AppendVMovLiteral(&code, component, inputs[i][component]);
+          AppendVMovLiteral(&code, 4, 0x38004400u); // FP16 RG: 4, 0.5
+          AppendVMovLiteral(&code, 5, 0x4000bc00u); // FP16 BA: -1, 2
+          for (u32 ordinal = 0; ordinal < 7; ++ordinal) {
+            code.push_back(EncodeExp0(ordinal, 0xf, ordinal == 6, ordinal != 2));
+            code.push_back(ordinal == 2 ? EncodeExp1(0, 1, 2, 0) : EncodeExp1(4, 5, 0, 0));
+          }
+          AppendEnd(&code);
+        }
+        return result;
+      }();
+      TestCase packed_read;
+      packed_read.name = "PackedUnormRenderTargetRead";
+      packed_read.has_user_data = true;
+      packed_read.image_descriptor_swizzle = DstSel(4, 5, 6, 1);
+      const ShaderTextureResource packed_descriptor{{static_cast<u32>(packed_address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k11_11_10UNorm) << 20u) | (3u << 30u),
+          ((extent - 1u) >> 2u) | ((extent - 1u) << 14u),
+          packed_read.image_descriptor_swizzle |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0, 0x00700000u, 0, 0}};
+      std::copy_n(packed_descriptor.fields, 8, packed_read.user_data.begin());
+      packed_read.user_data[8] = 0x92u;
+      packed_read.user_data[9] = 0x00fff000u;
+      packed_read.user_data[10] = 0x0a500000u; // Existing packed-UNorm bilinear clamp contract.
+      packed_read.user_data[50] = 8 * sizeof(u32);
+      AppendVMovU32(&packed_read.code, 20, extent / 2);
+      AppendVMovU32(&packed_read.code, 21, extent / 2);
+      packed_read.code.insert(packed_read.code.end(),
+          {EncodeMimg0(0x00, 0xf), EncodeMimg1(0, 20)});
+      AppendVMovLiteral(&packed_read.code, 20, 0x3f000000u);
+      AppendVMovLiteral(&packed_read.code, 21, 0x3f000000u);
+      packed_read.code.insert(packed_read.code.end(),
+          {EncodeMimg0(0x27, 0xf), EncodeMimg1(4, 20, 0, 2)});
+      for (u32 component = 0; component < 8; ++component)
+        AppendStoreVgpr(&packed_read.code, component, component);
+      AppendEnd(&packed_read.code);
+      const auto packed_reader = CompileCase(packed_read, SubgroupSize());
+      auto packed_output = CreateStorageBuffer(name, {}, 8);
+      const auto packed_sampler = CreateSampler(name);
+      uint64_t half_up_program = 0, truncate_program = 0;
+      struct PackedDraw { u32 slot, wave; bool truncate, clamp; };
+      for (const auto test : {PackedDraw{2, 64, false, false}, {2, 64, true, false},
+                              {2, 64, false, false}, {3, 32, false, false},
+                              {3, 32, false, true}}) {
+        const u32 float_slot = test.slot == 2 ? 6 : 7;
+        registers.Reset();
+        registers.SetViewportTransformControl(0x300);
+        registers.SetViewportScaleOffset(0, extent / 2, extent / 2,
+                                         extent / 2, extent / 2, 1, 0);
+        registers.SetViewportZMax(0, 1);
+        registers.SetScreenScissor(0, 0, extent, extent);
+        registers.SetWindowScissor(0, 0, extent, extent, false);
+        registers.SetGenericScissor(0, 0, extent, extent, false);
+        registers.SetViewportScissor(0, 0, 0, extent, extent, false);
+        registers.SetRenderTargetMask((7u << (4u * test.slot)) | (0xfu << (4u * float_slot)));
+        registers.SetShaderMask(test.slot == 2 ? 0x0fffffffu : 0xfffff0ffu);
+        registers.SetPsInControl(test.wave == 32 ? 0x8000 : 0);
+        constexpr std::array<u32, 7> modes{4, 4, 9, 5, 4, 4, 4};
+        for (u32 ordinal = 0; ordinal < modes.size(); ++ordinal)
+          registers.SetTargetOutputMode(ordinal, modes[ordinal]);
+        for (const auto slot : {test.slot, float_slot}) {
+          const bool packed = slot == test.slot;
+          registers.SetColorBase(slot, {.addr = packed ? packed_address : depth_address + 0x10000});
+          registers.SetColorInfo(slot,
+              {.blend_clamp = packed, .round_mode = packed && test.truncate,
+               .format = packed ? Prospero::ChannelLayout::k11_11_10
+                                : Prospero::ChannelLayout::k32_32_32_32,
+               .channel_type = packed ? Prospero::ChannelType::kUNorm : Prospero::ChannelType::kFloat,
+               .channel_order = Prospero::ChannelOrder::kStandard});
+          registers.SetColorAttrib2(slot, {.height = extent - 1, .width = extent - 1});
+          registers.SetColorAttrib3(slot, {.tile_mode = Prospero::TileMode::kLinear, .dimension = 1});
+        }
+        HW::BlendControl additive{};
+        additive.enable = true;
+        additive.color_srcblend = additive.color_destblend =
+            additive.alpha_srcblend = additive.alpha_destblend =
+                static_cast<uint8_t>(Prospero::BlendFactor::kOne);
+        registers.SetBlendControl(float_slot, additive);
+        const auto &code = packed_pixels[test.clamp];
+        const auto ps_address = reinterpret_cast<uint64_t>(code.data());
+        ShaderMapUserData(ps_address, {.type = Prospero::ShaderBinaryType::kPs,
+            .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+        shaders.SetEsShaderBase(vertex_address);
+        shaders.SetGsShaderResource2({});
+        shaders.SetPsShaderBase(ps_address);
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+        native_vertex_regs.es_regs.data_addr = vertex_address;
+        native_pixel_regs.ps_regs.data_addr = ps_address;
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(),
+            registers, user_config, export_mapping, true, native_vertex_info, pixel);
+        Require(name, "packed format follows export ordinal",
+                pixel.target_output_mode[2] == 9 && pixel.wave_size == test.wave &&
+                    pixel.target_packed_unorm_mask == 4u &&
+                    pixel.target_round_mode == (test.truncate ? 4u : 0u),
+                "packed conversion or rounding contaminated another MRT or followed a physical slot");
+        if (test.slot == 2) {
+          auto &id = test.truncate ? truncate_program : half_up_program;
+          Require(name, "packed rounding program reuse", id == 0 || id == programs.pixel.id,
+                  "restoring half-up rounding failed to reuse its program");
+          id = programs.pixel.id;
+        }
+        RenderColorInfo packed_target{}, float_target{};
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), packed_target, test.slot);
+        RenderExecutorTestAccess::ResolveRenderColorTarget(
+            executor, scheduler.Current(), float_target, float_slot);
+        Require(name, "packed target storage", packed_target.desc.info.bytes_per_block == 4 &&
+                    packed_target.desc.info.pixel_format == vk::Format::eR32Uint,
+                "packed target expanded its physical storage or used floating-point bit encoding");
+        vk::ClearValue packed_clear{}, float_clear{};
+        packed_clear.color.uint32[0] = 0xdeadbeefu;
+        float_clear.color.float32 = std::array<float, 4>{-2.f, 0.25f, 3.f, 0.5f};
+        const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), packed_target.image_id, range, packed_clear);
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), float_target.image_id, range, float_clear);
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const std::array<u32, 3> channels = test.clamp ? std::array<u32, 3>{0, 2047, 256}
+            : test.truncate ? std::array<u32, 3>{2, 3, 10} : std::array<u32, 3>{3, 4, 11};
+        const u32 word = channels[0] | (channels[1] << 11u) | (channels[2] << 22u);
+        Require(name, "packed MRT words",
+                ReadCachedTexel(name, context, packed_target.image_id, {}, {extent, extent, 1}) ==
+                    std::vector<u32>(extent * extent, word),
+                "mode9 export lost packed widths, half-up/truncate rounding, clamp or RGB write mask");
+        const auto floats = ReadCachedTexel(name, context, float_target.image_id, {}, {extent, extent, 1});
+        constexpr std::array<float, 4> blended{2.f, 0.75f, 2.f, 2.5f};
+        for (size_t i = 0; i < floats.size(); ++i)
+          Require(name, "unconverted MRT blending", floats[i] == std::bit_cast<u32>(blended[i % 4]),
+                  "packed MRT handling changed another target's floating-point export or blending");
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(packed_descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(
+            executor, packed_reader.program.info.images.at(0), value);
+        Require(name, "packed target sampled alias", binding.image_id == packed_target.image_id,
+                "sampling the packed target allocated a different image or lost the rendered data");
+        Image sampled;
+        sampled.view = cache.FindTexture(binding.image_id, binding.desc);
+        sampled.layout = cache.GetImage(binding.image_id).backing.state.layout;
+        scheduler.Finish();
+        Dispatch(packed_read, packed_reader, packed_output, nullptr, &sampled,
+                 nullptr, nullptr, packed_sampler);
+        const auto loaded = ReadBuffer(name, packed_output, 8);
+        for (u32 i = 0; i < loaded.size(); ++i) {
+          const auto component = i % 4;
+          const float expected = component == 3 ? 1.f
+              : channels[component] / (component == 2 ? 1023.f : 2047.f);
+          Require(name, "rendered packed load and sample",
+                  std::abs(std::bit_cast<float>(loaded[i]) - expected) < 0.000001f,
+                  "packed rendered contents lost normalization, ordering or texture visibility");
+        }
+      }
+      Require(name, "packed rounding program distinction", half_up_program != truncate_program,
+              "half-up and truncate exports shared one shader specialization");
+      DestroyBuffer(&packed_output);
+      m_device.destroySampler(packed_sampler);
       DestroyBuffer(&stencil_readback);
 
       vertex_shader = owned_vertex_shader;
@@ -16429,12 +19529,13 @@ public:
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
+    const bool object_id = !test.object_ids.empty();
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
                       vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
@@ -16442,8 +19543,17 @@ public:
     Image resolved;
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
-          test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
+          test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
           {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
+          test.layers);
+    }
+    Image primitive_target;
+    if (object_id) {
+      primitive_target = CreateImageMips(
+          test.name, test.width, 1, vk::Format::eR32Uint,
+          vk::ImageUsageFlagBits::eColorAttachment, {}, 1,
+          vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -16455,8 +19565,8 @@ public:
     };
     const auto &vertices =
         test.vertices.empty() ? default_vertices : test.vertices;
-    Require(test.name, "graphics", vertices.size() == 18u,
-            "graphics vertex buffer must contain three pos2/color4 vertices");
+    Require(test.name, "graphics", !vertices.empty() && vertices.size() % 18u == 0,
+            "graphics vertex buffer must contain pos2/color4 triangle lists");
     auto vertex_buffer =
         CreateHostBuffer(test.name, vertices.size() * sizeof(u32),
                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
@@ -16471,8 +19581,9 @@ public:
               test.push_constants.size() * sizeof(u32) ==
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
+    }
+    if (fragment_bind.UsesPushData() || object_id) {
       push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
-      push_constant_range.offset = 0;
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
 
@@ -16526,12 +19637,12 @@ public:
     vk::Viewport viewport{};
     viewport.x = 0.0f;
     viewport.y = 0.0f;
-    viewport.width = 1.0f;
+    viewport.width = static_cast<float>(test.width);
     viewport.height = 1.0f;
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vk::Rect2D scissor{};
-    scissor.extent.width = 1;
+    scissor.extent.width = test.width;
     scissor.extent.height = 1;
     vk::PipelineViewportStateCreateInfo viewport_state{};
     viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
@@ -16547,25 +19658,35 @@ public:
     raster.frontFace = vk::FrontFace::eCounterClockwise;
     raster.lineWidth = 1.0f;
 
+    vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex{};
+    if (test.provoking_vtx_last) {
+      provoking_vertex.provokingVertexMode = vk::ProvokingVertexModeEXT::eLastVertex;
+      raster.pNext = &provoking_vertex;
+    }
+
     vk::PipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
     multisample.rasterizationSamples = test.samples;
 
-    vk::PipelineColorBlendAttachmentState color_attachment{};
-    color_attachment.colorWriteMask =
-        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    std::array<vk::PipelineColorBlendAttachmentState, 8> color_attachments{};
+    for (auto &attachment : color_attachments) {
+      attachment.colorWriteMask =
+          vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    }
     vk::PipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &color_attachment;
+    color_blend.attachmentCount = object_id ? 8 : 1;
+    color_blend.pAttachments = color_attachments.data();
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
-    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    std::array<vk::Format, 8> color_formats{};
+    color_formats[0] = target.format;
+    color_formats[7] = primitive_target.format;
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
-    rendering_pipeline.colorAttachmentCount = 1;
-    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    rendering_pipeline.colorAttachmentCount = color_blend.attachmentCount;
+    rendering_pipeline.pColorAttachmentFormats = color_formats.data();
     pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
     pipeline_info.pNext = &rendering_pipeline;
     pipeline_info.stageCount = 2;
@@ -16583,48 +19704,78 @@ public:
                                                nullptr, &pipeline),
               "vkCreateGraphicsPipelines");
 
-    vk::CommandBuffer cmd = BeginCommands(test.name, "graphics");
-    vk::RenderingAttachmentInfo color{};
-    color.sType = vk::StructureType::eRenderingAttachmentInfo;
-    color.imageView = target.view;
-    color.imageLayout = vk::ImageLayout::eGeneral;
-    color.loadOp = vk::AttachmentLoadOp::eClear;
-    color.storeOp = vk::AttachmentStoreOp::eStore;
+    std::array<vk::RenderingAttachmentInfo, 8> colors{};
+    colors[0].imageView = target.view;
+    colors[0].imageLayout = vk::ImageLayout::eGeneral;
+    colors[0].loadOp = vk::AttachmentLoadOp::eClear;
+    colors[0].storeOp = vk::AttachmentStoreOp::eStore;
     if (resolved.image != nullptr) {
-      color.resolveMode = vk::ResolveModeFlagBits::eAverage;
-      color.resolveImageView = resolved.view;
-      color.resolveImageLayout = vk::ImageLayout::eGeneral;
+      colors[0].resolveMode = vk::ResolveModeFlagBits::eAverage;
+      colors[0].resolveImageView = resolved.view;
+      colors[0].resolveImageLayout = vk::ImageLayout::eGeneral;
+    }
+    if (object_id) {
+      colors[7].imageView = primitive_target.view;
+      colors[7].imageLayout = vk::ImageLayout::eGeneral;
+      colors[7].loadOp = vk::AttachmentLoadOp::eClear;
+      colors[7].storeOp = vk::AttachmentStoreOp::eStore;
+      colors[7].clearValue.color.uint32[0] = 0xfeedfaceu;
     }
     vk::RenderingInfo rendering{};
     rendering.sType = vk::StructureType::eRenderingInfo;
-    rendering.renderArea.extent = {1, 1};
+    rendering.renderArea.extent = {test.width, 1};
     rendering.layerCount = test.layers;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color;
-    cmd.beginRendering(rendering);
-    cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    if (push_constant_range.size != 0) {
-      ShaderRecompiler::IR::PushData push_data;
-      std::copy(test.push_constants.begin(), test.push_constants.end(),
-                push_data.dwords.begin() + fragment_bind.push_data_start_dword);
-      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
-                        sizeof(push_data), push_data.dwords.data());
+    rendering.colorAttachmentCount = color_blend.attachmentCount;
+    rendering.pColorAttachments = colors.data();
+    std::vector<u32> pixel;
+    // Reuse the same shader and pipeline while changing only dynamic object ID.
+    for (size_t draw = 0; draw < std::max<size_t>(test.object_ids.size(), 1); ++draw) {
+      vk::CommandBuffer cmd = BeginCommands(test.name, "graphics");
+      for (auto *image : {&target, &primitive_target}) {
+        if (image->image != nullptr && image->layout != vk::ImageLayout::eGeneral) {
+          AddImageBarrier(cmd, image->image, image->layout,
+                          vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                          vk::AccessFlagBits::eTransferRead,
+                          vk::AccessFlagBits::eColorAttachmentWrite,
+                          image->mip_levels, image->layers);
+          image->layout = vk::ImageLayout::eGeneral;
+        }
+      }
+      cmd.beginRendering(rendering);
+      cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      if (push_constant_range.size != 0) {
+        ShaderRecompiler::IR::PushData push_data;
+        if (object_id) {
+          push_data.dwords[0] = test.object_ids[draw];
+        }
+        if (fragment_bind.UsesPushData()) {
+          std::copy(test.push_constants.begin(), test.push_constants.end(),
+                    push_data.dwords.begin() + fragment_bind.push_data_start_dword);
+        }
+        cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+                          sizeof(push_data), push_data.dwords.data());
+      }
+      vk::DeviceSize offset = 0;
+      cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
+      cmd.draw(static_cast<u32>(vertices.size() / 6), test.layers, 0, 0);
+      cmd.endRendering();
+      EndSubmitAndFree(test.name, "graphics", cmd);
+      auto color_words = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
+      pixel.insert(pixel.end(), color_words.begin(), color_words.end());
+      if (object_id) {
+        auto id_words = ReadImage(test.name, &primitive_target);
+        pixel.insert(pixel.end(), id_words.begin(), id_words.end());
+      }
     }
-    vk::DeviceSize offset = 0;
-    cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
-    cmd.draw(3, test.layers, 0, 0);
-    cmd.endRendering();
-    EndSubmitAndFree(test.name, "graphics", cmd);
-    target.layout = vk::ImageLayout::eGeneral;
-
-    auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
+    DestroyImage(&primitive_target);
     DestroyImage(&resolved);
     DestroyImage(&target);
     return pixel;
@@ -16727,18 +19878,23 @@ public:
     const auto gpu_detile =
         [&](const std::vector<uint8_t> &tiled, std::vector<uint8_t> *linear,
             uint64_t tiled_capacity, uint64_t linear_capacity,
-            std::span<const GpuTileInfo> infos) {
+            const ImageInfo &info, TileManager *manager = nullptr,
+            uint64_t source_offset = 0) {
           const uint64_t padded_tiled = align_dword(tiled_capacity);
           const uint64_t padded_linear = align_dword(linear_capacity);
-          auto input = CreateHostBuffer(name, padded_tiled, AllFlags,
-                                        to_dwords(tiled, padded_tiled));
+          std::vector<uint8_t> source(source_offset + padded_tiled, 0x7b);
+          std::copy(tiled.begin(), tiled.end(), source.begin() + source_offset);
+          auto input = CreateHostBuffer(name, source.size(), AllFlags,
+                                        to_dwords(source, source.size()));
           auto output = CreateHostBuffer(
               name, padded_linear, AllFlags,
               std::vector<u32>(static_cast<size_t>(padded_linear / sizeof(u32)),
-                               0xabababab));
-          const auto result = tile_manager.Detile(input.buffer, 0, padded_tiled,
-                                                  padded_linear, infos);
-          const vk::BufferCopy copy{result.offset, 0, padded_linear};
+                               0));
+          const auto result = (manager ? *manager : tile_manager)
+                                  .Detile(input.buffer, source_offset, info);
+          Require(name, "detile capacity", result.size <= padded_linear,
+                  "canonical transfer size exceeded the fixture output");
+          const vk::BufferCopy copy{result.offset, 0, align_dword(result.size)};
           scheduler.Current().Handle().copyBuffer(result.buffer, output.buffer,
                                                   1, &copy);
           host_barrier(output.buffer, padded_linear,
@@ -16752,22 +19908,34 @@ public:
     const auto gpu_tile = [&](const std::vector<uint8_t> &linear,
                               std::vector<uint8_t> *tiled,
                               uint64_t tiled_capacity, uint64_t linear_capacity,
-                              std::span<const GpuTileInfo> infos) {
+                              const ImageInfo &info,
+                              TileManager *manager = nullptr,
+                              uint32_t levels = 0, uint64_t source_offset = 0,
+                              uint64_t target_offset = 0) {
       const uint64_t padded_tiled = align_dword(tiled_capacity);
       const uint64_t padded_linear = align_dword(linear_capacity);
-      auto input = CreateHostBuffer(name, padded_linear, AllFlags,
-                                    to_dwords(linear, padded_linear));
+      std::vector<uint8_t> source(source_offset + padded_linear, 0x7b);
+      std::copy(linear.begin(), linear.end(), source.begin() + source_offset);
+      auto input = CreateHostBuffer(name, source.size(), AllFlags,
+                                    to_dwords(source, source.size()));
       auto output = CreateHostBuffer(
-          name, padded_tiled, AllFlags,
-          std::vector<u32>(static_cast<size_t>(padded_tiled / sizeof(u32)),
-                           0xabababab));
-      tile_manager.Tile(input.buffer, 0, padded_linear, output.buffer, 0,
-                        padded_tiled, infos);
-      host_barrier(output.buffer, padded_tiled,
+          name, target_offset + padded_tiled, AllFlags,
+          std::vector<u32>(
+              static_cast<size_t>((target_offset + padded_tiled) / sizeof(u32)),
+              0xabababab));
+      (manager ? *manager : tile_manager)
+          .Tile(input.buffer, source_offset, padded_linear, output.buffer,
+                target_offset, padded_tiled, info, levels);
+      host_barrier(output.buffer, target_offset + padded_tiled,
                    vk::PipelineStageFlagBits::eComputeShader,
                    vk::AccessFlagBits::eShaderWrite);
       scheduler.Finish();
-      *tiled = read_bytes(output, tiled_capacity);
+      const auto observed = read_bytes(output, target_offset + tiled_capacity);
+      Require(name, "nonzero transfer target base",
+              std::all_of(observed.begin(), observed.begin() + target_offset,
+                          [](uint8_t value) { return value == 0xab; }),
+              "tiling changed bytes preceding its target offset");
+      tiled->assign(observed.begin() + target_offset, observed.end());
       DestroyBuffer(&output);
       DestroyBuffer(&input);
     };
@@ -16888,58 +20056,104 @@ public:
     };
     auto convert_reference = [&](bool to_tiled, std::vector<uint8_t> *dst,
                                  const std::vector<uint8_t> &src,
-                                 const GpuTileInfo &info) {
-      TileBlockLayout block{};
-      Require(name, "reference layout",
-              TileGetBlockLayout(info.family, info.bytes_per_element, block),
-              "CPU reference rejected GPU tile info");
-      const u32 tiled_width =
-          info.tiled_width != 0 ? info.tiled_width : info.pitch;
-      const u32 tiled_height =
-          info.tiled_height != 0 ? info.tiled_height : info.height;
+                                 const ImageInfo &info, uint32_t level = 0) {
+      const auto &block = info.tiling.block;
+      const auto &mip = info.mip_layout[level];
+      const auto active = info.MipExtent(level);
+      const uint32_t width = (active.width + info.tiling.texel_width - 1u) /
+                             info.tiling.texel_width;
+      const uint32_t height = (active.height + info.tiling.texel_height - 1u) /
+                              info.tiling.texel_height;
       const uint64_t columns =
-          (tiled_width + block.block_width - 1u) / block.block_width;
-      const uint64_t rows =
-          (tiled_height + block.block_height - 1u) / block.block_height;
+          (mip.pitch + block.block_width - 1u) / block.block_width;
       const uint64_t slice = info.linear_slice_stride != 0
                                  ? info.linear_slice_stride
-                                 : static_cast<uint64_t>(info.pitch) *
-                                       info.height * info.bytes_per_element;
-      for (u32 z = 0; z < info.depth; ++z) {
-        for (u32 y = 0; y < info.height; ++y) {
-          for (u32 x = 0; x < info.width; ++x) {
-            const u32 bx = info.tail ? 0 : x / block.block_width;
-            const u32 by = info.tail ? 0 : y / block.block_height;
-            const u32 bz = info.tail ? 0 : z / block.block_depth;
-            const u32 lx = info.tail ? x + info.tail_x : x % block.block_width;
-            const u32 ly = info.tail ? y + info.tail_y : y % block.block_height;
+                                 : mip.linear_size;
+      const bool tail = level >= info.first_tail_level;
+      for (u32 z = 0; z < active.depth; ++z) {
+        for (u32 y = 0; y < height; ++y) {
+          for (u32 x = 0; x < width; ++x) {
+            const u32 bx = tail ? 0 : x / block.block_width;
+            const u32 by = tail ? 0 : y / block.block_height;
+            const u32 bz = z / block.block_depth;
+            const u32 lx = tail ? x + mip.tail_x : x % block.block_width;
+            const u32 ly = tail ? y + mip.tail_y : y % block.block_height;
             const u32 lz = z % block.block_depth;
             u32 local = 0, block_xor = 0;
             Require(name, "reference offset",
                     TileGetBlockOffset(block, lx, ly, lz, local) &&
-                        TileGetBlockXor(block, bx, by, info.surface_z + bz,
+                        TileGetBlockXor(block, bx, by, mip.surface_z + bz,
                                         block_xor),
                     "CPU reference address lookup failed");
-            const uint64_t block_index =
-                static_cast<uint64_t>(bz) * columns * rows + by * columns + bx;
-            const uint64_t tiled = info.tiled_offset +
-                                   block_index * block.block_size +
-                                   (local ^ block_xor);
+            const uint64_t tiled =
+                mip.offset + uint64_t{bz} * info.tiled_slice_stride +
+                (by * columns + bx) * block.block_size + (local ^ block_xor);
             const uint64_t linear =
-                info.linear_offset + static_cast<uint64_t>(z) * slice +
-                static_cast<uint64_t>(y) * info.pitch * info.bytes_per_element +
-                static_cast<uint64_t>(x) * info.bytes_per_element;
+                mip.linear_offset + uint64_t{z} * slice +
+                (uint64_t{y} * mip.linear_pitch + x) * block.bytes_per_element;
             const uint64_t dst_offset = to_tiled ? tiled : linear;
             const uint64_t src_offset = to_tiled ? linear : tiled;
             Require(name, "reference range",
-                    dst_offset + info.bytes_per_element <= dst->size() &&
-                        src_offset + info.bytes_per_element <= src.size(),
+                    dst_offset + block.bytes_per_element <= dst->size() &&
+                        src_offset + block.bytes_per_element <= src.size(),
                     "CPU reference address escaped storage");
-            std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
-                        info.bytes_per_element);
+            if (info.GetColorTransform() == ColorTransform::Reverse10_11_11) {
+              uint32_t packed = 0;
+              std::memcpy(&packed, src.data() + src_offset, sizeof(packed));
+              const std::array<uint32_t, 3> widths =
+                  to_tiled ? std::array<uint32_t, 3>{11, 11, 10}
+                           : std::array<uint32_t, 3>{10, 11, 11};
+              std::array<uint32_t, 3> channels{};
+              for (uint32_t channel = 0; channel < channels.size(); ++channel) {
+                channels[channel] = packed & ((1u << widths[channel]) - 1u);
+                packed >>= widths[channel];
+              }
+              uint32_t shift = 0;
+              for (int channel = 2; channel >= 0; --channel) {
+                packed |= channels[channel] << shift;
+                shift += widths[channel];
+              }
+              std::memcpy(dst->data() + dst_offset, &packed, sizeof(packed));
+            } else if (info.GetColorTransform() == ColorTransform::SwapBgra16) {
+              std::array<uint16_t, 4> channels{};
+              std::memcpy(channels.data(), src.data() + src_offset,
+                          sizeof(channels));
+              std::swap(channels[0], channels[2]);
+              std::memcpy(dst->data() + dst_offset, channels.data(),
+                          sizeof(channels));
+            } else {
+              std::memcpy(dst->data() + dst_offset, src.data() + src_offset,
+                          block.bytes_per_element);
+            }
           }
         }
       }
+    };
+    const auto block_image = [](const TileBlockLayout &block, u32 width,
+                                u32 height, u32 depth, u32 pitch,
+                                uint64_t guest_size) {
+      ImageInfo info{};
+      info.extent = {width, height, block.block_depth > 1 ? depth : 1u};
+      info.type = block.block_depth > 1 ? Prospero::ImageType::kColor3D
+                                        : Prospero::ImageType::kColor2D;
+      info.resources = {1, block.block_depth > 1 ? 1u : depth};
+      info.tile_mode = Prospero::TileMode::kStandard4KB;
+      info.bytes_per_block = block.bytes_per_element;
+      info.tiling = {block, 1, 1};
+      info.data.size = guest_size;
+      info.first_tail_level = 16;
+      const uint64_t columns =
+          (pitch + block.block_width - 1u) / block.block_width;
+      const uint64_t rows =
+          (height + block.block_height - 1u) / block.block_height;
+      info.tiled_slice_stride = columns * rows * block.block_size;
+      info.mip_layout[0] = {
+          0, info.IsVolume() ? info.tiled_slice_stride : guest_size, pitch,
+          static_cast<uint32_t>(rows * block.block_height)};
+      info.mip_layout[0].linear_pitch = pitch;
+      info.mip_layout[0].linear_size =
+          uint64_t{pitch} * height * block.bytes_per_element;
+      return info;
     };
     struct FamilyCase {
       TileBlockFamily family;
@@ -17008,33 +20222,136 @@ public:
 
     u32 case_index = 0;
     auto check_round_trip = [&](const char *stage, uint64_t tiled_size,
-                                std::span<const GpuTileInfo> infos) {
-      uint64_t linear_size = 0;
-      for (const auto &info : infos) {
-        linear_size =
-            std::max(linear_size, info.linear_offset + info.linear_size);
-      }
+                                const ImageInfo &info,
+                                TileManager *manager = nullptr) {
+      const uint64_t linear_size = info.LinearSize();
       std::vector<uint8_t> tiled(tiled_size);
       std::vector<uint8_t> cpu(linear_size, 0);
       std::vector<uint8_t> gpu(linear_size, 0xab);
       fill(&tiled, ++case_index);
-      for (const auto &info : infos) {
-        convert_reference(false, &cpu, tiled, info);
+      for (uint32_t level = 0; level < info.resources.levels; ++level) {
+        convert_reference(false, &cpu, tiled, info, level);
       }
-      gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
+      gpu_detile(tiled, &gpu, tiled_size, linear_size, info, manager);
       compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
-
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
       std::vector<uint8_t> gpu_tiled(tiled_size, 0xab);
       fill(&linear, 0x280u + case_index);
-      for (const auto &info : infos) {
-        convert_reference(true, &cpu_tiled, linear, info);
+      for (uint32_t level = 0; level < info.resources.levels; ++level) {
+        convert_reference(true, &cpu_tiled, linear, info, level);
       }
-      gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, infos);
+      gpu_tile(linear, &gpu_tiled, tiled_size, linear_size, info, manager);
       compare((std::string(stage) + " tile bytes").c_str(), cpu_tiled,
               gpu_tiled);
     };
+
+    {
+      constexpr auto format = Prospero::BufferFormat::k8UNorm;
+      constexpr auto tile = Prospero::TileMode::kStandard256B;
+      constexpr u32 layers = 261;
+      const auto info =
+          MakeTilingImage(format, 1, 1, 1, layers, tile, 0, false);
+      const auto regions = info.BufferCopies();
+      Require(name, "large array mip record",
+              regions.size() == 1 &&
+                  regions[0].imageSubresource.layerCount == layers &&
+                  info.MipExtent(0).depth == layers &&
+                  info.tiled_slice_stride == 256 &&
+                  info.data.size == uint64_t{layers} * 256,
+              "array layers expanded the mip table or lost their guest stride");
+      check_round_trip("large array", info.data.size, info);
+    }
+    {
+      // Adjacent subword mips share output dwords and a guest tail block.
+      TileBlockLayout block{};
+      Require(name, "packed mip block",
+              TileGetBlockLayout(TileBlockFamily::Standard4KB, 1, block),
+              "packed mip block is unavailable");
+      auto info = block_image(block, 1, 1, 1, 1, 4096);
+      info.resources.levels = 16;
+      info.first_tail_level = 0;
+      for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+        info.mip_layout[mip] = {0, 4096, block.block_width, block.block_height};
+        info.mip_layout[mip].linear_offset = mip;
+        info.mip_layout[mip].linear_size = 1;
+        info.mip_layout[mip].linear_pitch = 1;
+        info.mip_layout[mip].tail_x = mip;
+      }
+      check_round_trip("16 packed subword mip records", 4096, info);
+      const auto atom =
+          std::max<uint64_t>(m_runtime_context.GetPhysicalDeviceProperties()
+                                 .limits.nonCoherentAtomSize,
+                             1);
+      for (const auto [mips, bytes] :
+           std::array{std::pair{1u, 64u}, std::pair{2u, 112u}}) {
+        StreamBuffer compact_parameters(m_runtime_context, scheduler,
+                                        MemoryUsage::Stream,
+                                        Common::AlignUp<uint64_t>(bytes, atom));
+        TileManager compact_tiler(m_runtime_context, scheduler,
+                                  compact_parameters);
+        auto compact_info = info;
+        compact_info.resources.levels = mips;
+        check_round_trip("compact parameter buffer", 4096, compact_info,
+                         &compact_tiler);
+      }
+    }
+    {
+      constexpr auto format = Prospero::BufferFormat::k32Float;
+      constexpr auto tile = Prospero::TileMode::kStandard256B;
+      constexpr u32 levels = 7, layers = 3;
+      constexpr uint64_t guest_stride = 0x4800,
+                         guest_size = guest_stride * layers;
+      constexpr uint64_t offsets[levels] = {0x1a00, 0xb00, 0x500, 0x300,
+                                            0x200,  0x100, 0};
+      const auto info = MakeTilingImage(format, 65, 33, levels, layers, tile,
+                                        guest_size, false);
+      const auto regions = info.BufferCopies();
+      bool valid =
+          info.tiled_slice_stride == guest_stride && regions.size() == levels;
+      for (u32 mip = 0; mip < levels && valid; ++mip) {
+        valid &= info.mip_layout[mip].offset == offsets[mip] &&
+                 info.MipExtent(mip).depth == layers &&
+                 regions[mip].imageSubresource.layerCount == layers;
+      }
+      Require(name, "reverse mip array addresses", valid,
+              "mip order or padded guest layer stride changed");
+      check_round_trip("reverse mip array", guest_size, info);
+      std::vector<uint8_t> tiled(guest_size),
+          expected_linear(info.LinearSize(), 0), observed_linear;
+      fill(&tiled, ++case_index);
+      for (u32 mip = 0; mip < levels; ++mip)
+        convert_reference(false, &expected_linear, tiled, info, mip);
+      gpu_detile(tiled, &observed_linear, guest_size, info.LinearSize(), info,
+                 nullptr, 260);
+      compare("detile nonzero source base", expected_linear, observed_linear);
+      const auto saved_mips = info.mip_layout;
+      const auto prefix = info.BufferCopies(256, 2);
+      Require(name, "partial mip array addresses",
+              prefix.size() == 2 && prefix[0].bufferOffset == 256 &&
+                  prefix[1].bufferOffset ==
+                      info.mip_layout[1].linear_offset + 256 &&
+                  info.mip_layout[0].offset == 0x1a00 &&
+                  info.mip_layout[1].offset == 0xb00,
+              "partial mip transfer recomputed the full-chain guest stride");
+      std::vector<uint8_t> linear(info.LinearSize());
+      fill(&linear, ++case_index);
+      for (const u32 count : {2u, levels, 1u, levels}) {
+        std::vector<uint8_t> expected(guest_size, 0xab),
+            observed(guest_size, 0xab);
+        for (u32 mip = 0; mip < count; ++mip)
+          convert_reference(true, &expected, linear, info, mip);
+        gpu_tile(linear, &observed, guest_size, info.LinearSize(), info,
+                 nullptr, count, count == levels ? 516 : 260,
+                 count == levels ? 520 : 264);
+        compare("repeated partial/full transfer", expected, observed);
+        Require(
+            name, "immutable transfer metadata",
+            info.mip_layout == saved_mips && info.resources.levels == levels &&
+                info.tiled_slice_stride == guest_stride,
+            "partial or repeated transfer changed canonical image metadata");
+      }
+    }
     for (const auto family : families) {
       for (u32 bpe = 1; bpe <= family.max_bpe; bpe <<= 1u) {
         TileBlockLayout block{};
@@ -17056,31 +20373,20 @@ public:
             (depth + block.block_depth - 1u) / block.block_depth;
         const uint64_t storage_size =
             block_columns * block_rows * block_slices * block.block_size;
-        const uint64_t slice_stride =
-            static_cast<uint64_t>(pitch) * height * bpe;
-
         std::vector<uint8_t> tiled(storage_size);
         std::vector<uint8_t> cpu(storage_size, 0);
         std::vector<uint8_t> gpu(storage_size, 0xab);
         fill(&tiled, ++case_index);
 
-        GpuTileInfo info{};
-        info.family = block.family;
-        info.bytes_per_element = block.bytes_per_element;
-        info.linear_size = storage_size;
-        info.tiled_size = storage_size;
-        info.linear_slice_stride = volume ? slice_stride : 0;
-        info.width = width;
-        info.height = height;
-        info.depth = depth;
-        info.pitch = pitch;
-        info.surface_z = family.family == TileBlockFamily::RenderTarget64KB ||
-                                 family.family == TileBlockFamily::Depth64KB
-                             ? 3
-                             : 0;
+        auto info =
+            block_image(block, width, height, depth, pitch, storage_size);
+        info.mip_layout[0].surface_z =
+            family.family == TileBlockFamily::RenderTarget64KB ||
+                    family.family == TileBlockFamily::Depth64KB
+                ? 3
+                : 0;
         convert_reference(false, &cpu, tiled, info);
-        gpu_detile(tiled, &gpu, storage_size, storage_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+        gpu_detile(tiled, &gpu, storage_size, storage_size, info);
         const auto family_label = [&](const char *operation) {
           std::ostringstream out;
           out << operation << " family=" << static_cast<u32>(family.family)
@@ -17095,47 +20401,54 @@ public:
           std::vector<uint8_t> gpu_tiled(storage_size, 0xab);
           fill(&linear, 0x80u + case_index);
           convert_reference(true, &cpu_tiled, linear, info);
-          gpu_tile(linear, &gpu_tiled, storage_size, storage_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+          gpu_tile(linear, &gpu_tiled, storage_size, storage_size, info);
           compare(family_label("tile bytes").c_str(), cpu_tiled, gpu_tiled);
         }
       }
     }
 
     // Exercise the real texture-layout/info-building seam for every format
-    // admitted by each standard tile mode.  Formats sharing a byte/block width
+    // admitted by each texture tile mode.  Formats sharing a byte/block width
     // intentionally share a shader, but this loop still validates their
     // texel-to-element conversion (notably every BCn format).
-    struct StandardMode {
+    struct TextureMode {
       Prospero::TileMode tile;
       TileBlockFamily family;
     };
-    constexpr StandardMode standard_modes[] = {
+    constexpr TextureMode texture_modes[] = {
         {Prospero::TileMode::kStandard256B, TileBlockFamily::Standard256B},
         {Prospero::TileMode::kStandard4KB, TileBlockFamily::Standard4KB},
         {Prospero::TileMode::kStandard64KB, TileBlockFamily::Standard64KB},
         {Prospero::TileMode::kPrt, TileBlockFamily::Prt64KB},
+        {Prospero::TileMode::kRenderTarget, TileBlockFamily::RenderTarget64KB},
+        {Prospero::TileMode::kDepth, TileBlockFamily::Depth64KB},
     };
-    struct RenderTargetFormatCase {
+    struct TextureTileFormatCase {
       Prospero::BufferFormat format;
       u32 bytes_per_element;
+      bool depth_supported;
     };
-    constexpr RenderTargetFormatCase render_target_formats[] = {
-        {Prospero::BufferFormat::k8Srgb, 1},
-        {Prospero::BufferFormat::k8_8Srgb, 2},
-        {Prospero::BufferFormat::k9_9_9_5Float, 0},
+    constexpr TextureTileFormatCase texture_tile_formats[] = {
+        {Prospero::BufferFormat::k8Srgb, 1, true},
+        {Prospero::BufferFormat::k8_8Srgb, 2, true},
+        {Prospero::BufferFormat::k9_9_9_5Float, 4, true},
+        {Prospero::BufferFormat::kBc1Srgb, 8, false},
+        {Prospero::BufferFormat::kBc7Srgb, 16, false},
+        {Prospero::BufferFormat::k32_32_32_32Float, 16, false},
     };
-    for (const auto &test : render_target_formats) {
+    for (const auto &test : texture_tile_formats) {
       for (const auto tile :
            {Prospero::TileMode::kDepth, Prospero::TileMode::kRenderTarget}) {
         TileTextureBlockLayout texture{};
         const bool supported =
             TileGetTextureBlockLayout(test.format, tile, false, texture);
-        Require(name, "RT format policy",
-                supported == (test.bytes_per_element != 0) &&
+        const bool expected = tile == Prospero::TileMode::kRenderTarget ||
+                              test.depth_supported;
+        Require(name, "texture tile format policy",
+                supported == expected &&
                     (!supported || texture.block.bytes_per_element ==
                                        test.bytes_per_element),
-                "RT/depth tile format support or element size is incorrect");
+                "texture tile policy used attachment format restrictions");
       }
     }
     {
@@ -17154,19 +20467,11 @@ public:
               !TileGetTiledTextureLayout(description, invalid),
               "Standard256B volume silently fell back to a 2D array layout");
     }
-    {
-      constexpr auto format = Prospero::BufferFormat::kFmask8_S4_F4;
-      constexpr auto tile = Prospero::TileMode::kStandard64KB;
-      TileSizeAlign total{};
-      TileGetTextureSize(format, 128, 128, 1, tile, &total, nullptr, nullptr);
-      const auto layout = TextureCalcUploadLayout(
-          format, 128, 128, 1, 1, tile, total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      Require(name, "FMASK policy",
-              !TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos),
-              "FMASK entered the texel tiler through a non-depth family");
-    }
+    Require(
+        name, "FMASK policy",
+        Prospero::IsFmaskTextureFormat(Prospero::BufferFormat::kFmask8_S4_F4),
+        "FMASK sample metadata lost its explicit tiler exclusion "
+        "classification");
     u32 format_cases = 0;
     for (u32 raw_format = 1;
          raw_format <= static_cast<uint32_t>(Prospero::BufferFormat::kBc7Srgb);
@@ -17176,7 +20481,7 @@ public:
       if (Prospero::IsFmaskTextureFormat(format)) {
         continue;
       }
-      for (const auto &mode : standard_modes) {
+      for (const auto &mode : texture_modes) {
         TileTextureBlockLayout texture{};
         if (!TileGetTextureBlockLayout(format, mode.tile, false, texture)) {
           continue;
@@ -17187,42 +20492,53 @@ public:
 
         constexpr u32 width = 67;
         constexpr u32 height = 51;
-        const u32 pitch = TileGetTexturePitch(format, width, mode.tile);
         TileSizeAlign total{};
         TileGetTextureSize(format, width, height, 1, mode.tile, &total, nullptr,
                            nullptr);
         Require(name, "format size", total.size != 0,
                 "supported format has an empty layout");
 
-        const auto layout =
-            TextureCalcUploadLayout(format, width, height, 1, 1, mode.tile,
-                                    total.size, false, name);
-        const auto regions = TextureBuildImageCopies(layout);
-        std::vector<GpuTileInfo> infos;
-        if (!TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos)) {
-          std::ostringstream out;
-          out << "format=" << raw_format
-              << " tile=" << static_cast<uint32_t>(mode.tile)
-              << " size=" << total.size << " pitch=" << pitch;
-          Fail(name, "format infos", out.str());
-        }
+        const auto layout = MakeTilingImage(format, width, height, 1, 1,
+                                            mode.tile, total.size, false);
+        const auto regions = layout.BufferCopies();
         Require(name, "format family",
-                infos.size() == 1 && infos[0].family == mode.family &&
-                    infos[0].bytes_per_element == bpe,
+                layout.resources.levels == 1 &&
+                    layout.tiling.block.family == mode.family &&
+                    layout.tiling.block.bytes_per_element == bpe,
                 "texture info selected the wrong shader family");
 
         std::vector<uint8_t> tiled(total.size);
         std::vector<uint8_t> cpu(total.size, 0);
         std::vector<uint8_t> gpu(total.size, 0xab);
         fill(&tiled, ++case_index);
-        convert_reference(false, &cpu, tiled, infos[0]);
-        gpu_detile(tiled, &gpu, total.size, total.size, infos);
+        convert_reference(false, &cpu, tiled, layout);
+        gpu_detile(tiled, &gpu, total.size, total.size, layout);
         compare("format bytes", cpu, gpu);
         ++format_cases;
       }
     }
     Require(name, "format coverage", format_cases != 0,
-            "no CPU-supported standard formats were tested");
+            "no CPU-supported texture formats were tested");
+
+    {
+      constexpr auto format = Prospero::BufferFormat::kBc1Srgb;
+      constexpr auto tile = Prospero::TileMode::kRenderTarget;
+      constexpr u32 layers = 8;
+      const auto captured =
+          MakeTilingImage(format, 2048, 2048, 1, layers, tile, 0, false);
+      Require(name, "PPSA19577 BC1 array footprint",
+              captured.data.size == 0x1000000 &&
+                  captured.tiled_slice_stride == 0x200000 &&
+                  captured.first_tail_level == 1 &&
+                  captured.tiling.block.block_width == 128 &&
+                  captured.tiling.block.block_height == 64 &&
+                  captured.mip_layout[0].pitch == 512 &&
+                  captured.mip_layout[0].height == 512,
+              "R64 BC1 texture lost its compressed blocks or array stride");
+      const auto small_array =
+          MakeTilingImage(format, 67, 51, 1, layers, tile, 0, false);
+      check_round_trip("R64 BC1 array", small_array.data.size, small_array);
+    }
 
     {
       constexpr auto format = Prospero::BufferFormat::k11_11_10UInt;
@@ -17291,24 +20607,16 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
                          nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
-      uint64_t linear_size = 0;
-      for (const auto &info : infos) {
-        linear_size =
-            std::max(linear_size, info.linear_offset + info.linear_size);
-      }
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
+
+      const auto linear_size = layout.LinearSize();
       Require(name, "BC1 mip-tail capacities",
-              built && total.size == 0x10000 &&
-                  layout.surface.first_tail_level == 0 &&
+              total.size == 0x10000 && layout.first_tail_level == 0 &&
                   linear_size == 0x15560 && linear_size > total.size,
               "BC1 mip tail conflated tiled and linear capacities");
-      check_round_trip("BC1 mip tail", total.size, infos);
+      check_round_trip("BC1 mip tail", total.size, layout);
     }
 
     {
@@ -17318,21 +20626,22 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, layers, 1, tile, false,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, 1, layers, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos);
+      const auto layout = MakeTilingImage(format, width, height, 1, layers,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
+
       Require(name, "array infos",
-              built && infos.size() == layers && infos[0].surface_z == 0 &&
-                  infos[1].surface_z == 1 && infos[2].surface_z == 2,
-              "array slices lost their absolute surface Z");
-      check_round_trip("array", total.size, infos);
+              layout.resources.levels == 1 &&
+                  layout.MipExtent(0).depth == layers &&
+                  layout.mip_layout[0].surface_z == 0 &&
+                  layout.tiled_slice_stride == total.size / layers &&
+                  regions.size() == 1 &&
+                  regions[0].imageSubresource.layerCount == layers,
+              "array mip lost its layer count or absolute surface Z origin");
+      check_round_trip("array", total.size, layout);
     }
 
-    for (const auto &mode : standard_modes) {
+    for (const auto &mode : texture_modes) {
       constexpr auto format = Prospero::BufferFormat::k32Float;
       constexpr u32 levels = 2;
       TileBlockLayout block{};
@@ -17343,21 +20652,58 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, mode.tile, &total,
                          nullptr, nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          mode.tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "odd mip infos",
-              TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                       infos) &&
-                  infos.size() == 2 && infos[1].tiled_width >= infos[1].pitch &&
-                  infos[1].tiled_height >= infos[1].height &&
+              layout.resources.levels == 2 &&
+                  layout.mip_layout[1].pitch >=
+                      layout.mip_layout[1].linear_pitch &&
+                  layout.mip_layout[1].height >=
+                      ((layout.MipExtent(1).height +
+                        layout.tiling.texel_height - 1u) /
+                       layout.tiling.texel_height) &&
                   (mode.family == TileBlockFamily::Standard256B ||
-                   infos[1].tiled_height > infos[1].height),
+                   layout.mip_layout[1].height >
+                       ((layout.MipExtent(1).height +
+                         layout.tiling.texel_height - 1u) /
+                        layout.tiling.texel_height)),
               "odd multi-mip physical stride collapsed to the active linear "
               "extent");
-      check_round_trip("odd multi-mip", total.size, infos);
+      check_round_trip("odd multi-mip", total.size, layout);
+    }
+
+    for (const bool sparse : {false, true}) {
+      const auto format = sparse ? Prospero::BufferFormat::k32_32_32_32UInt
+                                 : Prospero::BufferFormat::k16_16_16_16Float;
+      constexpr auto tile = Prospero::TileMode::kStandard4KB;
+      const uint32_t extent = sparse ? 2 : 16;
+      auto view = MakeTilingImage(format, extent, extent, 1, 1, tile, 0, false);
+      view.data.address = sparse ? 0x50322e3500 : 0x5032b23800;
+      view.UpdateSize();
+      Require(name, "rebased mip footprint",
+              view.data.size == (sparse ? 0x60 : 0x800) &&
+                  view.DataAlignment() == (sparse ? 0x100 : 0x800) &&
+                  view.mip_layout[0].pitch == (sparse ? 16 : 32) &&
+                  view.mip_layout[0].height == 16 &&
+                  view.tiled_slice_stride == 0x1000,
+              "a compact view changed its allocation geometry");
+      check_round_trip("rebased mip exact range", view.data.size, view);
+      check_round_trip("rebased mip adjacent canary", 0x1000, view);
+
+      std::vector<uint8_t> linear(view.LinearSize());
+      fill(&linear, ++case_index);
+      std::vector<uint8_t> expected(0x1000, 0xab), observed;
+      convert_reference(true, &expected, linear, view);
+      gpu_tile(linear, &observed, 0x1000, linear.size(), view, nullptr, 0,
+               0x100, 0x800);
+      compare("rebased mip prefix and neighboring mip", expected, observed);
+      std::vector<uint8_t> round_trip;
+      gpu_detile(observed, &round_trip, observed.size(), linear.size(), view,
+                 nullptr, 0x800);
+      std::vector<uint8_t> expected_linear(linear.size(), 0);
+      convert_reference(false, &expected_linear, expected, view);
+      compare("rebased mip nonzero source", expected_linear, round_trip);
     }
 
     struct TailMode {
@@ -17382,20 +20728,13 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, mode.tile, &total,
                          nullptr, nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, mode.tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          mode.tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "2D mip tail seam",
-              layout.surface.first_tail_level == 2 &&
-                  TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                           infos) &&
-                  infos.size() == levels && !infos[0].tail && !infos[1].tail &&
-                  std::all_of(infos.begin() + 2, infos.end(),
-                              [](const auto &info) { return info.tail; }),
+              layout.first_tail_level == 2 && layout.resources.levels == levels,
               "2D mip chain lost its linear/tiled tail boundary");
-      check_round_trip("2D mip tail seam", total.size, infos);
+      check_round_trip("2D mip tail seam", total.size, layout);
     }
 
     {
@@ -17408,25 +20747,31 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
-      Require(name, "3D mip infos",
-              regions.size() == depth + (depth >> 1u) && built &&
-                  infos.size() == 4 && infos[0].depth == 8 &&
-                  infos[1].depth == 8 && infos[2].depth == 1 &&
-                  infos[3].depth == 8 && infos[0].tiled_offset == 0x19000 &&
-                  infos[1].tiled_offset == 0x83000 &&
-                  infos[2].tiled_offset == 0xed000 &&
-                  infos[3].tiled_offset == 0 && infos[3].pitch == 32 &&
-                  infos[3].height == 64 && infos[3].tiled_width == 40 &&
-                  infos[3].tiled_height == 80,
-              "Standard4KB3D mip depth, packing, or physical stride changed");
-      check_round_trip("3D mip", total.size, infos);
+      const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                          tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+
+      Require(
+          name, "3D mip infos",
+          regions.size() == levels && layout.resources.levels == levels &&
+              regions[0].imageExtent.depth == depth &&
+              regions[1].imageExtent.depth == (depth >> 1u) &&
+              layout.MipExtent(0).depth == 17 &&
+              layout.MipExtent(1).depth == 8 &&
+              layout.mip_layout[0].offset == 0x19000 &&
+              layout.tiled_slice_stride == 0x6a000 &&
+              layout.mip_layout[0].offset + layout.tiled_slice_stride ==
+                  0x83000 &&
+              layout.mip_layout[0].offset + 2 * layout.tiled_slice_stride ==
+                  0xed000 &&
+              layout.mip_layout[1].offset == 0 &&
+              layout.mip_layout[1].linear_pitch == 32 &&
+              ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
+               layout.tiling.texel_height) == 64 &&
+              layout.mip_layout[1].pitch == 40 &&
+              layout.mip_layout[1].height == 80,
+          "Standard4KB3D mip depth, packing, or physical stride changed");
+      check_round_trip("3D mip", total.size, layout);
     }
 
     {
@@ -17439,19 +20784,21 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                               total);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, depth, tile,
-                                  total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      Require(name, "3D BC mip infos",
-              TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                       infos) &&
-                  infos.size() == 4 && infos[3].pitch == 8 &&
-                  infos[3].height == 16 && infos[3].tiled_width == 16 &&
-                  infos[3].tiled_height == 24,
-              "block-compressed 3D mip lost its physical row or slice stride");
-      check_round_trip("3D BC mip", total.size, infos);
+      const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                          tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+      Require(
+          name, "3D BC mip infos",
+          layout.resources.levels == levels &&
+              layout.MipExtent(0).depth == depth &&
+              layout.MipExtent(1).depth == (depth >> 1u) &&
+              layout.mip_layout[1].linear_pitch == 8 &&
+              ((layout.MipExtent(1).height + layout.tiling.texel_height - 1u) /
+               layout.tiling.texel_height) == 16 &&
+              layout.mip_layout[1].pitch == 16 &&
+              layout.mip_layout[1].height == 24,
+          "block-compressed 3D mip lost its physical row or slice stride");
+      check_round_trip("3D BC mip", total.size, layout);
     }
 
     {
@@ -17461,10 +20808,9 @@ public:
       TileSizeAlign total{};
       TileGetTextureSize(format, width, height, levels, tile, &total, nullptr,
                          nullptr);
-      const auto layout =
-          TextureCalcUploadLayout(format, width, height, levels, 1, tile,
-                                  total.size, false, name);
-      const auto regions = TextureBuildImageCopies(layout);
+      const auto layout = MakeTilingImage(format, width, height, levels, 1,
+                                          tile, total.size, false);
+      const auto regions = layout.BufferCopies();
       Require(name, "linear BC native regions",
               regions.size() == levels &&
                   std::all_of(regions.begin(), regions.end(),
@@ -17503,27 +20849,21 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(test.format, width, height, depth, levels,
                               test.tile, true, total);
-      const auto layout =
-          TextureCalcUploadLayout(test.format, width, height, levels, depth,
-                                  test.tile, total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      const bool built =
-          TextureBuildGpuTileInfos(total.size, regions, layout, levels, infos);
+      const auto layout = MakeTilingImage(test.format, width, height, levels,
+                                          depth, test.tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+
       const bool uses_z = test.family == TileBlockFamily::RenderTarget64KB ||
                           test.family == TileBlockFamily::Depth64KB;
       Require(name, "volume family infos",
-              built && !infos.empty() &&
-                  std::all_of(infos.begin(), infos.end(),
-                              [&](const auto &info) {
-                                return info.family == test.family;
-                              }) &&
-                  (!uses_z || std::any_of(infos.begin(), infos.end(),
-                                          [](const auto &info) {
-                                            return info.surface_z != 0;
-                                          })),
+              layout.resources.levels != 0 &&
+                  layout.tiling.block.family == test.family &&
+                  layout.resources.levels == levels &&
+                  layout.MipExtent(0).depth == depth &&
+                  (!uses_z || (layout.mip_layout[0].surface_z == 0 &&
+                               layout.tiled_slice_stride != 0)),
               "volume mode selected the wrong family or lost its surface Z");
-      check_round_trip("volume family", total.size, infos);
+      check_round_trip("volume family", total.size, layout);
     }
 
     struct VolumeTailCase {
@@ -17562,36 +20902,29 @@ public:
       TileSizeAlign total{};
       TileGetTextureTotalSize(tail.format, width, height, depth, levels, tile,
                               true, total);
-      const auto layout =
-          TextureCalcUploadLayout(tail.format, width, height, levels, depth,
-                                  tile, total.size, true, name);
-      const auto regions = TextureBuildImageCopies(layout);
-      std::vector<GpuTileInfo> infos;
-      bool valid = total.size == 8192 &&
-                   regions.size() == depth + std::max(depth >> 1u, 1u) +
-                                         std::max(depth >> 2u, 1u) +
-                                         std::max(depth >> 3u, 1u) +
-                                         std::max(depth >> 4u, 1u) &&
-                   TextureBuildGpuTileInfos(total.size, regions, layout, levels,
-                                            infos) &&
-                   infos.size() == 6;
+      const auto layout = MakeTilingImage(tail.format, width, height, levels,
+                                          depth, tile, total.size, true);
+      const auto regions = layout.BufferCopies();
+      bool valid = total.size == 8192 && regions.size() == levels &&
+                   layout.resources.levels == levels;
       const u32 table = std::countr_zero(tail.bytes);
       for (u32 level = 0; level < levels && valid; level++) {
-        const auto &info = infos[level == 0 ? 0 : level + 1];
-        valid &= info.tail && info.tail_x == volume_tail_xy[table][level][0] &&
-                 info.tail_y == volume_tail_xy[table][level][1] &&
-                 info.tiled_offset == 0;
+        const auto &mip = layout.mip_layout[level];
+        valid &=
+            level >= layout.first_tail_level &&
+            mip.tail_x == volume_tail_xy[table][level][0] &&
+            mip.tail_y == volume_tail_xy[table][level][1] && mip.offset == 0 &&
+            layout.MipExtent(level).depth == std::max(depth >> level, 1u) &&
+            layout.tiled_slice_stride == 4096;
       }
       if (valid) {
-        valid = infos[1].tail &&
-                infos[1].tail_x == volume_tail_xy[table][0][0] &&
-                infos[1].tail_y == volume_tail_xy[table][0][1] &&
-                infos[1].tiled_offset == 4096;
+        valid = layout.MipExtent(0).depth == block.block_depth + 1u &&
+                layout.mip_layout[0].offset + layout.tiled_slice_stride == 4096;
       }
       Require(
           name, "3D mip tail infos", valid,
           "Standard4KB3D mip tail coordinates or block-slice packing changed");
-      check_round_trip("3D mip tail", total.size, infos);
+      check_round_trip("3D mip tail", total.size, layout);
     }
 
     for (const auto family :
@@ -17615,24 +20948,18 @@ public:
         std::vector<uint8_t> cpu(linear_size, 0xcd);
         std::vector<uint8_t> gpu(linear_size, 0xab);
         fill(&tiled, ++case_index);
-        GpuTileInfo info{};
-        info.family = block.family;
-        info.bytes_per_element = block.bytes_per_element;
-        info.linear_size = linear_size;
-        info.tiled_size = block.block_size;
-        info.width = width;
-        info.height = height;
-        info.pitch = pitch;
-        info.tail = true;
-        info.tail_x = x;
-        info.tail_y = y;
-        info.surface_z = family == TileBlockFamily::RenderTarget64KB ||
-                                 family == TileBlockFamily::Depth64KB
-                             ? 2
-                             : 0;
+        auto info =
+            block_image(block, width, height, 1, pitch, block.block_size);
+        info.first_tail_level = 0;
+        info.mip_layout[0].tail_x = x;
+        info.mip_layout[0].tail_y = y;
+        info.mip_layout[0].surface_z =
+            family == TileBlockFamily::RenderTarget64KB ||
+                    family == TileBlockFamily::Depth64KB
+                ? 2
+                : 0;
         convert_reference(false, &cpu, tiled, info);
-        gpu_detile(tiled, &gpu, block.block_size, linear_size,
-                   std::span<const GpuTileInfo>(&info, 1));
+        gpu_detile(tiled, &gpu, block.block_size, linear_size, info);
         compare("tail bytes", cpu, gpu);
 
         std::vector<uint8_t> linear(linear_size);
@@ -17640,8 +20967,7 @@ public:
         std::vector<uint8_t> gpu_tiled(block.block_size, 0xab);
         fill(&linear, 0x400u + case_index);
         convert_reference(true, &cpu_tiled, linear, info);
-        gpu_tile(linear, &gpu_tiled, block.block_size, linear_size,
-                 std::span<const GpuTileInfo>(&info, 1));
+        gpu_tile(linear, &gpu_tiled, block.block_size, linear_size, info);
         compare("tail tile bytes", cpu_tiled, gpu_tiled);
       }
     }
@@ -17654,58 +20980,50 @@ public:
     std::vector<uint8_t> small_expected(small_block.block_size, 0);
     std::vector<uint8_t> small_output(small_block.block_size, 0xab);
     fill(&small_input, 0xee);
-    GpuTileInfo small_info{};
-    small_info.family = small_block.family;
-    small_info.bytes_per_element = small_block.bytes_per_element;
-    small_info.linear_size = small_output.size();
-    small_info.tiled_size = small_input.size();
-    small_info.width = 1;
-    small_info.height = 1;
-    small_info.pitch = small_block.block_width;
+    auto small_info = block_image(small_block, 1, 1, 1, small_block.block_width,
+                                  small_input.size());
     convert_reference(false, &small_expected, small_input, small_info);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(),
-               std::span<const GpuTileInfo>(&small_info, 1));
+               small_output.size(), small_info);
     compare("small detile", small_expected, small_output);
 
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
-               small_output.size(),
-               std::span<const GpuTileInfo>(&small_info, 1));
+               small_output.size(), small_info);
     compare("scheduler-owned reuse", small_expected, small_output);
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
     constexpr u32 volume_width = 8, volume_height = 4, volume_depth = 5;
     constexpr u32 volume_levels = 3;
-    const u32 volume_pitch =
-        TileGetTexturePitch(volume_format, volume_width, volume_tile);
     TileSizeAlign volume_size{};
     TileGetTextureTotalSize(volume_format, volume_width, volume_height,
                             volume_depth, volume_levels, volume_tile, true,
                             volume_size);
-    const auto volume_layout = TextureCalcUploadLayout(
+    const auto volume_layout = MakeTilingImage(
         volume_format, volume_width, volume_height, volume_levels, volume_depth,
-        volume_tile, volume_size.size, true, name);
-    const auto volume_copies = TextureBuildImageCopies(volume_layout);
+        volume_tile, volume_size.size, true);
+    const auto volume_copies = volume_layout.BufferCopies();
     std::vector<u32> volume_source(volume_size.size / sizeof(u32), 0);
     std::vector<std::pair<size_t, u32>> volume_probes;
     for (const auto &copy : volume_copies) {
-      for (u32 y = 0; y < copy.imageExtent.height; y++) {
-        for (u32 x = 0; x < copy.imageExtent.width; x++) {
-          const auto index =
-              (copy.bufferOffset +
-               (static_cast<uint64_t>(y) * copy.bufferRowLength + x) *
-                   sizeof(u32)) /
-              sizeof(u32);
-          const u32 value =
-              0xa0000000u | (copy.imageSubresource.mipLevel << 24u) |
-              (static_cast<u32>(copy.imageOffset.z) << 16u) | (y << 8u) | x;
-          Require(name, "linear volume native bounds",
-                  index < volume_source.size(),
-                  "linear volume copy escaped its padded guest layout");
-          volume_source[index] = value;
-          volume_probes.emplace_back(static_cast<size_t>(index), value);
+      for (u32 z = 0; z < copy.imageExtent.depth; ++z) {
+        for (u32 y = 0; y < copy.imageExtent.height; ++y) {
+          for (u32 x = 0; x < copy.imageExtent.width; ++x) {
+            const auto index = copy.bufferOffset / sizeof(u32) +
+                               (uint64_t{z} * copy.bufferImageHeight + y) *
+                                   copy.bufferRowLength +
+                               x;
+            const u32 value =
+                0xa0000000u | (copy.imageSubresource.mipLevel << 24u) |
+                ((static_cast<u32>(copy.imageOffset.z) + z) << 16u) |
+                (y << 8u) | x;
+            Require(name, "linear volume native bounds",
+                    index < volume_source.size(),
+                    "linear volume copy escaped its padded guest layout");
+            volume_source[index] = value;
+            volume_probes.emplace_back(static_cast<size_t>(index), value);
+          }
         }
       }
     }
@@ -17715,22 +21033,9 @@ public:
     auto volume_download = CreateHostBuffer(
         name, volume_size.size, vk::BufferUsageFlagBits::eTransferDst,
         std::vector<u32>(volume_source.size(), 0));
-    ImageInfo volume_info{};
-    volume_info.data = {0x10000, volume_size.size};
+    auto volume_info = volume_layout;
+    volume_info.data.address = 0x10000;
     volume_info.pixel_format = vk::Format::eR32Uint;
-    volume_info.guest_format = volume_format;
-    volume_info.type = Prospero::ImageType::kColor3D;
-    volume_info.extent = {volume_width, volume_height, volume_depth};
-    volume_info.resources = {volume_levels, 1};
-    volume_info.pitch = volume_pitch;
-    volume_info.bytes_per_block = sizeof(u32);
-    volume_info.tile_mode = volume_tile;
-    for (u32 level = 0; level < volume_levels; level++) {
-      volume_info.mip_layout[level] = {volume_layout.mips[level].offset,
-                                       volume_layout.mips[level].size,
-                                       volume_layout.mips[level].row_length,
-                                       volume_layout.mips[level].image_height};
-    }
     Libs::Graphics::Image volume_image(m_runtime_context, scheduler,
                                        volume_info);
     volume_image.Upload(volume_copies, volume_upload.buffer, 0,
@@ -17789,6 +21094,8 @@ private:
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
     m_runtime_context.shader_image_int64_atomics_enabled = true;
+    m_runtime_context.maintenance8_enabled = true;
+    m_runtime_context.conditional_rendering_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
@@ -17889,6 +21196,8 @@ private:
               features12.shaderOutputViewportIndex != true ||
               features12.shaderBufferInt64Atomics != true ||
               features12.shaderSampledImageArrayNonUniformIndexing != true ||
+              features12.shaderStorageImageArrayNonUniformIndexing != true ||
+              features12.shaderStorageBufferArrayNonUniformIndexing != true ||
               features12.shaderSharedInt64Atomics != true ||
               image_atomic64.shaderImageInt64Atomics != true ||
               workgroup_layout.workgroupMemoryExplicitLayout != true ||
@@ -17935,10 +21244,16 @@ private:
     available_provoking_vertex.pNext = &available_feedback_dynamic;
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT available_min_lod{};
     available_min_lod.pNext = &available_provoking_vertex;
+    vk::PhysicalDeviceMaintenance8FeaturesKHR available_maintenance8{};
+    available_maintenance8.pNext = &available_min_lod;
+    vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
+    available_robustness2.pNext = &available_maintenance8;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
-    available_features2.pNext = &available_min_lod;
+    available_features2.pNext = &available_robustness2;
     m_physical_device.getFeatures2(&available_features2);
+    Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
+            "null descriptors are not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -17970,12 +21285,23 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.shaderSampledImageArrayNonUniformIndexing == true,
             "nonuniform sampled image indexing is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.shaderStorageBufferArrayNonUniformIndexing == true,
+            "nonuniform storage buffer indexing is not supported");
+    Require("VulkanHarness", "dispatch",
+            available_features12.shaderStorageImageArrayNonUniformIndexing == true,
+            "nonuniform storage image indexing is not supported");
     Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
             "image view minimum LOD is not supported");
+    Require("VulkanHarness", "dispatch", available_maintenance8.maintenance8 == true,
+            "maintenance8 dynamic image offsets are not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
+                                available_features.drawIndirectFirstInstance &&
+                                available_features.multiDrawIndirect &&
+                                available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
                                 available_clip_control.depthClipControl &&
                                 available_color_write.colorWriteEnable &&
@@ -18049,18 +21375,28 @@ private:
     min_lod.pNext = m_rasterization_supported
                         ? static_cast<void *>(&provoking_vertex)
                         : static_cast<void *>(&derivatives);
-    device_info.pNext = &min_lod;
+    vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8{};
+    maintenance8.maintenance8 = true;
+    maintenance8.pNext = &min_lod;
+    vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
+    robustness2.nullDescriptor = true;
+    robustness2.pNext = &maintenance8;
+    vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
+    conditional_rendering.conditionalRendering = true;
+    conditional_rendering.pNext = &robustness2;
+    device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
+    device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
-    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
-    ShaderRecompiler::Spirv::SetHostImageFeatures(
-        {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
+    device_features.drawIndirectFirstInstance = m_rasterization_supported;
+    device_features.multiDrawIndirect = m_rasterization_supported;
+    device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -18068,7 +21404,10 @@ private:
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
+        VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+        VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
+        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+        VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME};
     if (m_rasterization_supported) {
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
       device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
@@ -18266,7 +21605,7 @@ private:
       copies.push_back(copy);
       offset += static_cast<vk::DeviceSize>(
           ImageMipDwordCount(image->width, image->height,
-                             image->dwords_per_pixel, level, image->layers) *
+                             image->format, level, image->layers) *
           sizeof(u32));
     }
     cmd.copyBufferToImage(staging, image->image,
@@ -18326,7 +21665,7 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -18482,8 +21821,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   }
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
   auto Has = [&](Kind kind) {
-    return ShaderRecompiler::IR::FindBinding(compiled.program.bindings, kind) !=
-           nullptr;
+    return compiled.program.bindings.descriptor_counts[static_cast<size_t>(kind)] != 0;
   };
   const auto dwords = std::max<size_t>(
       {test.initial.size(), test.expected.size(), static_cast<size_t>(1)});
@@ -18496,9 +21834,8 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vk::Sampler sampler = nullptr;
   bool needs_sampled_image = false;
   bool needs_storage_image = false;
-  for (const auto &binding : compiled.program.bindings.descriptors) {
-    const auto resource_class =
-        ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+  for (const auto &image : compiled.program.info.images) {
+    const auto resource_class = image.resource_class;
     if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
       needs_sampled_image = true;
     } else if (resource_class ==
@@ -18756,6 +22093,8 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_NLT_F32:
   case Opcode::V_CMP_CLASS_F32:
   case Opcode::V_CMPX_CLASS_F32:
+  case Opcode::V_CMP_CLASS_F16:
+  case Opcode::V_CMPX_CLASS_F16:
   case Opcode::V_CMP_LT_F16:
   case Opcode::V_CMP_EQ_F16:
   case Opcode::V_CMP_LE_F16:
@@ -18793,9 +22132,12 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_STORE_FORMAT_XYZ:
   case Opcode::BUFFER_STORE_FORMAT_XYZW:
   case Opcode::BUFFER_LOAD_UBYTE:
+  case Opcode::BUFFER_LOAD_UBYTE_D16:
   case Opcode::BUFFER_LOAD_SBYTE:
   case Opcode::BUFFER_LOAD_USHORT:
   case Opcode::BUFFER_LOAD_SSHORT:
+  case Opcode::BUFFER_LOAD_SHORT_D16:
+  case Opcode::BUFFER_LOAD_SHORT_D16_HI:
   case Opcode::BUFFER_LOAD_DWORDX2:
   case Opcode::BUFFER_LOAD_DWORDX3:
   case Opcode::BUFFER_LOAD_DWORDX4:
@@ -18821,6 +22163,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::BUFFER_ATOMIC_SMAX:
   case Opcode::BUFFER_ATOMIC_UMAX:
   case Opcode::BUFFER_ATOMIC_AND:
+  case Opcode::BUFFER_ATOMIC_ADD_X2:
   case Opcode::BUFFER_ATOMIC_AND_X2:
   case Opcode::BUFFER_ATOMIC_OR:
   case Opcode::BUFFER_ATOMIC_XOR:
@@ -18843,6 +22186,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::FLAT_STORE_DWORDX4:
   case Opcode::DS_ADD_U32:
   case Opcode::DS_ADD_U64:
+  case Opcode::DS_MAX_RTN_U64:
+  case Opcode::DS_CMPST_RTN_B32:
+  case Opcode::DS_CMPST_RTN_B64:
   case Opcode::DS_ADD_RTN_U32:
   case Opcode::DS_SUB_U32:
   case Opcode::DS_SUB_RTN_U32:
@@ -18912,6 +22258,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::IMAGE_SAMPLE:
   case Opcode::IMAGE_GATHER4_LZ:
   case Opcode::IMAGE_GATHER4_C:
+  case Opcode::IMAGE_GATHER4_C_L:
   case Opcode::IMAGE_GATHER4_C_LZ:
   case Opcode::IMAGE_GATHER4_LZ_O:
   case Opcode::IMAGE_GATHER4_C_O:
@@ -19391,27 +22738,34 @@ TestCase ScalarAbsI32UpdatesScc() {
     code.push_back(EncodeSop2(0x0a, dst_sgpr, InlineU32(1), InlineU32(0)));
   };
 
-  code.push_back(EncodeSMovB32(0, InlineU32(0)));
+  AppendSmemLoadOpcode(&code, 0x08, 16, 0);
   set_scc(true);
-  code.push_back(EncodeSop1(0x34, 1, 0));
-  capture_scc(2);
+  code.push_back(EncodeSop1(0x34, 17, 16));
+  capture_scc(18);
 
-  AppendSMovLiteral(&code, 3, 0xfffffffbu);
+  AppendSmemLoadOpcode(&code, 0x08, 19, 4);
   set_scc(false);
-  code.push_back(EncodeSop1(0x34, 4, 3));
-  capture_scc(5);
+  code.push_back(EncodeSop1(0x34, 20, 19));
+  capture_scc(21);
 
-  AppendStoreSgpr(&code, 1, 0);
-  AppendStoreSgpr(&code, 2, 1);
-  AppendStoreSgpr(&code, 4, 2);
-  AppendStoreSgpr(&code, 5, 3);
+  AppendSmemLoadOpcode(&code, 0x08, 22, 8);
+  set_scc(false);
+  code.push_back(EncodeSop1(0x34, 23, 22));
+  capture_scc(24);
+
+  AppendStoreSgpr(&code, 17, 0);
+  AppendStoreSgpr(&code, 18, 1);
+  AppendStoreSgpr(&code, 20, 2);
+  AppendStoreSgpr(&code, 21, 3);
+  AppendStoreSgpr(&code, 23, 4);
+  AppendStoreSgpr(&code, 24, 5);
   AppendEnd(&code);
 
   return {"ScalarAbsI32UpdatesScc",
           code,
-          {},
-          {0, 0, 5, 1},
-          {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32,
+          {0, 0xfffffffbu, 0x80000000u},
+          {0, 0, 5, 1, 0x80000000u, 1},
+          {O::S_BUFFER_LOAD_DWORD, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32,
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -20272,6 +23626,191 @@ TestCase ScalarBrevB32PreservesScc() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarZeroBitOps() {
+  using O = ShaderOpcode;
+  constexpr uint64_t inputs[] = {0, UINT64_MAX, 0xaaaaaaaa55555555ull,
+      0xffffffff7fffffffull, 0xfffffffeffffffffull, 0x7fffffffffffffffull,
+      0x00000000ffffffffull, 0xffffffff00000000ull};
+  TestCase test;
+  test.name = "ScalarZeroBitOps";
+  for (const auto input : inputs)
+    test.initial.insert(test.initial.end(), {u32(input), u32(input >> 32)});
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto check = [&](u32 opcode, u32 source, uint64_t input, bool scc) {
+    const u32 width = opcode == 0x0e || opcode == 0x12 ? 64 : 32;
+    u32 count = 0, first = UINT32_MAX;
+    for (u32 bit = 0; bit < width; ++bit) {
+      if (((input >> bit) & 1u) == 0) {
+        ++count;
+        if (first == UINT32_MAX) first = bit;
+      }
+    }
+    const bool counting = opcode == 0x0d || opcode == 0x0e;
+    code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(scc)));
+    code.push_back(EncodeSop1(opcode, 20, source));
+    if (source == 255) code.push_back(u32(input));
+    code.push_back(EncodeSMovB32(22, 253)); // Capture SCC before readback.
+    AppendStoreSgpr(&code, 20, u32(test.expected.size()));
+    AppendStoreSgpr(&code, 21, u32(test.expected.size() + 1));
+    AppendStoreSgpr(&code, 22, u32(test.expected.size() + 2));
+    test.expected.insert(test.expected.end(),
+        {counting ? count : first, u32(input >> 32), u32(counting ? count != 0 : scc)});
+  };
+  for (u32 index = 0; index < std::size(inputs); ++index) {
+    for (u32 word = 0; word < 2; ++word) {
+      AppendVMovU32(&code, 30, (index * 2 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8 + word, Vgpr(1)));
+    }
+    for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+      for (const bool scc : {false, true}) {
+        code.push_back(EncodeSop1(0x04, 20, 8)); // Destination aliases the source.
+        check(opcode, 20, inputs[index], scc);
+      }
+    }
+  }
+  for (const u32 opcode : {0x0du, 0x0eu, 0x11u, 0x12u}) {
+    for (const u32 source : {128u, 193u, 255u}) {
+      const uint64_t input = source == 128 ? 0 : source == 193 ? UINT64_MAX : 0xffffffffull;
+      AppendSMovLiteral(&code, 21, u32(input >> 32));
+      check(opcode, source, input, true); // Only inline -1 sign extends to B64.
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_BCNT0_I32_B32, O::S_BCNT0_I32_B64,
+      O::S_FF0_I32_B32, O::S_FF0_I32_B64, O::S_CMP_EQ_U32, O::S_MOV_B32,
+      O::S_MOV_B64, O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+      O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// V_READFIRSTLANE reads the first EXEC lane, or lane 0 when EXEC is zero; v1 = 100 + lane.
+TestCase VectorReadFirstLaneExecMasks(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorReadFirstLaneExecMasksWave32"
+                              : "VectorReadFirstLaneExecMasksWave64";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  code.push_back(EncodeSop1(0x04, 10, 126)); // s_mov_b64 s[10:11], exec
+  const uint64_t masks[] = {0, 1ull << 5, 0x80000000ull, 1ull << 32, 1ull << 63, 0xffff000000000000ull};
+  for (const uint64_t mask : masks) {
+    if (wave_size == 32 && mask > UINT32_MAX) continue;
+    AppendSMovLiteral(&code, 126, u32(mask));
+    if (wave_size == 64) AppendSMovLiteral(&code, 127, u32(mask >> 32));
+    code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
+    code.push_back(EncodeSop1(0x04, 126, 10));
+    AppendStoreSgpr(&code, 20, u32(test.expected.size()));
+    test.expected.push_back(100 + (mask == 0 ? 0 : std::countr_zero(mask)));
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::V_READFIRSTLANE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarSextMasks(u32 bits, u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = bits == 8 ? (wave_size == 32 ? "ScalarSextI8MasksWave32"
+                                         : "ScalarSextI8MasksWave64")
+                       : (wave_size == 32 ? "ScalarSextI16MasksWave32"
+                                         : "ScalarSextI16MasksWave64");
+  constexpr u32 high = 0x80000001u;
+  test.initial = bits == 8
+                     ? std::vector<u32>{0xdeadff00u, 0xabcdff7fu, 0x12340080u, 0xabcf00ffu}
+                     : std::vector<u32>{0xdead0000u, 0xabcd7fffu, 0x12348000u, 0xabcfffffu};
+  const u32 extended_values[] = {0u, bits == 8 ? 0x7fu : 0x7fffu,
+                                bits == 8 ? 0xffffff80u : 0xffff8000u, 0xffffffffu};
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < 4u; ++i) {
+    const auto extended = extended_values[i];
+    for (const bool scc : {false, true}) {
+      AppendVMovU32(&code, 30, i * 4u);
+      AppendBufferLoadDword(&code, 3, 30);
+      code.push_back(EncodeVop1(0x02, 11, Vgpr(3)));
+      AppendSMovLiteral(&code, 107, high);
+      code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
+      code.push_back(EncodeSop1(0x04, 126, 128)); // Scalar operations execute with empty EXEC.
+      // The I16 word is captured s_sext_i32_i16 vcc_lo, s11.
+      code.push_back(bits == 8 ? 0xbeea190bu : 0xbeea1a0bu);
+      code.push_back(EncodeSMovB32(20, 106));
+      code.push_back(EncodeSMovB32(21, 107));
+      code.push_back(EncodeSMovB32(22, 253));
+      code.push_back(EncodeSop1(0x04, 126, 193));
+      AppendVMovU32(&code, 1, 1);
+      code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+      const u32 expected[] = {extended, high, scc ? 1u : 0u};
+      for (u32 word = 0; word < 3u; ++word) {
+        AppendStoreSgprAtLaneDwordOffset(&code, 20u + word, 0, test.expected.size());
+        test.expected.insert(test.expected.end(), wave_size, expected[word]);
+      }
+      AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, test.expected.size());
+      const uint64_t mask = (uint64_t{high} << 32u) | extended;
+      for (u32 lane = 0; lane < wave_size; ++lane)
+        test.expected.push_back(static_cast<u32>((mask >> lane) & 1u));
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::S_MOV_B64, O::S_CMP_EQ_U32,
+                  bits == 8 ? O::S_SEXT_I32_I8 : O::S_SEXT_I32_I16,
+                  O::V_CNDMASK_B32, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{bits == 8 ? "S_SEXT_I32_I8 vcc_lo, s11"
+                                  : "S_SEXT_I32_I16 vcc_lo, s11", 8u}};
+  test.required_spirv = {"OpBitFieldSExtract"};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarSextConstantsAndAliases() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarSextConstantsAndAliases";
+  auto &code = test.code;
+  for (const u32 opcode : {0x19u, 0x1au}) {
+    const u32 literal = opcode == 0x19u ? 0x12345680u : 0x12348000u;
+    const u32 extended = opcode == 0x19u ? 0xffffff80u : 0xffff8000u;
+    for (const bool scc : {false, true}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(scc ? 1u : 0u), InlineU32(1)));
+      code.push_back(EncodeSop1(opcode, 10, 255));
+      code.push_back(literal);
+      code.push_back(EncodeSop1(opcode, 10, 10)); // In-place source/destination.
+      code.push_back(EncodeSop1(opcode, 11, InlineU32(0)));
+      code.push_back(EncodeSop1(opcode, 12, InlineU32(64)));
+      code.push_back(EncodeSop1(opcode, 13, 193)); // Inline -1.
+      code.push_back(EncodeSMovB32(14, 253));
+      const u32 expected[] = {extended, 0, 64, 0xffffffffu, scc ? 1u : 0u};
+      for (u32 word = 0; word < 5u; ++word) {
+        AppendStoreSgpr(&code, 10u + word, test.expected.size());
+        test.expected.push_back(expected[word]);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::S_CMP_EQ_U32, O::S_SEXT_I32_I8, O::S_SEXT_I32_I16,
+                  O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_SEXT_I32_I8", 10u}, {"S_SEXT_I32_I16", 10u}};
+  return test;
+}
+
 TestCase ScalarBrevB64OperandsAndMasks(u32 wave_size) {
   using O = ShaderOpcode;
   TestCase test;
@@ -20469,6 +24008,114 @@ TestCase Scalar64BitOps() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarDynamic64BitOps() {
+  using O = ShaderOpcode;
+  struct Input {
+    uint64_t lhs;
+    uint64_t rhs;
+    u32 count;
+    u32 offset;
+  };
+  constexpr Input inputs[] = {
+      {0, UINT64_MAX, 0, 0},
+      {UINT64_MAX, 0, 63, 0},
+      {0x8000000000000000ull, 1, 64, 0},
+      {0x0123456789abcdefull, 0xfedcba9876543210ull, 127, 0},
+      {UINT64_MAX, 0xffffffffull, 64, 1},
+      {0x0123456789abcdefull, 0x0123456789abcdefull, 63, 32},
+      {UINT64_MAX, 0x100000000ull, 127, 63},
+      {0, 0, 0, 127},
+      {0x8000000000000001ull, UINT64_MAX, UINT32_MAX, 64},
+  };
+  TestCase test;
+  test.name = "ScalarDynamic64BitOps";
+  for (const auto &input : inputs) {
+    test.initial.insert(test.initial.end(),
+                        {u32(input.lhs), u32(input.lhs >> 32), u32(input.rhs),
+                         u32(input.rhs >> 32), input.count, input.offset,
+                         ((input.count & 127u) << 16) | input.offset});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](uint64_t value, bool scc) {
+    const auto output = static_cast<u32>(test.expected.size());
+    code.push_back(EncodeSMovB32(18, 253));
+    AppendStoreSgprPair(&code, 16, output);
+    AppendStoreSgpr(&code, 18, output + 2);
+    test.expected.insert(test.expected.end(),
+                         {u32(value), u32(value >> 32), u32(scc)});
+  };
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    const auto [lhs, rhs, count, offset] = inputs[i];
+    for (u32 word = 0; word < 7; ++word) {
+      AppendVMovU32(&code, 30, (i * 7 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8 + word, Vgpr(1)));
+    }
+    for (const auto [opcode, value] :
+         std::array<std::pair<u32, uint64_t>, 8>{{{0x0f, lhs & rhs},
+                                                  {0x11, lhs | rhs},
+                                                  {0x13, lhs ^ rhs},
+                                                  {0x15, lhs & ~rhs},
+                                                  {0x17, lhs | ~rhs},
+                                                  {0x19, ~(lhs & rhs)},
+                                                  {0x1b, ~(lhs | rhs)},
+                                                  {0x1d, ~(lhs ^ rhs)}}}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(value != 0)));
+      code.push_back(EncodeSop2(opcode, 16, 8, 10));
+      store(value, value != 0);
+    }
+    for (const bool select_lhs : {false, true}) {
+      code.push_back(EncodeSopc(0x06, InlineU32(0), InlineU32(!select_lhs)));
+      code.push_back(EncodeSop2(0x0b, 16, 8, 10));
+      store(select_lhs ? lhs : rhs, select_lhs);
+    }
+    // BFM preserves SCC; BFE sets it from the entire extracted result.
+    code.push_back(EncodeSop2(0x25, 16, 12, 13));
+    store(((uint64_t{1} << (count & 63u)) - 1u) << (offset & 63u), true);
+    code.push_back(EncodeSop2(0x29, 16, 8, 14));
+    const auto width = std::min(count & 127u, 64u - (offset & 63u));
+    const auto mask = width == 64 ? UINT64_MAX : (uint64_t{1} << width) - 1u;
+    const auto extracted = (lhs >> (offset & 63u)) & mask;
+    store(extracted, extracted != 0);
+    for (const bool set : {false, true}) {
+      code.push_back(EncodeSop1(0x04, 16, 8));
+      code.push_back(EncodeSop1(set ? 0x1e : 0x1c, 16, 12));
+      const auto bit = uint64_t{1} << (count & 63u);
+      store(set ? lhs | bit : lhs & ~bit, extracted != 0);
+    }
+    code.push_back(EncodeSop1(0x2d, 16, 8));
+    uint64_t quads = 0;
+    for (u32 quad = 0; quad < 16; ++quad) {
+      quads |= uint64_t((lhs >> (quad * 4) & 15u) != 0) << quad;
+    }
+    store(quads, quads != 0);
+    code.push_back(EncodeSop1(0x3b, 16, 8));
+    uint64_t replicated = 0;
+    for (u32 bit = 0; bit < 32; ++bit) {
+      replicated |= ((lhs >> bit) & 1u) * (uint64_t{3} << (2 * bit));
+    }
+    store(replicated, quads != 0);
+    code.push_back(EncodeSMovB32(17, InlineU32(0)));
+    code.push_back(EncodeSop1(0x10, 16, 8));
+    store(std::popcount(lhs), lhs != 0);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {
+      O::V_MOV_B32,       O::BUFFER_LOAD_DWORD,  O::V_READFIRSTLANE_B32,
+      O::S_MOV_B32,       O::S_CMP_EQ_U32,       O::S_AND_B64,
+      O::S_OR_B64,        O::S_XOR_B64,          O::S_ANDN2_B64,
+      O::S_ORN2_B64,      O::S_NAND_B64,         O::S_NOR_B64,
+      O::S_XNOR_B64,      O::S_CSELECT_B64,      O::S_BFM_B64,
+      O::S_BFE_U64,       O::S_MOV_B64,          O::S_BITSET0_B64,
+      O::S_BITSET1_B64,   O::S_QUADMASK_B64,     O::S_BITREPLICATE_B64_B32,
+      O::S_BCNT1_I32_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpTypeInt 64 0", "OpBitwiseAnd", "OpBitwiseOr",
+                         "OpBitwiseXor"};
+  return test;
+}
+
 uint64_t ReferenceAshrI64(uint64_t bits, u32 count) {
   const auto shift = count & 63u;
   // Complementing negative values expresses sign fill using unsigned shifts.
@@ -20542,8 +24189,7 @@ TestCase ScalarAshrI64Edges(bool dynamic) {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {
       {"S_ASHR_I64", std::size(sources) * std::size(counts)}};
-  test.required_spirv = {"OpShiftRightArithmetic"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftRightArithmetic", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -20644,7 +24290,7 @@ TestCase ScalarAshrI64OperandsAndAliases() {
                   O::S_ASHR_I64,         O::V_MOV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"S_ASHR_I64", instructions}};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv.push_back("OpTypeInt 64 0");
   return test;
 }
 
@@ -20706,7 +24352,6 @@ TestCase ScalarAshrI64Masks(u32 wave_size) {
                   O::S_ENDPGM};
   test.decoded_counts = {{"S_ASHR_I64 vcc_lo, vcc_lo", std::size(cases)},
                          {"S_ASHR_I64 exec_lo, exec_lo", std::size(cases)}};
-  test.forbidden_spirv = {"OpTypeInt 64"};
   test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -21350,6 +24995,62 @@ TestCase VectorIntegerOps() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorIntegerExtremaRuntimeEdges() {
+  using O = ShaderOpcode;
+  constexpr std::array<std::array<u32, 3>, 8> inputs{{
+      {0x80000000u, 0u, 0x7fffffffu},
+      {0xffffffffu, 1u, 0x80000000u},
+      {1u, 0x80000000u, 0xffffffffu},
+      {1u, 0xffffffffu, 0x80000000u},
+      {0x7fffffffu, 0x7fffffffu, 0x80000000u},
+      {0x80000000u, 0x80000000u, 0xffffffffu},
+      {0xffffffffu, 0xffffffffu, 0xffffffffu},
+      {0u, 0u, 0u},
+  }};
+  TestCase test;
+  test.name = "VectorIntegerExtremaRuntimeEdges";
+  for (const auto &values : inputs)
+    test.initial.insert(test.initial.end(), values.begin(), values.end());
+  test.expected = test.initial;
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    for (u32 reg = 0; reg < 3; ++reg) {
+      AppendVMovU32(&test.code, 30, (i * 3u + reg) * 4u);
+      AppendBufferLoadDword(&test.code, reg, 30);
+    }
+    for (u32 op = 0; op < 4; ++op)
+      test.code.push_back(EncodeVop2(0x11u + op, 4u + op, Vgpr(0), 1));
+    constexpr std::array opcodes{0x152u, 0x155u, 0x158u, 0x153u, 0x156u, 0x159u};
+    for (u32 op = 0; op < opcodes.size(); ++op)
+      AppendVop3(&test.code, opcodes[op], 8u + op, Vgpr(0), Vgpr(1), Vgpr(2));
+    const auto output = static_cast<u32>(test.expected.size());
+    for (u32 result = 0; result < 10; ++result)
+      AppendStoreVgpr(&test.code, 4u + result, output + result);
+
+    auto unsigned_values = inputs[i];
+    std::array<int32_t, 3> signed_values;
+    for (u32 j = 0; j < 3; ++j)
+      signed_values[j] = std::bit_cast<int32_t>(unsigned_values[j]);
+    test.expected.insert(test.expected.end(), {
+        static_cast<u32>(std::min(signed_values[0], signed_values[1])),
+        static_cast<u32>(std::max(signed_values[0], signed_values[1])),
+        std::min(unsigned_values[0], unsigned_values[1]),
+        std::max(unsigned_values[0], unsigned_values[1])});
+    std::sort(signed_values.begin(), signed_values.end());
+    std::sort(unsigned_values.begin(), unsigned_values.end());
+    test.expected.insert(test.expected.end(), {
+        static_cast<u32>(signed_values[0]), static_cast<u32>(signed_values[2]),
+        static_cast<u32>(signed_values[1]), unsigned_values[0],
+        unsigned_values[2], unsigned_values[1]});
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN_I32, O::V_MAX_I32,
+                  O::V_MIN_U32, O::V_MAX_U32, O::V_MIN3_I32, O::V_MAX3_I32,
+                  O::V_MED3_I32, O::V_MIN3_U32, O::V_MAX3_U32, O::V_MED3_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {" SMin ", " SMax ", " UMin ", " UMax "};
+  return test;
+}
+
 TestCase VectorFfbhI32NativeAndVop3OnGpu() {
   using O = ShaderOpcode;
 
@@ -21537,6 +25238,121 @@ TestCase Vop1SdwaNotPartialSourcesAndDestinations() {
   return test;
 }
 
+TestCase Vop2SdwaBitwiseByteDestinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  // Low result bytes of AND, OR, XOR, XNOR for the two runtime inputs.
+  constexpr std::array<u32, 4> result_bytes{0xa4u, 0xbeu, 0x1au, 0xe5u};
+  constexpr std::array<u32, 4> alias_expected{
+      0xc350e5a6u, 0xc3fce5a6u, 0xc3ace5a6u, 0xc353e5a6u};
+  constexpr u32 sentinel = 0xa1b2c3d4u;
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaBitwiseByteDestinationsWave64"
+                             : "Vop2SdwaBitwiseByteDestinationsWave32";
+  test.initial = {0xc3d4e5a6u, 0x9b785abcu};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 reg, u32 expected) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 op = 0; op < 4; ++op) {
+    AppendVMovU32(&code, 30, 0);
+    AppendBufferLoadDword(&code, 12, 30);
+    AppendVMovU32(&code, 30, 4);
+    AppendBufferLoadDword(&code, 13, 30);
+    for (u32 selector = 0; selector < 4; ++selector) {
+      for (u32 unused = 0; unused < 3; ++unused) {
+        AppendVMovLiteral(&code, 26, sentinel);
+        code.push_back(EncodeVop2(0x1b + op, 26, 249, 13));
+        code.push_back(EncodeVop2Sdwa(12, selector, unused));
+        // RDNA2 table 88: pad, sign extend above/zero below, or preserve.
+        const u32 shift = selector * 8u;
+        u32 expected = result_bytes[op] << shift;
+        if (unused == 1 && (result_bytes[op] & 0x80u) != 0) {
+          expected = (0xffffff00u | result_bytes[op]) << shift;
+        } else if (unused == 2) {
+          expected |= sentinel & ~(0xffu << shift);
+        }
+        store(26, expected);
+      }
+    }
+    // Read source byte2 and word1 before overwriting source0's byte2.
+    code.push_back(EncodeVop2(0x1b + op, 12, 249, 13));
+    code.push_back(EncodeVop2Sdwa(12, 2, 2, 2, 5));
+    store(12, alias_expected[op]);
+    // Source1 may also alias the destination.
+    AppendVMovU32(&code, 30, 0);
+    AppendBufferLoadDword(&code, 12, 30);
+    code.push_back(EncodeVop2(0x1b + op, 13, 249, 13));
+    code.push_back(EncodeVop2Sdwa(12, 1, 2));
+    store(13, 0x9b7800bcu | (result_bytes[op] << 8u));
+    for (u32 unused = 0; unused < 3; ++unused) {
+      AppendVMovLiteral(&code, 26, sentinel);
+      code.push_back(EncodeSMovB32(126, InlineU32(0)));
+      code.push_back(EncodeVop2(0x1b + op, 26, 249, 13));
+      code.push_back(EncodeVop2Sdwa(12, 2, unused));
+      code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      store(26, sentinel);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_AND_B32, O::V_OR_B32, O::V_XOR_B32, O::V_XNOR_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitwiseAnd", "OpBitwiseOr", "OpBitwiseXor", "OpNot",
+                         "OpBitFieldInsert", "OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop2SdwaLshlrevByteDestinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xa1b2c3d4u;
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaLshlrevByteDestinations64" : "Vop2SdwaLshlrevByteDestinations32";
+  test.initial = {0x44668122u};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 reg, u32 expected) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  AppendBufferLoadDword(&code, 4, 30);
+  for (const u32 count : {6u, 7u, 39u}) {
+    const u32 byte = count == 6u ? 0x40u : 0x80u;
+    for (u32 selector = 0; selector < 4u; ++selector) {
+      for (u32 unused = 0; unused < 3u; ++unused) {
+        AppendVMovLiteral(&code, 5, sentinel);
+        code.push_back(EncodeVop2(0x1a, 5, 249, 4));
+        // count7/byte1/preserve is captured 340a08f9 01861187 at PC4e98.
+        code.push_back(EncodeVop2Sdwa(InlineU32(count), selector, unused, 6, 1,
+                                      0, 0, 0, 0, 0, 0, 1));
+        const u32 shift = selector * 8u;
+        const u32 fill = unused == 1u && byte == 0x80u ? 0xffffff00u : 0u;
+        store(5, ((byte | fill) << shift) |
+                     (unused == 2u ? sentinel & ~(0xffu << shift) : 0u));
+      }
+    }
+  }
+  code.insert(code.end(), {EncodeVop2(0x1a, 4, 249, 4), 0x01861187u});
+  store(4, 0x44668022u); // Source1 aliases the preserved destination.
+  AppendVMovLiteral(&code, 5, sentinel);
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  code.insert(code.end(), {0x340a08f9u, 0x01861187u});
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  store(5, sentinel);
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpShiftLeftLogical", "OpBitFieldInsert", "OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop1SdwaMovByteDestinations() {
   using O = ShaderOpcode;
 
@@ -21572,7 +25388,81 @@ TestCase Vop1SdwaMovByteDestinations() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.decoded_counts = {{"V_MOV_B32 v1.sdwa(sel=2,sext=0), 0", 1}};
-  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract", "OpBitwiseOr"};
+  test.required_spirv = {"OpBitFieldInsert", "OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase Vop1SdwaMovByteSources(u32 wave_size) {
+  using O = ShaderOpcode;
+  // Select 0x80 from each byte position, with nonzero neighboring bytes.
+  constexpr std::array<u32, 4> sources{
+      0x12345680u, 0x12348056u, 0x12803456u, 0x80341256u};
+  // RDNA2 table 88 / PS5 SDWA-related options: PAD, SEXT, PRESERVE.
+  constexpr std::array<u32, 18> partial_expected{
+      0x00000080u, 0xffffff80u, 0xa1b2c380u,
+      0x00008000u, 0xffff8000u, 0xa1b280d4u,
+      0x00800000u, 0xff800000u, 0xa180c3d4u,
+      0x80000000u, 0x80000000u, 0x80b2c3d4u,
+      0x00000080u, 0x00000080u, 0xa1b20080u,
+      0x00800000u, 0x00800000u, 0x0080c3d4u};
+  constexpr std::array<u32, 6> sext_word_expected{
+      0x0000ff80u, 0xffffff80u, 0xa1b2ff80u,
+      0xff800000u, 0xff800000u, 0xff80c3d4u};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop1SdwaMovByteSourcesWave64"
+                             : "Vop1SdwaMovByteSourcesWave32";
+  test.initial.assign(sources.begin(), sources.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 expected) {
+    AppendStoreVgpr(&code, 1, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 src_sel = 0; src_sel < sources.size(); ++src_sel) {
+    AppendVMovU32(&code, 30, src_sel * sizeof(u32));
+    AppendBufferLoadDword(&code, 2, 30);
+    for (u32 sext = 0; sext < 2; ++sext) {
+      for (u32 dst_sel = 0; dst_sel < 6; ++dst_sel) {
+        for (u32 unused = 0; unused < 3; ++unused) {
+          AppendVMovLiteral(&code, 1, 0xa1b2c3d4u);
+          code.push_back(EncodeVop1(0x01, 1, 249));
+          code.push_back(EncodeVop1Sdwa(2, dst_sel, unused, src_sel, sext));
+          store(sext && dst_sel >= 4 ? sext_word_expected[(dst_sel - 4u) * 3u + unused]
+                                    : partial_expected[dst_sel * 3u + unused]);
+        }
+      }
+    }
+  }
+  // Aliasing must read the source byte before replacing the destination byte.
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 1, 30);
+  code.push_back(EncodeVop1(0x01, 1, 249));
+  code.push_back(EncodeVop1Sdwa(1, 3, 2, 1));
+  store(0x56345680u);
+  // Scalar and inline sources use the same independent selectors.
+  AppendSMovLiteral(&code, 18, 0x12348056u);
+  code.push_back(EncodeVop1(0x01, 1, 249));
+  code.push_back(EncodeVop1Sdwa(18, 5, 0, 1, 1, 0, 0, 1));
+  store(0xff800000u);
+  AppendVMovLiteral(&code, 1, 0xa1b2c3d4u);
+  code.push_back(EncodeVop1(0x01, 1, 249));
+  code.push_back(EncodeVop1Sdwa(193, 0, 2, 3, 0, 0, 0, 1)); // Inline -1.
+  store(0xa1b2c3ffu);
+  for (u32 unused = 0; unused < 3; ++unused) {
+    AppendVMovLiteral(&code, 1, 0xa1b2c3d4u);
+    code.push_back(EncodeSMovB32(126, InlineU32(0)));
+    code.push_back(EncodeVop1(0x01, 1, 249));
+    code.push_back(EncodeVop1Sdwa(2, 4, unused, 0));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    store(0xa1b2c3d4u);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -21615,7 +25505,7 @@ TestCase Vop2SdwaAddNcCapturedHighWordDestination() {
   test.expected = {0x00010002u, 0x0006c3d4u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32,
                   O::V_ADD_NC_U32,      O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  test.required_spirv = {"OpIAdd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.required_spirv = {"OpIAdd", "OpBitFieldInsert"};
   return test;
 }
 
@@ -21689,6 +25579,178 @@ TestCase Vop2SdwaMaxI32CapturedHighWord(u32 wave_size) {
   return test;
 }
 
+TestCase Vop2SdwaMinI32CapturedByte0(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct MinCase { u32 lhs, packed_rhs, expected, exec = 1; };
+  constexpr std::array<MinCase, 9> cases{{
+      {0xfffffffbu, 0x12345678u, 0xfffffffbu},
+      {0x00000064u, 0xffffff80u, 0x00000064u},
+      {0x000000c8u, 0xffffff80u, 0x00000080u},
+      {0x7fffffffu, 0x000000ffu, 0x000000ffu},
+      {0x80000000u, 0x7fffffffu, 0x80000000u},
+      {0x00000100u, 0x00000105u, 0x00000005u},
+      {0xffffffffu, 0x00000000u, 0xffffffffu},
+      {0x00000010u, 0xdeadbe0fu, 0x0000000fu},
+      {0x80000001u, 0x7fff0123u, 0x7fff0123u, 0},
+  }};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMinI32Byte0Wave64"
+                             : "Vop2SdwaMinI32Byte0Wave32";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.packed_rhs});
+  }
+  test.initial.resize(cases.size() * 3u, 0xdeadbeefu);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 5, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    code.push_back(EncodeSMovB32(126, InlineU32(cases[i].exec)));
+    code.insert(code.end(), {0x220404f9u, 0x00060605u});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = cases.size() * 2u + i;
+    AppendStoreVgpr(&code, 2, out);
+    test.expected[out] = cases[i].expected;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MIN_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN_I32 v2, v5, v2.sdwa(sel=0,sext=0)", cases.size()}};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop2SdwaMulI24Destinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr std::array<u32, 5> sources{
+      0xdead1234u, 0xabcdffffu, 0x98768001u, 0x34560000u, 0x56789abcu};
+  constexpr std::array<u32, 10> captured_expected{
+      0xdead91a0u, 0xdead3400u, 0xabcdfff8u, 0xabcdff00u,
+      0x98760008u, 0x98760100u, 0x34560000u, 0x34560000u,
+      0x56789abcu, 0x56789abcu};
+  constexpr std::array<u32, 18> partial_expected{
+      0x00000080u, 0xffffff80u, 0xa1b2c380u,
+      0x00008000u, 0xffff8000u, 0xa1b280d4u,
+      0x00800000u, 0xff800000u, 0xa180c3d4u,
+      0x80000000u, 0x80000000u, 0x80b2c3d4u,
+      0x0000a180u, 0xffffa180u, 0xa1b2a180u,
+      0xa1800000u, 0xa1800000u, 0xa180c3d4u};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMulI24DestinationsWave64"
+                             : "Vop2SdwaMulI24DestinationsWave32";
+  test.initial.assign(sources.begin(), sources.end());
+  test.initial.push_back(0xabcde080u);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < sources.size(); ++index) {
+    AppendVMovU32(&code, 30, index * sizeof(u32));
+    AppendBufferLoadDword(&code, 12, 30);
+    AppendBufferLoadDword(&code, 26, 30);
+    AppendSMovLiteral(&code, 106, 256);
+    code.push_back(EncodeSMovB32(126, InlineU32(index + 1u == sources.size() ? 0 : 1)));
+    // Captured WORD0/PRESERVE encodings alias their source and destination.
+    code.insert(code.end(), {0x121818f9u, 0x04861488u,
+                             0x123434f9u, 0x0486146au});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreVgpr(&code, 12, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&code, 26, static_cast<u32>(test.expected.size()) + 1u);
+    test.expected.push_back(captured_expected[index * 2u]);
+    test.expected.push_back(captured_expected[index * 2u + 1u]);
+  }
+  AppendVMovU32(&code, 30, sources.size() * sizeof(u32));
+  AppendBufferLoadDword(&code, 12, 30);
+  for (u32 selector = 0; selector < 6; ++selector) {
+    for (u32 unused = 0; unused < 3; ++unused) {
+      AppendVMovLiteral(&code, 26, 0xa1b2c3d4u);
+      code.push_back(EncodeVop2(0x09, 26, 249, 12));
+      code.push_back(EncodeVop2Sdwa(InlineU32(3), selector, unused, 6, 4,
+                                    0, 0, 0, 0, 0, 0, 1));
+      AppendStoreVgpr(&code, 26, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(partial_expected[selector * 3u + unused]);
+    }
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MUL_I32_I24, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpIMul", "OpBitFieldUExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase Vop2SdwaMulU24Destinations(u32 wave_size) {
+  using O = ShaderOpcode;
+  // The high source bytes are discarded: 3 * 0xe080 = 0x2a180.
+  constexpr std::array<u32, 18> partial_expected{
+      0x00000080u, 0xffffff80u, 0xa1b2c380u,
+      0x00008000u, 0xffff8000u, 0xa1b280d4u,
+      0x00800000u, 0xff800000u, 0xa180c3d4u,
+      0x80000000u, 0x80000000u, 0x80b2c3d4u,
+      0x0000a180u, 0xffffa180u, 0xa1b2a180u,
+      0xa1800000u, 0xa1800000u, 0xa180c3d4u};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMulU24DestinationsWave64"
+                             : "Vop2SdwaMulU24DestinationsWave32";
+  test.initial = {0xab000003u, 0xcd00e080u, 0xffffffffu};
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto store = [&](u32 reg, u32 expected) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected);
+  };
+  for (u32 i = 0; i < test.initial.size(); ++i) {
+    AppendVMovU32(&code, 30, i * sizeof(u32));
+    AppendBufferLoadDword(&code, 12u + i, 30);
+  }
+  for (u32 selector = 0; selector < 6; ++selector) {
+    for (u32 unused = 0; unused < 3; ++unused) {
+      AppendVMovLiteral(&code, 26, 0xa1b2c3d4u);
+      code.push_back(EncodeVop2(0x0b, 26, 249, 13));
+      code.push_back(EncodeVop2Sdwa(12, selector, unused));
+      store(26, partial_expected[selector * 3u + unused]);
+    }
+  }
+  // Full result still truncates the 48-bit unsigned product to 32 bits.
+  code.push_back(EncodeVop2(0x0b, 26, 249, 14));
+  code.push_back(EncodeVop2Sdwa(14));
+  store(26, 0xfe000001u);
+  // Either multiplicand may alias the partial destination.
+  code.push_back(EncodeVop2(0x0b, 12, 249, 13));
+  code.push_back(EncodeVop2Sdwa(12, 5, 2));
+  store(12, 0xa1800003u);
+  code.push_back(EncodeVop2(0x0b, 13, 249, 13));
+  code.push_back(EncodeVop2Sdwa(InlineU32(3), 2, 2, 6, 4,
+                                0, 0, 0, 0, 0, 0, 1));
+  store(13, 0xcd80e080u);
+  // Source-byte sign extension happens before the unsigned 24-bit multiply.
+  AppendSMovLiteral(&code, 18, 0x12348056u);
+  code.push_back(EncodeVop2(0x0b, 26, 249, InlineU32(3)));
+  code.push_back(EncodeVop2Sdwa(18, 5, 0, 1, 6, 1, 0, 0, 0, 0, 0, 1, 1));
+  store(26, 0xfe800000u);
+  for (u32 unused = 0; unused < 3; ++unused) {
+    AppendVMovLiteral(&code, 26, 0xa1b2c3d4u);
+    code.push_back(EncodeSMovB32(126, InlineU32(0)));
+    code.push_back(EncodeVop2(0x0b, 26, 249, 13));
+    code.push_back(EncodeVop2Sdwa(12, 4, unused));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    store(26, 0xa1b2c3d4u);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MUL_U32_U24, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MUL_U32_U24", 25u}};
+  test.required_spirv = {"OpIMul", "OpBitFieldUExtract", "OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop2SdwaLshrrevCapturedByte1Source() {
   using O = ShaderOpcode;
 
@@ -21739,34 +25801,6 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase Vop2SdwaOrByteDestinations() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x11223344u);
-  AppendVMovLiteral(&code, 1, 0xaabbccddu);
-  // Captured: v_or_b32_sdwa v0, v0, v1 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE
-  // src0_sel:BYTE_0 src1_sel:BYTE_2 (0x380002f9 0x02001300).
-  code.push_back(EncodeVop2(0x1c, 0, 249, 1));
-  code.push_back(EncodeVop2Sdwa(0, 3, 2, 0, 2));
-  AppendStoreVgpr(&code, 0, 0);
-  // Every byte destination: (byte 0 of v2) | (byte 1 of v1), the other bytes preserved.
-  AppendVMovLiteral(&code, 2, 0x000000f0u);
-  for (u32 sel = 0; sel < 4; sel++) {
-    AppendVMovLiteral(&code, 10 + sel, 0xa1b2c3d4u);
-    code.push_back(EncodeVop2(0x1c, 10 + sel, 249, 1));
-    code.push_back(EncodeVop2Sdwa(2, sel, 2, 0, 1));
-    AppendStoreVgpr(&code, 10 + sel, 1 + sel);
-  }
-  AppendEnd(&code);
-
-  return {"Vop2SdwaOrByteDestinations",
-          code,
-          {},
-          {0xff223344u, 0xa1b2c3fcu, 0xa1b2fcd4u, 0xa1fcc3d4u, 0xfcb2c3d4u},
-          {O::V_MOV_B32, O::V_OR_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
 TestCase Vop3CvtPkI16I32Captured() {
   using O = ShaderOpcode;
 
@@ -21787,10 +25821,8 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
-  test.ir_counts = {{" = BitwiseAnd32 ", 2},
-                    {" = ShiftLeftLogical32 ", 1},
-                    {" = BitwiseOr32 ", 1}};
-  test.required_spirv = {"OpBitwiseAnd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  test.ir_counts = {{" = BitFieldInsert ", 1}};
+  test.required_spirv = {"OpBitFieldInsert"};
   return test;
 }
 
@@ -21836,6 +25868,56 @@ TestCase Vop3MulLoU16CapturedAndSelectors() {
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_MUL_LO_U16", 10}};
   test.required_spirv = {"OpIMul"};
+  return test;
+}
+
+TestCase Vop3F32ClampFlushesNaN() {
+  using O = ShaderOpcode;
+  struct ClampCase {
+    u32 opcode, input, expected;
+    u32 abs = 0;
+  };
+  constexpr u32 inf = 0x7f800000u, one = 0x3f800000u;
+  // GoW Ragnarok PS 3d52c7172f95fd37 0x2564: v_mul_f32 v18 clamp, inf, |v2|; and
+  // fma(x, inf, inf) clamp. The clamp modifier (DX10 clamp mode) turns their NaN into 0.
+  const std::array<ClampCase, 10> cases{{
+      {0x108, 0x00000000u, 0, 2}, // inf * |0| = NaN.
+      {0x108, 0x80000000u, 0, 2}, // inf * |-0| = NaN.
+      {0x108, 0x3f000000u, one, 2},
+      {0x108, 0xc0400000u, one, 2},
+      {0x14b, 0xbf800000u, 0}, // -1 * inf + inf = NaN.
+      {0x14b, 0x40000000u, one},
+      {0x103, 0x7fc00000u, 0}, // Quiet NaN input.
+      {0x103, 0xffc00001u, 0}, // Negative NaN input.
+      {0x103, 0x3e800000u, 0x3e800000u},
+      {0x103, 0x3fc00000u, one},
+  }};
+  TestCase test;
+  test.name = "Vop3F32ClampFlushesNaN";
+  for (const auto &entry : cases) test.initial.push_back(entry.input);
+  test.expected = test.initial;
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 20, inf);
+  AppendVMovU32(&code, 21, 0);
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 2, 30); // Runtime inputs prevent folding.
+    AppendVMovLiteral(&code, 18, 0xa5a5beefu);
+    if (entry.opcode == 0x108) {
+      AppendVop3(&code, 0x108, 18, Vgpr(20), Vgpr(2), 0, entry.abs, 0, true);
+    } else if (entry.opcode == 0x14b) {
+      AppendVop3(&code, 0x14b, 18, Vgpr(2), Vgpr(20), Vgpr(20), 0, 0, true);
+    } else {
+      AppendVop3(&code, 0x103, 18, Vgpr(2), Vgpr(21), 0, 0, 0, true);
+    }
+    AppendStoreVgpr(&code, 18, static_cast<u32>(cases.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_F32, O::V_FMA_F32,
+                  O::V_ADD_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MUL_F32", 4}, {"V_FMA_F32", 2}, {"V_ADD_F32", 4}};
   return test;
 }
 
@@ -21897,6 +25979,65 @@ TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
   return test;
 }
 
+TestCase Vop3Min3U16CapturedAndSelectors() {
+  using O = ShaderOpcode;
+  struct MinCase {
+    u32 lhs, rhs, third, expected;
+    u32 selectors = 0;
+    u32 dst = 17;
+    bool active = true;
+  };
+  constexpr u32 a = 0x0009ea60u, b = 0x0007c350u, c = 0x00059c40u;
+  const std::array<MinCase, 10> cases{{
+      {a, b, c, 0x0005beefu, 14}, // Captured: min(60000, 7, 5) into v17.hi.
+      {a, b, c, 0xa5a59c40u}, // Unsigned values above INT16_MAX.
+      {a, b, c, 0xa5a50009u, 1},
+      {a, b, c, 0xa5a50007u, 2},
+      {a, b, c, 0xa5a50005u, 4},
+      {a, b, c, 0x0005beefu, 15},
+      {a, b, c, 0x9c40ea60u, 8, 4}, // Destination aliases source 0.
+      {0xabcdffffu, 0xffff0000u, 0x98768000u, 0xa5a50000u},
+      {0x0000ffffu, 0x7fffffffu, 0x8000ffffu, 0xa5a5ffffu},
+      {a, b, c, 0xa5a5beefu, 14, 17, false},
+  }};
+  TestCase test;
+  test.name = "Vop3Min3U16CapturedAndSelectors";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs, entry.third});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    u32 offset = i * 12u;
+    for (u32 reg : {4u, 0u, 7u}) {
+      AppendVMovU32(&code, 30, offset);
+      AppendBufferLoadDword(&code, reg, 30); // Runtime inputs prevent folding.
+      offset += 4u;
+    }
+    AppendVMovLiteral(&code, 17, 0xa5a5beefu);
+    if (!entry.active) {
+      code.push_back(EncodeSop1(0x04, 24, 126)); // Preserve the initial active lanes.
+      code.push_back(EncodeSop1(0x04, 126, 128));
+    }
+    if (i == 0u) {
+      code.insert(code.end(), {0xd7537011u, 0x041e0104u});
+    } else {
+      AppendVop3(&code, 0x353, entry.dst, Vgpr(4), Vgpr(0), Vgpr(7), 0,
+                  entry.selectors);
+    }
+    if (!entry.active) code.push_back(EncodeSop1(0x04, 126, 24));
+    AppendStoreVgpr(&code, entry.dst, static_cast<u32>(test.initial.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MIN3_U16,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MIN3_U16", cases.size()}};
+  test.required_spirv = {" UMin "};
+  return test;
+}
+
 TestCase Vop3Med3I16Captured() {
   using O = ShaderOpcode;
 
@@ -21919,7 +26060,7 @@ TestCase Vop3Med3I16Captured() {
   test.decoded_counts = {{"0x00000020: V_MED3_I16 v3.sdwa(sel=5,sext=0), "
                           "v5.opsel(lo=1,hi=0,neghi=0), s25, s27\n",
                           1}};
-  test.required_spirv = {"OpSLessThan"};
+  test.required_spirv = {" SMin ", " SMax "};
   return test;
 }
 
@@ -21945,7 +26086,7 @@ TestCase Vop2SdwaMinU32PreservesWordDestination() {
   test.expected = {0xa1b20007u, 0xa1b2001fu};
   test.opcodes = {O::V_MOV_B32, O::V_MIN_U32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpULessThan", "OpSelect"};
+  test.required_spirv = {" UMin ", "OpSelect"};
   return test;
 }
 
@@ -21997,8 +26138,7 @@ TestCase VectorVop3LshrrevB64Captured() {
   test.expected = {0x789abcdeu, 0x00123456u};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHRREV_B64,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftRightLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftRightLogical"};
   return test;
 }
 
@@ -22025,8 +26165,7 @@ TestCase VectorVop3LshlrevB64Captured() {
   test.expected = {33u, 0u, 2u, 1u, 0u};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64, O::V_ADD_NC_U32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftLeftLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftLeftLogical", "OpTypeInt 64 0"};
   return test;
 }
 
@@ -22034,7 +26173,7 @@ TestCase VectorDynamicU64ShiftEdges() {
   using O = ShaderOpcode;
   TestCase test;
   test.name = "VectorDynamicU64ShiftEdges";
-  test.initial = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u};
+  test.initial = {0u, 1u, 31u, 32u, 33u, 63u, 64u, 65u, 127u, UINT32_MAX};
   test.expected = test.initial;
   auto& code = test.code;
   for (const uint64_t source : {uint64_t{0}, uint64_t{1},
@@ -22063,8 +26202,8 @@ TestCase VectorDynamicU64ShiftEdges() {
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_LSHLREV_B64,
                   O::V_LSHRREV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical", "OpSelect"};
-  test.forbidden_spirv = {"OpTypeInt 64"};
+  test.required_spirv = {"OpShiftLeftLogical", "OpShiftRightLogical",
+                         "OpTypeInt 64 0"};
   return test;
 }
 
@@ -22195,6 +26334,31 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
+TestCase VectorBfmDropsMaskBitsPastBit31() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 vgpr = 0; vgpr < 4; vgpr++) {
+    AppendVMovU32(&code, 30, vgpr * sizeof(u32));
+    AppendBufferLoadDword(&code, vgpr, 30);
+  }
+  AppendVop3(&code, 0x363, 10, Vgpr(0), Vgpr(1));
+  AppendVop3(&code, 0x363, 11, Vgpr(2), Vgpr(3));
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorBfmDropsMaskBitsPastBit31";
+  test.code = std::move(code);
+  // Size and offset use bits [4:0]; mask bits shifted past bit 31 are dropped.
+  test.initial = {24, 16, 0x3fu, 0x21u};
+  test.expected = {0xffff0000u, 0xfffffffeu};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_BFM_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorAlignByteUsesTwoBitByteOffset() {
   using O = ShaderOpcode;
 
@@ -22253,6 +26417,34 @@ TestCase VectorCarryAndBitCountOps() {
           {O::V_MOV_B32, O::V_CMP_T_U32, O::V_ADDC_U32, O::V_BCNT_U32_B32,
            O::V_MBCNT_LO_U32_B32, O::V_MBCNT_HI_U32_B32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase ScalarVector64BitFloatInlineConstants() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeSop1(0x04, 40, 242));
+  code.push_back(EncodeSop2(0x11, 42, 240, InlineU32(0)));
+  code.push_back(EncodeSop1(0x04, 44, 248));
+  AppendVop3(&code, 0x300, 2, InlineU32(32), 244);
+  code.push_back(EncodeSMovB32(46, InlineU32(0)));
+  AppendSMovLiteral(&code, 47, 0x3ff00000u);
+  code.push_back(EncodeSopc(0x12, 46, 242));
+  code.push_back(EncodeSMovB32(48, 253));
+  AppendStoreSgprPair(&code, 40, 0);
+  AppendStoreSgprPair(&code, 42, 2);
+  AppendStoreVgpr(&code, 2, 4);
+  AppendStoreVgpr(&code, 3, 5);
+  AppendStoreSgprPair(&code, 44, 6);
+  AppendStoreSgpr(&code, 48, 8);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarVector64BitFloatInlineConstants";
+  test.code = std::move(code);
+  test.expected = {0u, 0x3ff00000u, 0u, 0x3fe00000u, 0x40000000u, 0u, 0x6dc9c882u, 0x3fc45f30u, 1u};
+  test.opcodes = {O::S_MOV_B64, O::S_OR_B64, O::V_LSHRREV_B64, O::S_MOV_B32, O::S_CMP_EQ_U64,
+                  O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase VectorMbcntUsesThreadMask() {
@@ -22349,7 +26541,7 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = IAddCarry32 ", 2}};
+  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 3}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
@@ -22597,23 +26789,53 @@ TestCase VectorVop3BSubCoU32UsesRdna2Opcode310() {
 
 TestCase VectorMadU64U32UnsignedCarryOut() {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 1, 0xffffffffu);
-  AppendVMovU32(&code, 2, 2);
-  AppendVMovU32(&code, 4, 2);
-  AppendVMovLiteral(&code, 5, 0xffffffffu);
-  AppendVop3B(&code, 0x176u, 10, 20, Vgpr(1), Vgpr(2), Vgpr(4));
-  AppendStoreVgpr(&code, 10, 0);
-  AppendStoreVgpr(&code, 11, 1);
-  AppendStoreSgprPair(&code, 20, 2);
+  struct Input {
+    u32 lhs;
+    u32 rhs;
+    uint64_t addend;
+  };
+  constexpr Input inputs[] = {
+      {0, UINT32_MAX, UINT64_MAX},
+      {UINT32_MAX, 2, 0xffffffff00000002ull},
+      {UINT32_MAX, UINT32_MAX, UINT64_MAX},
+      {0x80000000u, 0x80000000u, 0x4000000000000000ull},
+      {3, 5, 7},
+  };
+  TestCase test;
+  test.name = "VectorMadU64U32UnsignedCarryOut";
+  for (const auto &input : inputs) {
+    test.initial.insert(
+        test.initial.end(),
+        {input.lhs, input.rhs, u32(input.addend), u32(input.addend >> 32)});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    for (u32 word = 0; word < 4; ++word) {
+      AppendVMovU32(&code, 30, (i * 4 + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, word < 2 ? word + 1 : word + 2, 30);
+    }
+    AppendVop3B(&code, 0x176u, 10, 20, Vgpr(1), Vgpr(2), Vgpr(4));
+    const auto output = static_cast<u32>(test.expected.size());
+    AppendStoreVgpr(&code, 10, output);
+    AppendStoreVgpr(&code, 11, output + 1);
+    AppendStoreSgprPair(&code, 20, output + 2);
+    const auto product = uint64_t(inputs[i].lhs) * inputs[i].rhs;
+    const auto sum = product + inputs[i].addend;
+    test.expected.insert(test.expected.end(),
+                         {u32(sum), u32(sum >> 32), u32(sum < product), 0});
+  }
   AppendEnd(&code);
-
-  return {"VectorMadU64U32UnsignedCarryOut",
-          code,
-          {},
-          {0x00000000u, 0x00000001u, 0x00000001u, 0x00000000u},
-          {O::V_MOV_B32, O::V_MAD_U64_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_U64_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // NVIDIA rejected the native widening multiply in a large Astro's Playroom
+  // vertex shader. Keep its 32x32 product portable and its 64-bit addition
+  // native.
+  test.required_spirv = {"OpTypeInt 64 0", "OpUMulExtended", "OpIMul %uint",
+                         "OpIAdd %ulong", "OpULessThan"};
+  test.forbidden_spirv = {"OpIMul %ulong", "OpIMul %long"};
+  return test;
 }
 
 TestCase VectorLaneAndPackedOps() {
@@ -22767,6 +26989,48 @@ TestCase Vop3pIntegerNegationCapturedAndSelectedHalves() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop3pInt16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0x80007fffu);
+  AppendVMovLiteral(&code, 2, 0x00010001u);
+  AppendVMovLiteral(&code, 3, 0xfffe0003u);
+  AppendVMovLiteral(&code, 4, 0x00130004u);
+  AppendVMovLiteral(&code, 5, 0x8010f00fu);
+  AppendVMovLiteral(&code, 6, 0x00050007u);
+
+  AppendVop3p(&code, 0x00u, 10, Vgpr(1), Vgpr(3), Vgpr(6), 0x7u);
+  AppendVop3p(&code, 0x09u, 11, Vgpr(1), Vgpr(3), Vgpr(6), 0x7u);
+  AppendVop3p(&code, 0x01u, 12, Vgpr(1), Vgpr(3), 0, 0x3u);
+  AppendVop3p(&code, 0x02u, 13, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0bu, 14, Vgpr(2), Vgpr(3), 0, 0x3u);
+  AppendVop3p(&code, 0x04u, 15, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x05u, 16, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x06u, 17, Vgpr(4), Vgpr(5), 0, 0x3u);
+  AppendVop3p(&code, 0x08u, 18, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0cu, 19, Vgpr(1), Vgpr(2), 0, 0x3u);
+  AppendVop3p(&code, 0x0du, 20, Vgpr(1), Vgpr(2), 0, 0x3u);
+
+  for (u32 i = 0; i < 11; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3pInt16Ops";
+  test.code = std::move(code);
+  test.expected = {0x00058004u, 0x00058004u, 0x00007ffdu, 0x80018000u,
+                   0x0003fffeu, 0x008000f0u, 0x10020f00u, 0xf002ff00u,
+                   0x80000001u, 0x80007fffu, 0x00010001u};
+  test.opcodes = {O::V_MOV_B32,        O::V_PK_MAD_I16,     O::V_PK_MAD_U16,
+                  O::V_PK_MUL_LO_U16,  O::V_PK_ADD_I16,     O::V_PK_SUB_U16,
+                  O::V_PK_LSHLREV_B16, O::V_PK_LSHRREV_B16, O::V_PK_ASHRREV_I16,
+                  O::V_PK_MIN_I16,     O::V_PK_MAX_U16,     O::V_PK_MIN_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase CvtPkU8F32PacksSelectedByte() {
   using O = ShaderOpcode;
 
@@ -22811,6 +27075,49 @@ TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
           {0x80010001u},
           {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase CvtPkrtzF16F32RuntimeEdges() {
+  using O = ShaderOpcode;
+  // Independent expected half encodings, including truncation boundaries and NaN payloads.
+  constexpr std::array<std::array<u32, 2>, 31> inputs{{
+      {0x00000000u, 0x0000u}, {0x80000000u, 0x8000u},
+      {0x00000001u, 0x0000u}, {0x007fffffu, 0x0000u},
+      {0x00800000u, 0x0000u}, {0x32ffffffu, 0x0000u},
+      {0x33000000u, 0x0000u}, {0x337fffffu, 0x0000u},
+      {0x33800000u, 0x0001u}, {0x33c00000u, 0x0001u},
+      {0x34000000u, 0x0002u}, {0x387fc000u, 0x03ffu},
+      {0x387fe000u, 0x03ffu}, {0x387fffffu, 0x03ffu},
+      {0x38800000u, 0x0400u}, {0x38802000u, 0x0401u},
+      {0x3e22f983u, 0x3117u}, {0x3f800000u, 0x3c00u},
+      {0x3f801000u, 0x3c00u}, {0x3f801001u, 0x3c00u},
+      {0x3f802000u, 0x3c01u}, {0x477fe000u, 0x7bffu},
+      {0x477ff000u, 0x7bffu}, {0x477fffffu, 0x7bffu},
+      {0x47800000u, 0x7bffu}, {0x7f7fffffu, 0x7bffu},
+      {0x7f800000u, 0x7c00u}, {0x7f800001u, 0x7e00u},
+      {0x7fa02000u, 0x7f01u}, {0x7fc12000u, 0x7e09u},
+      {0x7fffffffu, 0x7fffu},
+  }};
+  TestCase test;
+  test.name = "CvtPkrtzF16F32RuntimeEdges";
+  for (const auto &input : inputs)
+    test.initial.insert(test.initial.end(), {input[0], input[0] ^ 0x80000000u});
+  test.expected = test.initial;
+  for (u32 i = 0; i < inputs.size(); ++i) {
+    for (u32 reg = 0; reg < 2; ++reg) {
+      AppendVMovU32(&test.code, 30, (i * 2u + reg) * 4u);
+      AppendBufferLoadDword(&test.code, reg, 30);
+    }
+    test.code.push_back(EncodeVop2(0x2f, 2, Vgpr(0), 1));
+    AppendStoreVgpr(&test.code, 2, static_cast<u32>(test.expected.size()));
+    const auto half = inputs[i][1];
+    test.expected.push_back(half | ((half ^ 0x8000u) << 16));
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PKRTZ_F16_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"PackHalf2x16", "UnpackHalf2x16"};
+  return test;
 }
 
 TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {
@@ -22871,13 +27178,17 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
   AppendVMovLiteral(&code, 3, 0x80007e00u);
   AppendVMovLiteral(&code, 4, 0x40007d01u);
   AppendVMovLiteral(&code, 5, 0x7d014000u);
+  AppendVMovLiteral(&code, 6, 0x40007e01u);
+  AppendVMovLiteral(&code, 7, 0x7e013c00u);
 
   AppendVop3p(&code, 0x11, 10, Vgpr(0), Vgpr(1), 0, 0x3);
   AppendVop3p(&code, 0x12, 11, Vgpr(2), Vgpr(3), 0, 0x3);
   AppendVop3p(&code, 0x11, 12, Vgpr(4), Vgpr(5), 0, 0x3);
   AppendVop3p(&code, 0x12, 13, Vgpr(4), Vgpr(5), 0, 0x3);
+  AppendVop3p(&code, 0x11, 14, Vgpr(6), Vgpr(7), 0, 0x3);
+  AppendVop3p(&code, 0x12, 15, Vgpr(6), Vgpr(7), 0, 0x3);
 
-  for (u32 i = 0; i < 4; i++) {
+  for (u32 i = 0; i < 6; i++) {
     AppendStoreVgpr(&code, 10 + i, i);
   }
   AppendEnd(&code);
@@ -22885,7 +27196,7 @@ TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
   return {"PackedMinMaxF16NanAndSignedZeroEdges",
           code,
           {},
-          {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u},
+          {0x80004000u, 0x00004000u, 0x7f017f01u, 0x7f017f01u, 0x40003c00u, 0x40003c00u},
           {O::V_MOV_B32, O::V_PK_MIN_F16, O::V_PK_MAX_F16,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
@@ -23527,11 +27838,12 @@ TestCase VectorPermlane16FetchInactiveFi() {
   return test;
 }
 
-TestCase VectorDpp8Captured(bool masked_exec) {
+TestCase VectorDpp8Captured(bool masked_exec, u32 wave_size = 64, bool fi = false) {
   using O = ShaderOpcode;
   constexpr u32 sentinel = 0xaaaaaaaau;
-  const u32 masks[] = {masked_exec ? 0x0f0f0f0fu : 0xffffffffu,
-                      masked_exec ? 0xf0f0f0f0u : 0xffffffffu};
+  // Both wave halves contain active and inactive lane-3 sources for the ADD.
+  const u32 masks[] = {masked_exec ? 0x0f0ff0f0u : 0xffffffffu,
+                      masked_exec ? 0xf0f00f0fu : 0xffffffffu};
   std::vector<u32> code;
   AppendVMovU32(&code, 5, 100);
   code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
@@ -23540,20 +27852,21 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendVMovLiteral(&code, 3, sentinel);
   AppendVMovLiteral(&code, 8, sentinel);
   AppendSMovLiteral(&code, 126, masks[0]);
-  AppendSMovLiteral(&code, 127, masks[1]);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, masks[1]);
   // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
-  code.push_back(EncodeVop1(0x01, 2, 233));
+  const u32 encoding = fi ? 234u : 233u;
+  code.push_back(EncodeVop1(0x01, 2, encoding));
   code.push_back(0xfacfac05u);
-  code.push_back(EncodeVop1(0x01, 3, 233));
+  code.push_back(EncodeVop1(0x01, 3, encoding));
   code.push_back(0x68868805u);
   // CS 6babb2a8915d35c4, pc 0xcc: add lane 3 of each group to its own v7.
-  code.push_back(0x4a100ee9u);
+  code.push_back(EncodeVop2(0x25, 8, encoding, 7));
   code.push_back(0x6db6db07u);
   AppendSMovLiteral(&code, 126, 0xffffffffu);
-  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  if (wave_size == 64) AppendSMovLiteral(&code, 127, 0xffffffffu);
   code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
   AppendBufferStoreDword(&code, 2, 6);
-  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  AppendVMovU32(&code, 7, wave_size * sizeof(u32));
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
   AppendBufferStoreDword(&code, 3, 6);
   code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
@@ -23561,11 +27874,13 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
-                          : "VectorDpp8Captured";
+  const char *names[2][2] = {
+      {"VectorDpp8Wave32MaskedExec", "VectorDpp8Wave64MaskedExec"},
+      {"VectorDpp8FiWave32MaskedExec", "VectorDpp8FiWave64MaskedExec"}};
+  test.name = masked_exec ? names[fi][wave_size == 64] : "VectorDpp8Captured";
   test.code = std::move(code);
-  test.expected.resize(192, sentinel);
-  for (u32 lane = 0; lane < 64; ++lane) {
+  test.expected.resize(3 * wave_size, sentinel);
+  for (u32 lane = 0; lane < wave_size; ++lane) {
     const auto mask = masks[lane / 32u];
     if ((mask & (1u << (lane % 32u))) == 0) {
       continue;
@@ -23574,20 +27889,20 @@ TestCase VectorDpp8Captured(bool masked_exec) {
                            (lane & ~7u) | (lane & 3u)};
     for (u32 permutation = 0; permutation < 2; ++permutation) {
       const auto source = sources[permutation];
-      test.expected[permutation * 64u + lane] =
-          (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
+      test.expected[permutation * wave_size + lane] =
+          fi || (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
     }
     const u32 source = (lane & ~7u) | 3u;
-    test.expected[128u + lane] = 100u + lane;
-    if ((mask & (1u << (source % 32u))) != 0) {
-      test.expected[128u + lane] += 100u + source;
+    test.expected[2 * wave_size + lane] = 100u + lane;
+    if (fi || (mask & (1u << (source % 32u))) != 0) {
+      test.expected[2 * wave_size + lane] += 100u + source;
     }
   }
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
                   O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{".dpp8(", 3}};
-  test.compute_info.wave_size = 64;
-  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -23640,6 +27955,85 @@ TestCase VectorDppRowXmask() {
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppRowShare(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorDppRowShareWave32" : "VectorDppRowShareWave64";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1)); // v1 = 100 + lane.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  for (u32 selector = 0; selector < 16; ++selector) {
+    for (const bool masked : {false, true}) {
+      const u32 row_mask = masked ? 0xau : 0xfu;
+      const u32 bank_mask = masked ? 0x5u : 0xfu;
+      // Keep the selected source active in every row while masking destination
+      // lanes. Row and bank masks affect destinations, not the shared source.
+      const u32 source_lanes = 0x00010001u << selector;
+      const u32 exec[] = {masked ? 0xaaaaaaaau | source_lanes : 0xffffffffu,
+                          masked ? 0x55555555u | source_lanes : 0xffffffffu};
+      AppendVMovLiteral(&code, 2, sentinel);
+      AppendVMovLiteral(&code, 3, sentinel);
+      AppendSMovLiteral(&code, 126, exec[0]);
+      if (wave_size == 64) AppendSMovLiteral(&code, 127, exec[1]);
+      code.push_back(EncodeVop1(0x01, 2, 250));
+      code.push_back(EncodeVop1Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeVop2(0x25, 3, 250, 0));
+      code.push_back(EncodeVop2Dpp(1, 0x150 + selector, row_mask, bank_mask));
+      code.push_back(EncodeSop1(0x04, 126, 10));
+      for (const u32 reg : {2u, 3u}) {
+        AppendStoreVgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
+        for (u32 lane = 0; lane < wave_size; ++lane) {
+          const bool write = ((row_mask >> (lane / 16)) & 1u) &&
+              ((bank_mask >> ((lane / 4) % 4)) & 1u) &&
+              ((exec[lane / 32] >> (lane % 32)) & 1u);
+          const u32 source = (lane / 16) * 16 + selector;
+          test.expected.push_back(write ? 100 + source + (reg == 3 ? lane : 0) : sentinel);
+        }
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// row_mirror, row_half_mirror and row_ror read lanes within the row; v1 = 100 + lane.
+TestCase VectorDppMirrorAndRotate(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "VectorDppMirrorAndRotateWave32" : "VectorDppMirrorAndRotateWave64";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1));
+  for (const u32 control : {0x140u, 0x141u, 0x121u, 0x125u, 0x12fu}) {
+    code.push_back(EncodeVop1(0x01, 2, 250));
+    code.push_back(EncodeVop1Dpp(1, control));
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, u32(test.expected.size()));
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const u32 source = control == 0x140u   ? (lane | 15u) - (lane & 15u)
+                         : control == 0x141u ? (lane | 7u) - (lane & 7u)
+                                             : (lane & ~15u) | ((lane - (control & 15u)) & 15u);
+      test.expected.push_back(100 + source);
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
@@ -24034,23 +28428,73 @@ TestCase FloatInlineConstantF16UsesNumericValue() {
   AppendVMovLiteral(&code, 2, 0x3c003c00u); // 1.0h, 1.0h
   AppendVMovLiteral(&code, 10, 0xaaaa0000u);
   AppendVMovLiteral(&code, 12, 0xbbbb0000u);
+  AppendVMovLiteral(&code, 14, 0xcccc0000u);
+  AppendVMovLiteral(&code, 15, 0xdddd0000u);
 
   AppendVop3(&code, 0x34bu, 10, 246u, Vgpr(1), Vgpr(2));
   AppendVop3p(&code, 0x0eu, 11, 246u, Vgpr(1), Vgpr(2), 0x1u);
   AppendVop3(&code, 0x34bu, 12, 248u, 242u, 128u);
+  AppendVop3(&code, 0x311u, 13, 242u, 248u);
+  AppendVop3(&code, 0x34bu, 14, 246u, Vgpr(1), Vgpr(2), 0, 1);
+  AppendVop3(&code, 0x303u, 15, 240u, InlineU32(1));
 
   AppendStoreVgpr(&code, 10, 0);
   AppendStoreVgpr(&code, 11, 1);
   AppendStoreVgpr(&code, 12, 2);
+  AppendStoreVgpr(&code, 13, 3);
+  AppendStoreVgpr(&code, 14, 4);
+  AppendStoreVgpr(&code, 15, 5);
   AppendEnd(&code);
 
   TestCase test;
   test.name = "FloatInlineConstantF16UsesNumericValue";
   test.code = std::move(code);
-  test.expected = {0xaaaa4200u, 0x3c004200u, 0xbbbb3118u};
+  test.expected = {0xaaaa4200u, 0x3c004200u, 0xbbbb3118u,
+                   0x31183c00u, 0xcccc3c00u, 0xdddd3801u};
   test.opcodes = {O::V_MOV_B32, O::V_FMA_F16, O::V_PK_FMA_F16,
+                  O::V_PACK_B32_F16, O::V_ADD_NC_U16,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.decoded_counts = {{"4.000000", 2}, {"0.159155", 1}};
+  test.decoded_counts = {{"4.000000", 3}, {"0.159155", 2}};
+  return test;
+}
+
+TestCase Vop3Int16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 1, 0xabcd0001u);
+  AppendVMovLiteral(&code, 2, 0x12340002u);
+  AppendVMovLiteral(&code, 3, 0x55557fffu);
+  AppendVMovLiteral(&code, 4, 0x66668000u);
+  AppendVMovLiteral(&code, 5, 0x77770013u);
+  AppendVMovLiteral(&code, 6, 0x88888010u);
+  AppendVMovLiteral(&code, 10, 0xaaaa0000u);
+  AppendVMovLiteral(&code, 11, 0xbbbb0000u);
+  AppendVMovLiteral(&code, 12, 0xcccc0000u);
+  AppendVMovLiteral(&code, 13, 0xdddd0000u);
+  AppendVMovLiteral(&code, 14, 0xeeee0000u);
+  AppendVMovLiteral(&code, 15, 0x11110000u);
+
+  AppendVop3(&code, 0x304u, 10, Vgpr(1), Vgpr(2));
+  AppendVop3(&code, 0x30du, 11, Vgpr(3), Vgpr(1));
+  AppendVop3(&code, 0x308u, 12, Vgpr(5), Vgpr(6));
+  AppendVop3(&code, 0x309u, 13, Vgpr(3), Vgpr(4));
+  AppendVop3(&code, 0x30bu, 14, Vgpr(3), Vgpr(4));
+  AppendVop3(&code, 0x308u, 15, Vgpr(5), Vgpr(3));
+
+  for (u32 i = 0; i < 6; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3Int16Ops";
+  test.code = std::move(code);
+  test.expected = {0xaaaaffffu, 0xbbbb8000u, 0xccccf002u,
+                   0xdddd8000u, 0xeeee7fffu, 0x11110fffu};
+  test.opcodes = {O::V_MOV_B32, O::V_SUB_NC_U16, O::V_ADD_NC_I16,
+                  O::V_ASHRREV_I16, O::V_MAX_U16, O::V_MIN_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -24193,29 +28637,122 @@ TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
            O::V_MAX3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
-TestCase VectorMed3F32NanUsesMin3Path() {
+// MIN/MAX/MIN3/MAX3 on runtime inputs, so no compiler can fold them. The expected bits follow
+// the emulated rules: a NaN operand yields the other (S0 for two NaNs) and signed zeros are
+// ordered.
+// Denormal operands are left out; their expected results are not pinned down here.
+TestCase VectorMinMaxF32RuntimeEdges(u32 wave) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x40000000u);
-  AppendVMovLiteral(&code, 1, 0x40400000u);
-  AppendVMovLiteral(&code, 2, 0x7fa00001u);
-  AppendVMovLiteral(&code, 3, 0x7fc00000u);
-
-  AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
-  AppendVop3(&code, 0x157, 11, Vgpr(0), Vgpr(1), Vgpr(3));
-  AppendVop3(&code, 0x157, 12, Vgpr(2), Vgpr(0), Vgpr(1));
-
-  AppendStoreVgpr(&code, 10, 0);
-  AppendStoreVgpr(&code, 11, 1);
-  AppendStoreVgpr(&code, 12, 2);
+  const auto nan = [](u32 v) { return (v & 0x7fffffffu) > 0x7f800000u; };
+  const auto zero = [](u32 v) { return (v & 0x7fffffffu) == 0u; };
+  const auto value = [](u32 v) { return std::bit_cast<float>(v); };
+  const auto min2 = [&](u32 a, u32 b) {
+    if (nan(b)) return a;
+    if (nan(a)) return b;
+    if (zero(a) && zero(b)) return a | b;
+    return value(a) < value(b) ? a : b;
+  };
+  const auto max2 = [&](u32 a, u32 b) {
+    if (nan(b)) return a;
+    if (nan(a)) return b;
+    if (zero(a) && zero(b)) return a & b;
+    return value(a) >= value(b) ? a : b;
+  };
+  constexpr u32 cases[][3] = {
+      {0x40000000u, 0x40400000u, 0x3f800000u}, {0x7fc00000u, 0x40000000u, 0xbf800000u},
+      {0x40000000u, 0x7fc00000u, 0x3f800000u}, {0x7fa00001u, 0x40000000u, 0x40400000u},
+      {0x40000000u, 0x7fa00001u, 0xc0000000u}, {0x80000000u, 0x00000000u, 0x80000000u},
+      {0x00000000u, 0x80000000u, 0x00000000u}, {0x80000000u, 0x80000000u, 0x00000000u},
+      {0xff800000u, 0x7f800000u, 0x00000000u}, {0x7fc00000u, 0x00000000u, 0x80000000u},
+      {0xffc05678u, 0x3f800000u, 0x7fa00001u}, {0xbf800000u, 0xc0000000u, 0x7fc01234u},
+      {0x7fc01234u, 0xffc05678u, 0x7fa00001u}, {0xffc05678u, 0x7fc01234u, 0x3f800000u}};
+  TestCase test;
+  test.name = "VectorMinMaxF32RuntimeEdges";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    const auto [a, b, c] = cases[index];
+    code.push_back(EncodeVop2(0x0f, 10, Vgpr(0), 1));
+    code.push_back(EncodeVop2(0x10, 11, Vgpr(0), 1));
+    AppendVop3(&code, 0x151, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendVop3(&code, 0x154, 13, Vgpr(0), Vgpr(1), Vgpr(2));
+    for (u32 result = 0; result < 4; ++result)
+      AppendStoreVgpr(&code, 10 + result, static_cast<u32>(test.expected.size() + result));
+    test.expected.insert(test.expected.end(),
+                         {min2(a, b), max2(a, b), min2(min2(a, b), c), max2(max2(a, b), c)});
+  }
   AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_MIN_F32,         O::V_MAX_F32,
+                  O::V_MIN3_F32, O::V_MAX3_F32,        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
 
-  return {"VectorMed3F32NanUsesMin3Path",
-          code,
-          {},
-          {0x40000000u, 0x40000000u, 0x40000000u},
-          {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+TestCase VectorMed3F32NanUsesMin3Path(u32 wave) {
+  using O = ShaderOpcode;
+  // Runtime inputs keep every MED3 in the emitted module; compare raw result bits.
+  constexpr u32 cases[][4] = {
+      {0x40000000u, 0x40400000u, 0x7fa00001u, 0x40000000u},
+      {0x40000000u, 0x40400000u, 0x7fc00000u, 0x40000000u},
+      {0x7fa00001u, 0x40000000u, 0x40400000u, 0x40000000u},
+      {0x40400000u, 0x7fc01234u, 0x40000000u, 0x40000000u},
+      {0x80000000u, 0x00000000u, 0x3f800000u, 0x00000000u},
+      {0x00000000u, 0x80000000u, 0xbf800000u, 0x80000000u},
+      {0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0x00000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x80000000u, 0x00000000u, 0x80000000u, 0x00000000u},
+      {0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u},
+      {0xbf800000u, 0x80000000u, 0x00000000u, 0x00000000u},
+      {0xbf800000u, 0x00000000u, 0x80000000u, 0x80000000u},
+      {0x80000000u, 0xbf800000u, 0x00000000u, 0x00000000u},
+      {0x00000000u, 0xbf800000u, 0x80000000u, 0x80000000u},
+      {0x80000000u, 0x00000000u, 0xbf800000u, 0x00000000u},
+      {0x7fc01234u, 0x80000000u, 0x00000000u, 0x80000000u},
+      {0x3f800000u, 0x40400000u, 0x40000000u, 0x40000000u},
+      {0xc0400000u, 0xbf800000u, 0xc0000000u, 0xc0000000u},
+      {0xff800000u, 0x7f800000u, 0x3f800000u, 0x3f800000u},
+      {0x00000001u, 0x7f800000u, 0x7fc01234u, 0x00000001u},
+      {0x80000001u, 0x80000001u, 0x00000000u, 0x80000001u},
+      {0x7fc01234u, 0x7fa00001u, 0xffc05678u, 0xffc05678u},
+      {0x7fa00001u, 0xffc05678u, 0x40000000u, 0x40000000u}};
+  TestCase test;
+  test.name = "VectorMed3F32NanUsesMin3Path";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.float_mode = 0xf0; // Preserve FP32 input/output denormals.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  for (const auto &values : cases)
+    test.initial.insert(test.initial.end(), values, values + 3);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 index = 0; index < std::size(cases); ++index) {
+    for (u32 operand = 0; operand < 3; ++operand) {
+      AppendVMovU32(&code, 30, (index * 3u + operand) * 4u);
+      AppendBufferLoadDword(&code, operand, 30);
+    }
+    AppendVop3(&code, 0x157, 10, Vgpr(0), Vgpr(1), Vgpr(2));
+    AppendStoreVgpr(&code, 10, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(cases[index][3]);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MED3_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{"FPMedTri32", std::size(cases)}};
+  // Measured 16,140/33,705 words; keep min/max expansion growth below a single MED3.
+  test.max_spirv_words = wave == 32u ? 16150u : 33720u;
+  return test;
 }
 
 TestCase VectorFloatConversionOps() {
@@ -24440,9 +28977,10 @@ TestCase VectorCompareInteger64Edges() {
     const auto lhs = pairs[i][0], rhs = pairs[i][1];
     const auto signed_lhs = std::bit_cast<int64_t>(lhs);
     const auto signed_rhs = std::bit_cast<int64_t>(rhs);
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 9>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 11>{{
              {0xa0, false}, {0xa1, signed_lhs < signed_rhs},
-             {0xa3, signed_lhs <= signed_rhs}, {0xa5, lhs != rhs}, {0xa7, true},
+             {0xa3, signed_lhs <= signed_rhs}, {0xa4, signed_lhs > signed_rhs},
+             {0xa5, lhs != rhs}, {0xa6, signed_lhs >= signed_rhs}, {0xa7, true},
              {0xe0, false}, {0xe3, lhs <= rhs}, {0xe6, lhs >= rhs}, {0xe7, true}}}) {
       test.code.push_back(EncodeVopc(opcode, Vgpr(1), 3));
       store_mask(106, value);
@@ -24450,17 +28988,40 @@ TestCase VectorCompareInteger64Edges() {
       store_mask(20, value);
     }
     // A negative literal expands by signedness, including equality comparisons.
-    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 5>{{
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 7>{{
              {0xa1, -1 < signed_rhs}, {0xa3, -1 <= signed_rhs},
-             {0xa5, -1 != signed_rhs},
+             {0xa4, -1 > signed_rhs}, {0xa5, -1 != signed_rhs},
+             {0xa6, -1 >= signed_rhs},
              {0xa2, -1 == signed_rhs}, {0xe3, 0xffffffffull <= rhs}}}) {
       test.code.push_back(EncodeVopc(opcode, 255, 3));
       test.code.push_back(0xffffffffu);
       store_mask(106, value);
+      if (opcode == 0xa4 || opcode == 0xa6) {
+        test.code.push_back(EncodeSop1(0x04, 10, 126));
+        test.code.push_back(EncodeVopc(opcode + 0x10, 255, 3));
+        test.code.push_back(0xffffffffu);
+        test.code.push_back(EncodeSop1(0x04, 20, 126));
+        test.code.push_back(EncodeSop1(0x04, 126, 10));
+        store_mask(20, value);
+      }
     }
-    AppendVop3(&test.code, 0xa3, 20, Vgpr(1), 255);
-    test.code.push_back(0xffffffffu);
-    store_mask(20, signed_lhs <= -1);
+    for (const auto [opcode, value] : std::array<std::pair<u32, bool>, 3>{{
+             {0xa3, signed_lhs <= -1}, {0xa4, signed_lhs > -1},
+             {0xa6, signed_lhs >= -1}}}) {
+      for (const u32 source : {255u, 193u}) { // Literal and inline -1.
+        AppendVop3(&test.code, opcode, 20, Vgpr(1), source);
+        if (source == 255) test.code.push_back(0xffffffffu);
+        store_mask(20, value);
+        if (opcode == 0xa4 || opcode == 0xa6) {
+          test.code.push_back(EncodeSop1(0x04, 10, 126));
+          AppendVop3(&test.code, opcode + 0x10, 22, Vgpr(1), source);
+          if (source == 255) test.code.push_back(0xffffffffu);
+          test.code.push_back(EncodeSop1(0x04, 20, 126));
+          test.code.push_back(EncodeSop1(0x04, 126, 10));
+          store_mask(20, value);
+        }
+      }
+    }
     test.code.push_back(EncodeSop1(0x04, 10, 126));
     AppendVop3(&test.code, 0xb2, 126, 255, Vgpr(3)); // CMPX_EQ_I64 sign-extends -1.
     test.code.push_back(0xffffffffu);
@@ -24483,7 +29044,8 @@ TestCase VectorCompareInteger64Edges() {
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
                   O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_LE_I64, O::V_CMP_EQ_I64,
-                  O::V_CMP_NE_I64, O::V_CMP_T_I64, O::V_CMPX_EQ_I64,
+                  O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64,
+                  O::V_CMP_T_I64, O::V_CMPX_EQ_I64, O::V_CMPX_GT_I64, O::V_CMPX_GE_I64,
                   O::V_CMP_F_U64, O::V_CMP_LE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64,
                   O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpSLessThan", "OpULessThanEqual", "OpUGreaterThanEqual"};
@@ -24493,7 +29055,7 @@ TestCase VectorCompareInteger64Edges() {
 TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   using O = ShaderOpcode;
   // Rows exercise signed 16-bit truncation, full-width integer ordering, and
-  // ordered FP64 comparisons (including NaN, signed zero, and subnormals).
+  // ordered/unordered FP64 comparisons (including NaN, signed zero, and subnormals).
   constexpr std::array<std::array<std::array<uint64_t, 2>, 8>, 3> inputs{{
       {{{0x1111ffff, 0x22220000}, {0x33338000, 0x44447fff},
         {0x55550000, 0x66660000}, {0x77777fff, 0x88888000},
@@ -24508,18 +29070,28 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         {0xc000000000000000ull, 0xbff0000000000000ull},
         {0x7ff0000000000000ull, 0x7ff0000000000000ull},
         {0x3ff0000000000001ull, 0x3ff0000000000000ull}}}}};
-  struct Compare { u32 encoding; O opcode; u32 group; };
+  struct Compare { u32 encoding; O opcode; u32 group; bool update_exec{true}; };
   constexpr std::array comparisons{
       Compare{0x99, O::V_CMPX_LT_I16, 0}, Compare{0x9a, O::V_CMPX_EQ_I16, 0},
       Compare{0x9b, O::V_CMPX_LE_I16, 0}, Compare{0x9c, O::V_CMPX_GT_I16, 0},
       Compare{0x9d, O::V_CMPX_NE_I16, 0}, Compare{0x9e, O::V_CMPX_GE_I16, 0},
       Compare{0xb0, O::V_CMPX_F_I64, 1}, Compare{0xb1, O::V_CMPX_LT_I64, 1},
       Compare{0xb2, O::V_CMPX_EQ_I64, 1}, Compare{0xb3, O::V_CMPX_LE_I64, 1},
+      Compare{0xb4, O::V_CMPX_GT_I64, 1}, Compare{0xb6, O::V_CMPX_GE_I64, 1},
+      Compare{0xa4, O::V_CMP_GT_I64, 1, false},
+      Compare{0xa6, O::V_CMP_GE_I64, 1, false},
       Compare{0xb7, O::V_CMPX_T_I64, 1}, Compare{0xf0, O::V_CMPX_F_U64, 1},
       Compare{0xf1, O::V_CMPX_LT_U64, 1}, Compare{0xf2, O::V_CMPX_EQ_U64, 1},
       Compare{0xf3, O::V_CMPX_LE_U64, 1}, Compare{0xf4, O::V_CMPX_GT_U64, 1},
       Compare{0xf6, O::V_CMPX_GE_U64, 1}, Compare{0xf7, O::V_CMPX_T_U64, 1},
-      Compare{0x33, O::V_CMPX_LE_F64, 2}, Compare{0x36, O::V_CMPX_GE_F64, 2}};
+      Compare{0x30, O::V_CMPX_F_F64, 2}, Compare{0x3f, O::V_CMPX_TRU_F64, 2},
+      Compare{0x33, O::V_CMPX_LE_F64, 2}, Compare{0x36, O::V_CMPX_GE_F64, 2},
+      Compare{0x31, O::V_CMPX_LT_F64, 2}, Compare{0x32, O::V_CMPX_EQ_F64, 2},
+      Compare{0x34, O::V_CMPX_GT_F64, 2}, Compare{0x35, O::V_CMPX_LG_F64, 2},
+      Compare{0x37, O::V_CMPX_O_F64, 2},  Compare{0x38, O::V_CMPX_U_F64, 2},
+      Compare{0x39, O::V_CMPX_NGE_F64, 2}, Compare{0x3a, O::V_CMPX_NLG_F64, 2},
+      Compare{0x3b, O::V_CMPX_NGT_F64, 2}, Compare{0x3c, O::V_CMPX_NLE_F64, 2},
+      Compare{0x3d, O::V_CMPX_NEQ_F64, 2}, Compare{0x3e, O::V_CMPX_NLT_F64, 2}};
   constexpr u32 low_exec = 0xeeeeeeeeu, high_exec = 0x77777777u;
   constexpr u32 vcc_lo = 0x12345678u, vcc_hi = 0x89abcdefu;
   TestCase test;
@@ -24533,8 +29105,6 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   test.expected = test.initial;
   auto& code = test.code;
   code.push_back(EncodeSop1(0x04, 10, 126));
-  AppendSMovLiteral(&code, 106, vcc_lo);
-  AppendSMovLiteral(&code, 107, vcc_hi);
   for (const auto compare : comparisons) {
     for (u32 word = 0; word < 4; ++word) {
       code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
@@ -24547,6 +29117,8 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
       const auto pair = inputs[compare.group][lane % 8];
       const auto a = std::bit_cast<int16_t>(uint16_t(pair[0]));
       const auto b = std::bit_cast<int16_t>(uint16_t(pair[1]));
+      const auto lhs = std::bit_cast<double>(pair[0]);
+      const auto rhs = std::bit_cast<double>(pair[1]);
       bool result = false;
       switch (compare.encoding) {
         case 0x99: result = a < b; break;
@@ -24555,33 +29127,61 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
         case 0x9c: result = a > b; break;
         case 0x9d: result = a != b; break;
         case 0x9e: result = a >= b; break;
-        case 0xb0: case 0xf0: result = false; break;
+        case 0x30: case 0xb0: case 0xf0: result = false; break;
         case 0xb1: result = std::bit_cast<int64_t>(pair[0]) < std::bit_cast<int64_t>(pair[1]); break;
         case 0xb2: case 0xf2: result = pair[0] == pair[1]; break;
         case 0xb3: result = std::bit_cast<int64_t>(pair[0]) <= std::bit_cast<int64_t>(pair[1]); break;
-        case 0xb7: case 0xf7: result = true; break;
+        case 0xa4: case 0xb4: result = std::bit_cast<int64_t>(pair[0]) > std::bit_cast<int64_t>(pair[1]); break;
+        case 0xa6: case 0xb6: result = std::bit_cast<int64_t>(pair[0]) >= std::bit_cast<int64_t>(pair[1]); break;
+        case 0x3f: case 0xb7: case 0xf7: result = true; break;
         case 0xf1: result = pair[0] < pair[1]; break;
         case 0xf3: result = pair[0] <= pair[1]; break;
         case 0xf4: result = pair[0] > pair[1]; break;
         case 0xf6: result = pair[0] >= pair[1]; break;
-        case 0x33: result = std::bit_cast<double>(pair[0]) <= std::bit_cast<double>(pair[1]); break;
-        case 0x36: result = std::bit_cast<double>(pair[0]) >= std::bit_cast<double>(pair[1]); break;
+        case 0x33: result = lhs <= rhs; break;
+        case 0x36: result = lhs >= rhs; break;
+        case 0x31: result = lhs < rhs; break;
+        case 0x32: result = lhs == rhs; break;
+        case 0x34: result = lhs > rhs; break;
+        case 0x35: result = lhs < rhs || lhs > rhs; break;
+        case 0x37: result = !std::isnan(lhs) && !std::isnan(rhs); break;
+        case 0x38: result = std::isnan(lhs) || std::isnan(rhs); break;
+        // The N* predicates are the logical negation of their ordered counterpart,
+        // which is true for any comparison involving a NaN (IEEE unordered compares).
+        case 0x39: result = !(lhs >= rhs); break;
+        case 0x3a: result = !(lhs < rhs || lhs > rhs); break;
+        case 0x3b: result = !(lhs > rhs); break;
+        case 0x3c: result = !(lhs <= rhs); break;
+        case 0x3d: result = !(lhs == rhs); break;
+        case 0x3e: result = !(lhs < rhs); break;
       }
       if (result) expected_exec[lane / 32] |= 1u << (lane % 32);
     }
     expected_exec[0] &= low_exec;
     expected_exec[1] &= high_exec;
     for (const bool vop3 : {false, true}) {
+      AppendSMovLiteral(&code, 106, vcc_lo);
+      AppendSMovLiteral(&code, 107, vcc_hi);
+      AppendSMovLiteral(&code, 22, vcc_lo);
+      AppendSMovLiteral(&code, 23, vcc_hi);
       AppendSMovLiteral(&code, 126, low_exec);
       if (wave_size == 64) AppendSMovLiteral(&code, 127, high_exec);
-      if (vop3) AppendVop3(&code, compare.encoding, 20, Vgpr(1), Vgpr(3));
+      if (vop3) AppendVop3(&code, compare.encoding, 22, Vgpr(1), Vgpr(3));
       else code.push_back(EncodeVopc(compare.encoding, Vgpr(1), 3));
       code.push_back(EncodeSMovB32(20, 126));
       code.push_back(EncodeSMovB32(21, 127));
       code.push_back(EncodeSop1(0x04, 126, 10));
-      for (const auto [reg, value] : std::array<std::pair<u32, u32>, 4>{{
-               {20, expected_exec[0]}, {21, expected_exec[1]},
-               {106, vcc_lo}, {107, vcc_hi}}}) {
+      const bool vcc_dest = !compare.update_exec && !vop3;
+      const bool sgpr_dest = !compare.update_exec && vop3;
+      // Wave32 writes only the low half of VCC or the selected SGPR pair.
+      const u32 mask_hi = wave_size == 64 ? expected_exec[1] : vcc_hi;
+      for (const auto [reg, value] : std::array<std::pair<u32, u32>, 6>{{
+               {20, compare.update_exec ? expected_exec[0] : low_exec},
+               {21, compare.update_exec ? expected_exec[1] : (wave_size == 64 ? high_exec : 0)},
+               {106, vcc_dest ? expected_exec[0] : vcc_lo},
+               {107, vcc_dest ? mask_hi : vcc_hi},
+               {22, sgpr_dest ? expected_exec[0] : vcc_lo},
+               {23, sgpr_dest ? mask_hi : vcc_hi}}}) {
         AppendStoreSgprAtLaneDwordOffset(&code, reg, 0, u32(test.expected.size()));
         test.expected.insert(test.expected.end(), wave_size, value);
       }
@@ -24598,13 +29198,16 @@ TestCase VectorCompareExecWaveMasks(u32 wave_size) {
   test.opcodes.insert(test.opcodes.end(), {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64,
       O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
       O::BUFFER_STORE_DWORD, O::S_ENDPGM});
-  test.required_spirv = {"OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual"};
+  test.required_spirv = {"OpFOrdLessThanEqual", "OpFOrdGreaterThanEqual", "OpFOrdLessThan",
+                         "OpFOrdGreaterThan",   "OpFOrdEqual",           "OpFOrdNotEqual",
+                         "OpFUnordEqual",       "OpFUnordNotEqual",      "OpFUnordLessThan",
+                         "OpFUnordGreaterThan", "OpFUnordLessThanEqual", "OpFUnordGreaterThanEqual"};
   return test;
 }
 
 TestCase VectorCompareF64Edges() {
   using O = ShaderOpcode;
-  constexpr std::array<std::array<uint64_t, 2>, 15> pairs{{
+  constexpr std::array<std::array<uint64_t, 2>, 16> pairs{{
       {0xc000000000000000ull, 0xbff0000000000000ull},
       {0x8000000000000001ull, 0}, {0x3fc45f306dc9c882ull, 0x3fc45f306dc9c882ull},
       {0, 0x8000000000000000ull}, {1, 0}, {1, 1}, {1, 2},
@@ -24613,7 +29216,8 @@ TestCase VectorCompareF64Edges() {
       {0x7ff0000000000000ull, 0x7ff0000000000000ull},
       {0x7ff0000000000000ull, 0xfff0000000000000ull},
       {0x7ff8000000000001ull, 0x7ff8000000000001ull},
-      {0x7ff0000000000001ull, 0}, {0x7fefffffffffffffull, 0x7fefffffffffffffull}}};
+      {0x7ff0000000000001ull, 0}, {0, 0x7ff8000000000001ull},
+      {0x7fefffffffffffffull, 0x7fefffffffffffffull}}};
   TestCase test;
   test.name = "VectorCompareF64Edges";
   for (const auto& pair : pairs)
@@ -24631,19 +29235,28 @@ TestCase VectorCompareF64Edges() {
     }
     const auto lhs = std::bit_cast<double>(pairs[i][0]);
     const auto rhs = std::bit_cast<double>(pairs[i][1]);
-    test.code.push_back(EncodeVopc(0x22, Vgpr(1), 3));
-    store_mask(106, lhs == rhs);
-    test.code.push_back(EncodeVopc(0x23, Vgpr(1), 3));
-    store_mask(106, lhs <= rhs);
-    AppendVop3(&test.code, 0x23, 20, Vgpr(1), Vgpr(3), 0, 1, 0, false, 0, 1);
-    store_mask(20, -std::abs(lhs) <= rhs);
+    for (const bool vop3 : {false, true}) {
+      const auto a = vop3 ? -std::abs(lhs) : lhs;
+      const auto b = vop3 ? -std::abs(rhs) : rhs;
+      const bool ordered = !std::isnan(a) && !std::isnan(b);
+      // Predicates 0x20..0x2f; N* is the negation of its ordered counterpart.
+      const std::array results{false, a < b, a == b, a <= b, a > b,
+          a < b || a > b, a >= b, ordered, !ordered, !(a >= b),
+          !(a < b || a > b), !(a > b), !(a <= b), !(a == b), !(a < b), true};
+      for (u32 predicate = 0; predicate < results.size(); ++predicate) {
+        if (vop3)
+          AppendVop3(&test.code, 0x20 + predicate, 20, Vgpr(1), Vgpr(3),
+                     0, 3, 0, false, 0, 3);
+        else
+          test.code.push_back(EncodeVopc(0x20 + predicate, Vgpr(1), 3));
+        store_mask(vop3 ? 20 : 106, results[predicate]);
+      }
+    }
     test.code.push_back(EncodeVopc(0x23, 255, 3));
     test.code.push_back(0x3ff00000u); // FP64 literals supply the high word.
     store_mask(106, 1.0 <= rhs);
     AppendVop3(&test.code, 0x23, 20, 248, Vgpr(3));
     store_mask(20, std::bit_cast<double>(uint64_t{0x3fc45f306dc9c882ull}) <= rhs);
-    AppendVop3(&test.code, 0x22, 20, Vgpr(1), Vgpr(3), 0, 1, 0, false, 0, 1);
-    store_mask(20, -std::abs(lhs) == rhs);
     test.code.push_back(EncodeVop1(0x02, 100, Vgpr(3)));
     test.code.push_back(EncodeVop1(0x02, 101, Vgpr(4)));
     // Captured e6d76d24f59f8015 PC 0xe4: compare zero with s100:s101.
@@ -24655,9 +29268,16 @@ TestCase VectorCompareF64Edges() {
   AppendEnd(&test.code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
-                  O::V_CMP_EQ_F64, O::V_CMP_LE_F64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpFOrdEqual",
-                         "OpFOrdLessThanEqual"};
+                  O::V_CMP_F_F64, O::V_CMP_LT_F64, O::V_CMP_EQ_F64, O::V_CMP_LE_F64,
+                  O::V_CMP_GT_F64, O::V_CMP_LG_F64, O::V_CMP_GE_F64, O::V_CMP_O_F64,
+                  O::V_CMP_U_F64, O::V_CMP_NGE_F64, O::V_CMP_NLG_F64, O::V_CMP_NGT_F64,
+                  O::V_CMP_NLE_F64, O::V_CMP_NEQ_F64, O::V_CMP_NLT_F64, O::V_CMP_TRU_F64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpCapability Float64", "OpTypeFloat 64", "OpIsNan",
+                         "OpFOrdEqual", "OpFOrdNotEqual", "OpFOrdLessThan",
+                         "OpFOrdLessThanEqual", "OpFOrdGreaterThan", "OpFOrdGreaterThanEqual",
+                         "OpFUnordEqual", "OpFUnordNotEqual", "OpFUnordLessThan",
+                         "OpFUnordLessThanEqual", "OpFUnordGreaterThan", "OpFUnordGreaterThanEqual"};
   return test;
 }
 
@@ -24856,7 +29476,7 @@ TestCase VectorFractF64CapturedAndEdges() {
 
 TestCase VectorMinMaxF64CapturedAndEdges() {
   using O = ShaderOpcode;
-  // MODE.IEEE=0: select the numeric operand, or the second NaN unchanged.
+  // MODE.IEEE=0: select the numeric operand, or the first NaN unchanged.
   constexpr uint64_t positive_zero = 0, negative_zero = 0x8000000000000000ull;
   constexpr uint64_t one = 0x3ff0000000000000ull, minus_two = 0xc000000000000000ull;
   constexpr uint64_t qnan = 0x7ff8123456789abcull, snan = 0xfff0000000000042ull;
@@ -24870,7 +29490,7 @@ TestCase VectorMinMaxF64CapturedAndEdges() {
       {positive_zero, positive_zero, positive_zero, positive_zero},
       {qnan, one, one, one}, {one, qnan, one, one},
       {snan, minus_two, minus_two, minus_two}, {minus_two, snan, minus_two, minus_two},
-      {qnan, snan, snan, snan}, {snan, qnan, qnan, qnan},
+      {qnan, snan, qnan, qnan}, {snan, qnan, snan, snan},
       {infinity, one, one, infinity},
       {infinity | negative_zero, one, infinity | negative_zero, one},
       {0x3fe0000000000000ull, one, 0x3fe0000000000000ull, one},
@@ -25322,23 +29942,28 @@ TestCase VectorRcpIflagF32IntegerReciprocal() {
   return test;
 }
 
+// Runtime inputs keep the driver from folding; finite values from 2^23 up are whole periods.
 TestCase VectorSinCosMaxFiniteSpecialCases() {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0xff7fffffu);
-  code.push_back(EncodeVop1(0x35, 1, Vgpr(0)));
-  code.push_back(EncodeVop1(0x36, 2, Vgpr(0)));
-  AppendStoreVgpr(&code, 1, 0);
-  AppendStoreVgpr(&code, 2, 1);
-  AppendEnd(&code);
-
-  return {"VectorSinCosMaxFiniteSpecialCases",
-          code,
-          {},
-          {0x00000000u, 0x3f800000u},
-          {O::V_MOV_B32, O::V_SIN_F32, O::V_COS_F32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
+  constexpr u32 inputs[] = {0xff7fffffu, 0x7f7fffffu, 0x4b000001u, 0xcb800000u};
+  TestCase test;
+  test.name = "VectorSinCosMaxFiniteSpecialCases";
+  test.initial.assign(std::begin(inputs), std::end(inputs));
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(inputs); i++) {
+    AppendVMovU32(&test.code, 30, i * 4u);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x35, 1, Vgpr(0)));
+    test.code.push_back(EncodeVop1(0x36, 2, Vgpr(0)));
+    AppendStoreVgpr(&test.code, 1, u32(test.expected.size()));
+    AppendStoreVgpr(&test.code, 2, u32(test.expected.size() + 1));
+    test.expected.insert(test.expected.end(), {0x00000000u, 0x3f800000u});
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_SIN_F32, O::V_COS_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase VectorCompareF32ExposureGuard() {
@@ -25550,46 +30175,6 @@ TestCase VectorVop3CompareEqU64OnGpu() {
                  O::S_ENDPGM}};
   test.decoded_counts = {{"V_CMP_EQ_U64 vcc_lo, exec_lo, vcc_lo", 2}};
   return test;
-}
-
-TestCase VectorVop3CompareEqF64OnGpu() {
-  using O = ShaderOpcode;
-
-  struct Case {
-    u32 lo0, hi0, lo1, hi1;
-    u32 src0, src1; // 100: s[100:101], 102: s[102:103], 128: inline 0, 242: inline 1.0
-  };
-  constexpr Case cases[] = {
-      {0, 0x00000000u, 0, 0, 128, 100},           // captured: 0 == +0.0
-      {0, 0x80000000u, 0, 0, 128, 100},           // 0 == -0.0
-      {0, 0x3ff00000u, 0, 0, 128, 100},           // 0 == 1.0
-      // NaN == NaN (false on RDNA2) is left out: upstream translates V_CMP_EQ_F64 as OpFOrdEqual
-      // on f64, which the RTX 5090 driver folds to true for NaN (DEBUGGING.md, 2026-10-02 rebase).
-      {0, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // 1.0 == 1.0
-      {0, 0x3ff00000u, 0, 0, 242, 100},           // inline 1.0 is the f64 1.0
-      {1, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // low dwords differ
-  };
-  std::vector<u32> code;
-  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
-  u32 index = 0;
-  for (const auto &c : cases) {
-    AppendSMovLiteral(&code, 100, c.lo0);
-    AppendSMovLiteral(&code, 101, c.hi0);
-    AppendSMovLiteral(&code, 102, c.lo1);
-    AppendSMovLiteral(&code, 103, c.hi1);
-    code.push_back(0xd422006au); // v_cmp_eq_f64 vcc_lo, src0, src1
-    code.push_back(c.src0 | (c.src1 << 9u));
-    code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
-    AppendStoreVgpr(&code, 2, index++);
-  }
-  AppendEnd(&code);
-
-  return {"VectorVop3CompareEqF64OnGpu",
-          code,
-          {},
-          {1, 1, 0, 1, 1, 0},
-          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_EQ_F64, O::V_CNDMASK_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareNeU64OnGpu() {
@@ -25831,6 +30416,56 @@ TestCase VectorCompareClassF32() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase VectorCompareClassF32ImmediateAndDynamicMasks(u32 wave) {
+  using O = ShaderOpcode;
+  // One input for each architectural class bit, in bit order.
+  constexpr std::array<u32, 10> values{
+      0x7f800001u, 0x7fc00001u, 0xff800000u, 0xbf800000u, 0x80000001u,
+      0x80000000u, 0x00000000u, 0x00000001u, 0x3f800000u, 0x7f800000u};
+  constexpr std::array<u32, 8> masks{
+      0u, 0x3ffu, 3u, 7u, 0xfffffc00u, 0xffffffffu, 0xfffffc03u, 0xfffffc07u};
+  TestCase test;
+  test.name = "VectorCompareClassF32ImmediateAndDynamicMasks";
+  test.has_compute_info = true;
+  test.compute_info.wave_size = wave;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.initial.assign(values.begin(), values.end());
+  test.initial.insert(test.initial.end(), masks.begin(), masks.end());
+  test.expected = test.initial;
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 1);
+  for (u32 index = 0; index < values.size(); ++index) {
+    AppendVMovU32(&code, 30, index * 4u);
+    AppendBufferLoadDword(&code, 0, 30);
+    for (u32 mask_index = 0; mask_index < masks.size(); ++mask_index) {
+      for (const bool dynamic : {false, true}) {
+        if (dynamic) {
+          AppendVMovU32(&code, 30, (values.size() + mask_index) * 4u);
+          AppendBufferLoadDword(&code, 2, 30);
+          code.push_back(EncodeVopc(0x88, Vgpr(0), 2));
+        } else {
+          AppendVop3(&code, 0x88, 106, Vgpr(0), 255);
+          code.push_back(masks[mask_index]);
+        }
+        code.push_back(EncodeVop2(0x01, 3, InlineU32(0), 1));
+        AppendStoreVgpr(&code, 3, static_cast<u32>(test.expected.size()));
+        test.expected.push_back((masks[mask_index] & (1u << index)) != 0u);
+      }
+    }
+    AppendStoreVgpr(&code, 0, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(values[index]);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CMP_CLASS_F32,
+                  O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpIsNan"};
+  test.ir_counts = {{"BitCastF32U32", values.size()}};
+  // Measured 56,287/117,071 words; allow only a small fixed emission margin.
+  test.max_spirv_words = wave == 32u ? 56400u : 117200u;
+  return test;
+}
+
 TestCase VectorVopcSdwaCmpxClassF32CapturedExecMask() {
   using O = ShaderOpcode;
 
@@ -25860,6 +30495,150 @@ TestCase VectorVopcSdwaCmpxClassF32CapturedExecMask() {
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {
       {"V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo", 2}};
+  return test;
+}
+
+TestCase VectorCmpClassF16(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr std::array<u32, 10> values{
+      0x7c01u, 0x7e01u, 0xfc00u, 0xbc00u, 0x8001u,
+      0x8000u, 0x0000u, 0x0001u, 0x3c00u, 0x7c00u};
+  constexpr u32 guard = 0x87654321u;
+  TestCase test;
+  test.name = wave_size == 64 ? "VectorCmpClassF16Wave64" : "VectorCmpClassF16Wave32";
+  for (const auto value : values) {
+    test.initial.insert(test.initial.end(), {0xa55a0000u | value, (value << 16u) | 0x7e01u});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  const auto compare = [&](std::initializer_list<u32> words, u32 expected,
+                           u32 dst = 106u, u32 exec = 1u) {
+    AppendSMovLiteral(&code, 106, 0x12345678u);
+    AppendSMovLiteral(&code, 107, guard);
+    AppendSMovLiteral(&code, dst + 1u, guard);
+    code.push_back(EncodeSopc(0x06, InlineU32(expected), InlineU32(0)));
+    code.insert(code.end(), words);
+    const u32 sources[] = {dst, dst + 1u, 126, 127, 253};
+    for (u32 i = 0; i < std::size(sources); ++i) {
+      code.push_back(EncodeSMovB32(30u + i, sources[i]));
+    }
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 results[] = {expected, wave_size == 32 ? guard : 0u, exec, 0u, 1u - expected};
+    for (u32 i = 0; i < std::size(results); ++i) {
+      AppendStoreSgpr(&code, 30u + i, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(results[i]);
+    }
+    if (dst != 106u) {
+      AppendStoreSgpr(&code, 106, static_cast<u32>(test.expected.size()));
+      AppendStoreSgpr(&code, 107, static_cast<u32>(test.expected.size()) + 1u);
+      test.expected.insert(test.expected.end(), {0x12345678u, guard});
+    }
+  };
+  for (u32 index = 0; index < values.size(); ++index) {
+    AppendVMovU32(&code, 30, index * 8u);
+    AppendBufferLoadDword(&code, 0, 30);
+    AppendVMovU32(&code, 30, index * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    for (u32 bit = 0; bit < 12; ++bit) {
+      AppendVMovU32(&code, 1, bit == 11 ? 0 : 1u << bit);
+      const u32 expected = bit == index ? 1u : 0u;
+      compare({EncodeVopc(0x8f, Vgpr(0), 1)}, expected);
+      compare({EncodeVop3Word0(0x8f, 20), EncodeVop3Word1(Vgpr(0), Vgpr(1))},
+              expected, 20);
+    }
+    // SDWA selects the high half, applies -abs, and writes an explicit SGPR pair.
+    compare({EncodeVopc(0x8f, 249, InlineU32(56)),
+             EncodeVopcSdwa(2, 20, 1, 5, 6, 0, 0, 1, 1, 0, 0, 0, 1)},
+            index >= 3 && index <= 8 ? 1u : 0u, 20);
+    compare({EncodeVop3Word0(0x8f, 20, 1),
+             EncodeVop3Word1(Vgpr(0), InlineU32(56), 0, 0, 1)},
+            index >= 3 && index <= 8 ? 1u : 0u, 20);
+  }
+  AppendVMovU32(&code, 1, 1u << 8u);
+  compare({EncodeVopc(0x8f, 242, 1)}, 1); // Inline 1.0 becomes half 0x3c00.
+  compare({EncodeVopc(0x8f, 255, 1), 0xdead3c00u}, 1); // Literal low half.
+  compare({EncodeVop3Word0(0x8f, 20), EncodeVop3Word1(242, 248)}, 1, 20);
+  // Inline INV_2PI supplies half bits 0x3118, including the positive-normal class.
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  compare({EncodeVopc(0x8f, 242, 1)}, 0, 106, 0); // Inactive lanes clear the result.
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_CMP_EQ_U32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMP_CLASS_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMP_CLASS_F16", 264u}};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorCmpxClassF16(u32 wave_size) {
+  using O = ShaderOpcode;
+  // One raw half value for each architectural class bit, in bit order.
+  constexpr std::array<u32, 10> values{
+      0x7c01u, 0x7e01u, 0xfc00u, 0xbc00u, 0x8001u,
+      0x8000u, 0x0000u, 0x0001u, 0x3c00u, 0x7c00u};
+  TestCase test;
+  test.name = wave_size == 64 ? "VectorCmpxClassF16Wave64" : "VectorCmpxClassF16Wave32";
+  for (const auto value : values) {
+    test.initial.insert(test.initial.end(), {0xa55a0000u | value, (value << 16u) | 0x7e01u});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  AppendSMovLiteral(&code, 106, 0x12345678u);
+  AppendSMovLiteral(&code, 107, 0x87654321u);
+  code.push_back(EncodeSMovB32(127, InlineU32(0)));
+  const auto compare = [&](std::initializer_list<u32> words, u32 expected) {
+    code.insert(code.end(), words);
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    AppendStoreSgpr(&code, 20, static_cast<u32>(test.expected.size()));
+    AppendStoreSgpr(&code, 21, static_cast<u32>(test.expected.size()) + 1u);
+    test.expected.insert(test.expected.end(), {expected, 0});
+  };
+  for (u32 index = 0; index < values.size(); ++index) {
+    AppendVMovU32(&code, 30, index * 8u);
+    AppendBufferLoadDword(&code, 0, 30);
+    AppendVMovU32(&code, 30, index * 8u + 4u);
+    AppendBufferLoadDword(&code, 2, 30);
+    for (u32 bit = 0; bit < 12; ++bit) {
+      AppendVMovU32(&code, 1, bit == 11 ? 0 : 1u << bit);
+      const u32 expected = bit == index ? 1 : 0;
+      if ((bit & 1u) == 0) {
+        compare({EncodeVopc(0x9f, Vgpr(0), 1)}, expected);
+      } else {
+        compare({EncodeVop3Word0(0x9f, 126), EncodeVop3Word1(Vgpr(0), Vgpr(1))}, expected);
+      }
+    }
+    const u32 finite = index >= 3 && index <= 8 ? 1 : 0;
+    compare({0x7d3f70f9u, 0x86360000u}, finite); // Captured -abs(v0), inline56.
+    compare({0x7d3f70f9u, 0x86350002u}, finite); // Captured -abs(v2.word1).
+  }
+  AppendVMovU32(&code, 1, 1u << 8u);
+  compare({EncodeVopc(0x9f, 242, 1)}, 1); // Inline1.0 encodes half0x3c00.
+  AppendVMovU32(&code, 1, 1u << 6u);
+  compare({EncodeVopc(0x9f, 249, 1),
+           EncodeVopcSdwa(242, 0, 0, 5, 6, 0, 0, 0, 0, 0, 0, 1)}, 1);
+  AppendVMovU32(&code, 1, 1u << 7u);
+  compare({EncodeVopc(0x9f, 249, 1),
+           EncodeVopcSdwa(242, 0, 0, 1, 6, 0, 0, 0, 0, 0, 0, 1)}, 1);
+  AppendVMovU32(&code, 30, 8u * 8u);
+  AppendBufferLoadDword(&code, 0, 30);
+  compare({EncodeVopc(0x9f, 249, 248),
+           EncodeVopcSdwa(0, 0, 0, 6, 6, 0, 0, 0, 0, 0, 0, 0, 1)}, 1);
+  // INV_2PI as a half class mask is0x3118, including positive normal bit8.
+  AppendVMovU32(&code, 1, 1u << 8u);
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  compare({EncodeVopc(0x9f, Vgpr(0), 1)}, 0);
+  AppendStoreSgpr(&code, 106, static_cast<u32>(test.expected.size()));
+  AppendStoreSgpr(&code, 107, static_cast<u32>(test.expected.size()) + 1u);
+  test.expected.insert(test.expected.end(), {0x12345678u, 0x87654321u});
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_CLASS_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -25967,6 +30746,61 @@ TestCase VectorCompareF16Ops() {
            O::V_CMP_NGE_F16, O::V_CMP_NEQ_F16, O::V_CMPX_LT_F16, O::V_CMPX_EQ_F16,
            O::V_CMPX_LE_F16, O::V_CMPX_GT_F16, O::V_CMPX_GE_F16,
            O::V_CMPX_NEQ_F16, O::V_CMPX_NLT_F16, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorCompareI16U16Ops() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  std::vector<u32> expected;
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovLiteral(&code, 2, 0xabcd8000u);
+  AppendVMovLiteral(&code, 3, 0x00007fffu);
+  AppendVMovLiteral(&code, 4, 0x12348000u);
+  AppendVMovLiteral(&code, 5, 0xffff0001u);
+  AppendVMovLiteral(&code, 6, 0x00000001u);
+
+  u32 dst = 10;
+  u32 out = 0;
+  auto append_compare = [&](u32 opcode, u32 src0, u32 src1, bool value) {
+    code.push_back(EncodeVopc(opcode, src0, src1));
+    code.push_back(EncodeVop2(0x01, dst, InlineU32(0), 1));
+    AppendStoreVgpr(&code, dst, out++);
+    expected.push_back(value ? 1u : 0u);
+    dst++;
+  };
+
+  append_compare(0x8a, Vgpr(2), 4, true);
+  append_compare(0x8a, Vgpr(2), 3, false);
+  append_compare(0x8b, Vgpr(2), 3, true);
+  append_compare(0x8b, Vgpr(3), 2, false);
+  append_compare(0x8b, Vgpr(5), 6, true);
+  append_compare(0x8c, Vgpr(3), 2, true);
+  append_compare(0x8c, Vgpr(2), 3, false);
+  append_compare(0x8d, Vgpr(2), 3, true);
+  append_compare(0x8d, Vgpr(5), 6, false);
+
+  append_compare(0xaa, Vgpr(2), 4, true);
+  append_compare(0xaa, Vgpr(2), 3, false);
+  append_compare(0xab, Vgpr(3), 2, true);
+  append_compare(0xab, Vgpr(2), 3, false);
+  append_compare(0xac, Vgpr(2), 3, true);
+  append_compare(0xac, Vgpr(3), 2, false);
+  append_compare(0xad, Vgpr(2), 3, true);
+  append_compare(0xad, Vgpr(5), 6, false);
+  append_compare(0xae, Vgpr(2), 3, true);
+  append_compare(0xae, Vgpr(3), 2, false);
+  append_compare(0xae, Vgpr(5), 6, true);
+  AppendEnd(&code);
+
+  return {"VectorCompareI16U16Ops",
+          code,
+          {},
+          expected,
+          {O::V_MOV_B32, O::V_CMP_EQ_I16, O::V_CMP_LE_I16, O::V_CMP_GT_I16,
+           O::V_CMP_NE_I16, O::V_CMP_EQ_U16, O::V_CMP_LE_U16, O::V_CMP_GT_U16,
+           O::V_CMP_NE_U16, O::V_CMP_GE_U16, O::V_CNDMASK_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -27053,14 +31887,60 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-TestCase ScalarMemRealtimeReadsDeviceClock() {
+TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool upper_nonzero = false) {
+  using O = ShaderOpcode;
+  TestCase test;
+  if (upper_nonzero) {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresLastLaneWave32"
+                               : "ScalarBranchRestoresUpperHalfWave64";
+  } else if (threads < wave_size) {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresPartialWave32"
+                               : "ScalarBranchRestoresPartialWave64";
+  } else {
+    test.name = wave_size == 32 ? "ScalarBranchRestoresInactiveWave32"
+                               : "ScalarBranchRestoresInactiveWave64";
+  }
+  auto &code = test.code;
+  code = {EncodeVop1(0x01, 1, InlineU32(32)),
+          EncodeVop2(0x25, 1, Vgpr(0), 1),
+          EncodeSop1(0x04, 8, 126), // Save all participating lanes.
+          EncodeSMovB32(20, InlineU32(0))};
+  AppendSMovLiteral(&code, 126, upper_nonzero ? (wave_size == 32 ? 0x80000000u : 0u) : 1u);
+  AppendSMovLiteral(&code, 127, upper_nonzero && wave_size == 64 ? 0x80000000u : 0u);
+  if (upper_nonzero) {
+    code.push_back(EncodeSopp(0x09, 1)); // Last lane makes the whole-wave EXEC nonzero.
+    code.push_back(EncodeSopp(0x02, 3));
+  } else {
+    code.push_back(EncodeSopp(0x08, 3)); // EXEC is nonzero for the whole wave.
+  }
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  // The branch restores inactive lanes before reading the last lane's value.
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(threads - 1));
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(threads, 0);
+  test.expected.assign(threads, 32 + threads - 1);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
+                  O::V_READLANE_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformAny"};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase ScalarMemRealtimeCapturedPlaceholder() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeReadsDeviceClock", "decode",
+  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
@@ -27071,16 +31951,11 @@ TestCase ScalarMemRealtimeReadsDeviceClock() {
   code.insert(code.end(), {0xf4940300u, 0xfa000000u});
   AppendStoreSgprPair(&code, 12, 2);
   AppendEnd(&code);
-  TestCase test{"ScalarMemRealtimeReadsDeviceClock",
-                code,
-                {},
-                {},
-                {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  // The instruction reads the device clock, so its values are not deterministic: check the
-  // emitted clock read instead of the stored words.
-  test.compile_only = true;
-  test.required_spirv = {"OpReadClockKHR"};
-  return test;
+  return {"ScalarMemRealtimeCapturedPlaceholder",
+          code,
+          {},
+          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
+          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -27131,18 +32006,15 @@ TestCase ScalarMemoryLoadVariants() {
   std::vector<u32> expected = initial;
   expected.insert(expected.end(), initial.begin(), initial.end());
 
-  TestCase test{"ScalarMemoryLoadVariants",
-                code,
-                initial,
-                expected,
-                {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
-                 O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
-                 O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
-                 O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
-                 O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  return test;
+  return {"ScalarMemoryLoadVariants",
+          code,
+          initial,
+          expected,
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::S_LOAD_DWORDX2, O::S_LOAD_DWORDX4,
+           O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX16, O::S_BUFFER_LOAD_DWORD,
+           O::S_BUFFER_LOAD_DWORDX2, O::S_BUFFER_LOAD_DWORDX4,
+           O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX16, O::V_MOV_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarBufferOffsetAlignmentAndCarry() {
@@ -27186,15 +32058,11 @@ TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  TestCase test{"ScalarLoadSignedImmediateOffsetAddsSoffset",
-                code,
-                {0x11111111u, 0x22222222u},
-                {0x22222222u, 0x22222222u},
-                {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  test.forbidden_spirv = {"flattened_srt"};
-  return test;
+  return {"ScalarLoadSignedImmediateOffsetAddsSoffset",
+          code,
+          {0x11111111u, 0x22222222u},
+          {0x22222222u, 0x22222222u},
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase BufferLoadStore() {
@@ -27341,32 +32209,29 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
-TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
+TestCase BufferOffsetsUsePackedWords(bool storage) {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  for (u32 base : {0u, 4u}) {
-    AppendSMovLiteral(&code, base, 0x1000u + base * 0x1000u);
-    AppendSMovLiteral(&code, base + 1u, 4u << 16u);
-    AppendSMovLiteral(&code, base + 2u, 1u);
-    AppendSMovLiteral(&code, base + 3u, 1u << 24u);
-  }
-  AppendVMovLiteral(&code, 0, 0x12345678u);
-  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
-  code.push_back(EncodeMubuf1(0, 0, 20));
-  AppendVMovLiteral(&code, 1, 0xabcdef01u);
-  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
-  code.push_back(EncodeMubuf1(1, 1, 20));
-  AppendEnd(&code);
-
+  constexpr std::array offsets{0u, 12u, 20u, 28u, 36u};
   TestCase test;
-  test.name = "BufferOffsetsUsePackedLaneAndStorageFallback";
-  test.code = std::move(code);
-  test.initial = {0, 0, 0, 0};
-  test.expected = {0x12345678u, 0, 0, 0xabcdef01u};
+  test.name = storage ? "BufferOffsetsPackedWordsStorage" : "BufferOffsetsPackedWordsPush";
+  test.initial.resize(10);
+  test.expected = test.initial;
+  for (u32 i = 0; i < offsets.size(); ++i) {
+    const auto base = i * 4u;
+    AppendSMovLiteral(&test.code, base, 0x1000u + base * 0x1000u);
+    AppendSMovLiteral(&test.code, base + 1u, 4u << 16u);
+    AppendSMovLiteral(&test.code, base + 2u, 1u);
+    AppendSMovLiteral(&test.code, base + 3u, 1u << 24u);
+    const auto value = 0x12345678u + i;
+    AppendVMovLiteral(&test.code, i, value);
+    test.code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+    test.code.push_back(EncodeMubuf1(i, i, 20));
+    test.expected[offsets[i] / 4u] = value;
+  }
+  AppendEnd(&test.code);
   test.storage_buffer_range_bytes = 4;
-  test.storage_buffer_offsets = {0, 12};
-  test.expand_shader_data_storage = true;
+  test.storage_buffer_offsets.assign(offsets.begin(), offsets.end());
+  test.expand_shader_data_storage = storage;
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   return test;
@@ -27405,6 +32270,80 @@ TestCase BufferLoadVariants() {
            O::BUFFER_LOAD_SSHORT, O::BUFFER_LOAD_DWORDX2,
            O::BUFFER_LOAD_DWORDX3, O::BUFFER_LOAD_DWORDX4, O::V_MOV_B32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase BufferLoadD16Captured(ShaderOpcode opcode, u32 wave_size = 32) {
+  const bool high = opcode == ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI;
+  const bool byte = opcode == ShaderOpcode::BUFFER_LOAD_UBYTE_D16;
+  TestCase test;
+  test.name = byte ? (wave_size == 64 ? "BufferLoadUbyteD16Captured64" : "BufferLoadUbyteD16Captured32")
+                  : high ? "BufferLoadShortD16HiCaptured" : "BufferLoadShortD16Captured";
+  auto& code = test.code;
+  const u32 data_reg = byte ? 0u : high ? 20u : 1u;
+  const u32 index_reg = byte ? 3u : high ? 21u : 15u;
+  const std::array<u32, 2> load = byte ? std::array{0xe080e000u, 0x80040003u}
+                                : high ? std::array{0xe0942006u, 0x80021415u}
+                                      : std::array{0xe090200eu, 0x8000010fu};
+  AppendVMovU32(&code, index_reg, 1);
+  AppendVMovLiteral(&code, data_reg, 0xabcd1234u);
+  // Load both halves of v20 through s8:s11.
+  if (high) code.insert(code.end(), {0xe090200eu, 0x80021415u});
+  code.insert(code.end(), load.begin(), load.end());
+  AppendStoreVgpr(&code, data_reg, 0);
+  AppendVMovLiteral(&code, data_reg, 0xdeaf4321u);
+  code.push_back(EncodeSop1(0x04, 32, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), load.begin(), load.end());
+  code.push_back(EncodeSop1(0x04, 126, 32));
+  AppendStoreVgpr(&code, data_reg, 1);
+  AppendVMovU32(&code, index_reg, 2);
+  AppendVMovLiteral(&code, data_reg, 0xbeef5678u);
+  code.insert(code.end(), load.begin(), load.end());
+  AppendStoreVgpr(&code, data_reg, 2);
+  if (byte) {
+    AppendVMovU32(&code, index_reg, 1);
+    for (u32 offset = 1; offset <= 3; ++offset) {
+      AppendVMovLiteral(&code, data_reg, 0xa1b2ffffu);
+      code.insert(code.end(), {load[0] | offset, load[1]});
+      AppendStoreVgpr(&code, data_reg, 2 + offset);
+    }
+    code.insert(code.end(), {load[0], load[1] | (index_reg << 8u)});
+    AppendStoreVgpr(&code, index_reg, 6);
+  }
+  AppendEnd(&code);
+  const u32 stride = high ? 16u : 32u;
+  test.initial.assign(high ? 12u : 20u, 0xa5a5a5a5u);
+  test.initial[byte ? 8u : high ? 5u : 11u] = byte ? 0xff007f80u : 0x8001cafeu;
+  if (high) test.initial[7] = 0xcafefaceu;
+  test.expected = test.initial;
+  test.expected[0] = byte ? 0xabcd0080u : high ? 0x8001cafeu : 0xabcd8001u;
+  test.expected[1] = 0xdeaf4321u;
+  test.expected[2] = high ? 0x00005678u : 0xbeef0000u;
+  test.user_data = MakeStructuredStorageBufferData(stride, 2);
+  if (high) std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 8);
+  if (byte) {
+    std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 16);
+    test.expected[3] = 0xa1b2007fu;
+    test.expected[4] = 0xa1b20000u;
+    test.expected[5] = 0xa1b200ffu;
+    test.expected[6] = 0x80u;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1;
+    test.compute_info.wave_size = static_cast<uint8_t>(wave_size);
+    test.has_compute_info = true;
+    test.required_spirv = {"Volatile"};
+  }
+  test.user_data[50] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = stride * 2u;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+      opcode, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  if (high) test.opcodes.push_back(ShaderOpcode::BUFFER_LOAD_SHORT_D16);
+  test.decoded_counts = {{byte ? "BUFFER_LOAD_UBYTE_D16 v0.sdwa(sel=4,sext=0)"
+                       : high ? "BUFFER_LOAD_SHORT_D16_HI v20.sdwa(sel=5,sext=0)"
+                              : "BUFFER_LOAD_SHORT_D16 v1.sdwa(sel=4,sext=0)", byte ? 6u : 3u}};
+  return test;
 }
 
 TestCase BufferSubwordLoadsAtHostOffset(u32 bytes, u32 component, bool sign) {
@@ -27552,6 +32491,69 @@ TestCase BufferLoadDwordx2SnapshotsOverlappingAddress() {
   return test;
 }
 
+TestCase CoherentBufferLoadDwordx2Bounds(u32 wave, u32 prefix) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave == 64 ? (prefix ? "CoherentBufferPairBoundsOffsetWave64"
+                                   : "CoherentBufferPairBoundsWave64")
+                         : (prefix ? "CoherentBufferPairBoundsOffsetWave32"
+                                   : "CoherentBufferPairBoundsWave32");
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+  test.initial.resize(12);
+  test.expected = test.initial;
+  const u32 addresses[] = {0u, 4u, 8u, 0xfffffffcu};
+  const u32 base = prefix / 4;
+  const u32 values[][2] = {{test.initial[base], test.initial[base + 1]},
+                           {test.initial[base + 1], test.initial[base + 2]},
+                           {test.initial[base + 2], 0u},
+                           {0u, test.initial[base]}};
+  for (u32 i = 0; i < std::size(addresses); ++i) {
+    AppendVMovLiteral(&test.code, 20, addresses[i]);
+    test.code.push_back(EncodeMubuf0(0x0d, 0, false, true, true) | (1u << 15u));
+    test.code.push_back(EncodeMubuf1(2, 0, 20));
+    for (u32 component = 0; component < 2; ++component) {
+      AppendStoreVgpr(&test.code, 2 + component, 4 + i * 2 + component);
+      test.expected[4 + i * 2 + component] = values[i][component];
+    }
+  }
+  AppendEnd(&test.code);
+  test.user_data = MakeStructuredStorageBufferData(0, 12);
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {prefix};
+  test.storage_buffer_ranges = {{0u, 12u + prefix}};
+  test.required_spirv = {"OpAtomicLoad %ulong", "Int64Atomics",
+                         "ArrayStride 8"};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX2, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase CoherentBufferLoadDwordx2Swizzled() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "CoherentBufferLoadDwordx2Swizzled";
+  AppendVMovU32(&test.code, 20, 0);
+  test.code.push_back(EncodeMubuf0(0x0d, 0, true, false, true) | (1u << 15u));
+  test.code.push_back(EncodeMubuf1(2, 0, 20));
+  AppendStoreVgpr(&test.code, 2, 9);
+  AppendStoreVgpr(&test.code, 3, 10);
+  AppendEnd(&test.code);
+  test.initial = {0x11111111u, 0x22222222u, 0,           0, 0, 0,
+                  0,           0,           0x33333333u, 0, 0};
+  test.expected = test.initial;
+  test.expected[9] = test.initial[0];
+  test.expected[10] =
+      test.initial[8]; // Four-byte elements span eight-index groups.
+  test.user_data = MakeStructuredStorageBufferData(8, 8);
+  test.user_data[1] |= 1u << 31u;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX2, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadDwordx3SnapshotsOverlappingAddress() {
   using O = ShaderOpcode;
 
@@ -27600,7 +32602,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
+TestCase BufferLoadsGpuSelectedDescriptors(u32 width, u32 wave = 32u) {
   const bool scalar = width == 1u;
   const bool xyz = width == 3u;
   using O = ShaderOpcode;
@@ -27633,10 +32635,14 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
               : xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                     : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
-  // v40 = lane index (0 in lane 0), from v_mbcnt_lo_u32_b32 over v41 = ~0u, v42 = 0.
-  AppendVMovLiteral(&test.code, 41, 0xffffffffu);
-  test.code.push_back(EncodeVop1(0x01, 42, InlineU32(0)));
-  test.code.push_back(EncodeVop2(0x23, 40, Vgpr(41), 42));
+  test.compute_info.threads_num[0] = wave;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  test.code.push_back(EncodeVop1(0x01, 25, Vgpr(0)));
+  AppendSMovLiteral(&test.code, 126, 1u);
+  AppendSMovLiteral(&test.code, 127, 0u);
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
     const u32 data_offset = 4096 + i * 128;
@@ -27653,11 +32659,6 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
     const u32 selected = static_cast<u32>(std::size(cases)) - 1 - i;
     test.initial[64 + i] = selected;
     AppendVMovU32(&test.code, 30, (64 + i) * 4);
-    // Offset the selector address by the lane index: lane 0 reads the same entry, but the
-    // load is no longer a uniform read the host could evaluate (IsUniformBufferRead), so
-    // the descriptor stays GPU-selected.
-    test.code.push_back(EncodeVop2(0x1a, 43, InlineU32(2), 40));
-    test.code.push_back(EncodeVop2(0x25, 30, Vgpr(43), 30));
     AppendBufferLoadDword(&test.code, 0, 30);
     test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
     test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
@@ -27679,19 +32680,72 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
       test.expected.push_back(expected == 0 ? 0 : selected * 100 + expected);
     }
   }
+  constexpr u32 payload = 6144u, output = 8192u, canary = 0xa5a5a5a5u;
+  const u32 row = std::size(cases);
+  const std::array<u32, 4> descriptor{u32(GuestBase + payload), (32u << 16u) | 1u,
+                                    wave, 0x5204u | (1u << 23u)};
+  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130u + row * 30u);
+  test.initial[64u + row] = row;
+  for (u32 lane = 0; lane < wave; ++lane)
+    for (u32 word = 0; word < 8u; ++word)
+      test.initial[payload / 4u + lane * 8u + word] = 0x90000000u | (lane << 8u) | word;
+  test.initial.resize((output + wave * 32u) / 4u, canary);
+  const auto matrix_results = std::move(test.expected);
+  test.expected = test.initial;
+  std::copy(matrix_results.begin(), matrix_results.end(), test.expected.begin());
+  AppendVMovU32(&test.code, 30, (64u + row) * 4u);
+  AppendBufferLoadDword(&test.code, 0, 30);
+  test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+  test.code.insert(test.code.end(), {EncodeSop2(0x26, 20, 20, 255), 120u,
+      EncodeSmem0(0x0a, 8, 0), EncodeSmem1(520, 20)});
+  AppendSMovLiteral(&test.code, 126, UINT32_MAX);
+  AppendSMovLiteral(&test.code, 127, wave == 64u ? UINT32_MAX : 0u);
+  test.code.insert(test.code.end(), {EncodeVop2(0x1a, 24, InlineU32(5), 25),
+      EncodeVop2(0x25, 24, 255, 24), output});
+  const u32 opcode = scalar ? 0x0cu : xyz ? 0x0fu : 0x0eu;
+  for (u32 component = width; component < 4u; ++component)
+    AppendVMovLiteral(&test.code, 4u + component, canary);
+  AppendVMovU32(&test.code, 21, 0u);
+  AppendVMovLiteral(&test.code, 22, UINT32_MAX - 2u);
+  // U32 byte offset + immediate wraps to four before ADD_TID addressing and bounds.
+  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 7u, true, true), EncodeMubuf1(4, 2, 21),
+      EncodeMubuf0(0x1e, 0u, false, true), EncodeMubuf1(4, 12, 24)});
+  for (u32 component = 0; component < 4u; ++component)
+    AppendVMovLiteral(&test.code, 4u + component, canary);
+  AppendVMovLiteral(&test.code, 21, UINT32_MAX);
+  AppendVMovU32(&test.code, 22, 0u);
+  AppendSMovLiteral(&test.code, 126, 0x55555555u);
+  AppendSMovLiteral(&test.code, 127, wave == 64u ? 0xaaaaaaaau : 0u);
+  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 4u, true, true, true), EncodeMubuf1(4, 2, 21)});
+  AppendSMovLiteral(&test.code, 126, 0u);
+  AppendSMovLiteral(&test.code, 127, 0u);
+  test.code.insert(test.code.end(), {EncodeMubuf0(opcode, 0u, true, true, true), EncodeMubuf1(4, 2, 21)});
+  AppendSMovLiteral(&test.code, 126, UINT32_MAX);
+  AppendSMovLiteral(&test.code, 127, wave == 64u ? UINT32_MAX : 0u);
+  test.code.insert(test.code.end(), {EncodeMubuf0(0x1e, 16u, false, true), EncodeMubuf1(4, 12, 24)});
+  for (u32 lane = 0; lane < wave; ++lane) {
+    const bool active = (lane & 1u) == (lane < 32u ? 0u : 1u);
+    for (u32 component = 0; component < width; ++component) {
+      test.expected[output / 4u + lane * 8u + component] =
+          0x90000000u | (lane << 8u) | (component + 1u);
+      test.expected[output / 4u + lane * 8u + 4u + component] = !active ? canary :
+          lane == 0u ? 0u : 0x90000000u | ((lane - 1u) << 8u) | (component + 1u);
+    }
+  }
   AppendEnd(&test.code);
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   if (scalar) {
-    test.decoded_counts = {{"BUFFER_LOAD_DWORD ", 2u * std::size(cases)}};
+    test.decoded_counts = {{"BUFFER_LOAD_DWORD ", 2u * std::size(cases) + 4u}};
   } else if (xyz) {
     test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
   } else {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
-  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  test.opcodes.insert(test.opcodes.end(), {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORDX4});
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "Volatile"};
   return test;
 }
 
@@ -27707,8 +32761,10 @@ TestCase BufferLoadDwordGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(1u);
 }
 
-TestCase BufferLoadFormatXGpuSelectedDescriptors() {
+TestCase BufferLoadGpuSelectedDescriptors(u32 wave, ShaderOpcode load) {
   using O = ShaderOpcode;
+  const bool formatted = load == O::BUFFER_LOAD_FORMAT_X;
+  const bool byte = load == O::BUFFER_LOAD_UBYTE;
   using F = Prospero::BufferFormat;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -27716,8 +32772,12 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
     u32 selector, stride, records, mode, index, offset, soffset;
     bool swizzle;
     u32 expected;
+    bool zero_payload = false;
+    bool unmapped = false;
   };
-  constexpr DescriptorCase cases[] = {
+  std::vector<DescriptorCase> cases;
+  if (formatted) {
+    cases = {
       {F::k8UInt, 4, 1, 4, 3, 1, 0, 0, false, 0x7f},
       {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
       {F::k16UInt, 4, 2, 4, 0, 1, 0, 0, false, 0x80ff},
@@ -27746,54 +32806,219 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
       {F::kInvalid, 1, 4, 1, 0, 0, 0, 0, false, 0},
       {F::k32UInt, 4, 4, 0, 2, 0, 0, 0, false, 0},
       {F::k32UInt, 4, 0, 4, 3, 0, 0, 8, false, 0},
-  };
+      {F::k8_8UInt, 5, 0, 16, 3, 0, 2, 0, false, 0x80},
+      {F::k16_16UInt, 5, 0, 16, 3, 0, 1, 0, false, 0x80ff},
+      {F::k16_16_16_16UInt, 7, 0, 16, 3, 0, 0, 0, false, 0x8001},
+      {F::k16_16_16_16Float, 6, 0, 16, 3, 0, 4, 0, false, 0x3f800000},
+      {F::k32_32_32UInt, 7, 0, 16, 3, 0, 0, 0, false, 0x80ff7f01},
+      {F::k32_32_32UInt, 6, 0, 16, 3, 0, 0, 0, false, 0x40003c00},
+      {F::k11_11_10Float, 6, 0, 16, 3, 0, 0, 0, false, 0x400c0000},
+      {F::k10_11_11Float, 4, 0, 16, 3, 0, 0, 0, false, 0x44040000},
+      // Whole-record OOB and constant/reserved selectors must not touch this absent BDA page.
+      {F::k32_32_32_32UInt, 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {F::k32UInt, 0, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {F::k32UInt, 1, 4, 1, 0, 0, 0, 0, false, 1, false, true},
+      {F::k32Float, 1, 4, 1, 0, 0, 0, 0, false, 0x3f800000, false, true},
+      {F::k32UInt, 2, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {F::k32UInt, 3, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+      {static_cast<F>(127), 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+    };
+  } else if (!byte) {
+    cases = {
+        {F::k32Float, 1, 0, 16, 3, 0, 0, 0, false, 0x7f01},
+        {F::k8UInt, 7, 0, 16, 3, 0, 1, 0, false, 0x7f01},
+        {F::k8UInt, 4, 0, 16, 3, 0, 2, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 16, 3, 0, 3, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 2, 0, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0},
+        {F::k8UInt, 4, 4, 2, 0, 1, 2, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 2, 0, 1, 3, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 1, 1, 1, 0, 0, false, 0},
+        {F::k8UInt, 4, 4, 1, 1, 0, 8, 0, false, 0x3c00},
+        {F::k8UInt, 4, 4, 1, 2, 1, 2, 0, false, 0x8001},
+        {F::k8UInt, 4, 4, 0, 2, 0, 0, 0, false, 0, false, true},
+        {F::k8UInt, 4, 0, 16, 3, 0, 0, 2, false, 0x80ff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 0, 8, false, 0, false, true},
+        {F::kInvalid, 4, 4, 1, 0, 0, 0, 0, false, 0, false, true},
+        {F::k8UInt, 4, 0, 16, 3, 0, 15, 0, false, 0, false, true},
+        {F::k8UInt, 4, 8, 2, 0, 1, 2, 4, true, 0x4000},
+    };
+  } else {
+    cases = {
+        {F::k32Float, 1, 0, 16, 3, 0, 0, 0, false, 0x01},
+        {F::k8UInt, 7, 0, 16, 3, 0, 1, 0, false, 0x7f},
+        {F::k8UInt, 4, 0, 16, 3, 0, 2, 0, false, 0xff},
+        {F::k8UInt, 4, 0, 4, 3, 0, 3, 0, false, 0x80},
+        {F::k8UInt, 4, 0, 4, 3, 0, 4, 0, false, 0, false, true},
+        {F::k8UInt, 4, 4, 2, 0, 1, 3, 0, false, 0x80},
+        {F::k8UInt, 4, 0, 16, 3, 0, 0, 2, false, 0xff},
+        {F::k8UInt, 4, 8, 2, 0, 1, 3, 4, true, 0x40},
+    };
+  }
+  // Visit every geometry entry and every selector. Zero payloads have exact zero
+  // results in all numeric classes; selector ONE depends only on integer vs float.
+  for (u32 format = 0; formatted && format <= static_cast<u32>(F::k32_32_32_32Float); ++format) {
+    const auto info = ShaderRecompiler::Format::GetFormatInfo(static_cast<F>(format));
+    using T = ShaderRecompiler::Format::ComponentType;
+    for (u32 selector = 0; selector < 8u; ++selector) {
+      const u32 one = info.type == T::Uint || info.type == T::Sint ? 1u : 0x3f800000u;
+      cases.push_back({static_cast<F>(format), selector, 16, 1, 0, 0, 0, 0, false,
+                       selector == 1u && info.type != T::Unknown ? one : 0u, true});
+    }
+  }
   TestCase test;
-  test.name = "BufferLoadFormatXGpuSelectedDescriptors";
-  test.initial.resize(2048);
+  test.name = formatted ? (wave == 32 ? "BufferLoadFormatXGpuSelectedDescriptors32"
+                                      : "BufferLoadFormatXGpuSelectedDescriptors64")
+                        : byte ? (wave == 32 ? "BufferLoadUbyteGpuSelectedDescriptors32"
+                                              : "BufferLoadUbyteGpuSelectedDescriptors64")
+                               : (wave == 32 ? "BufferLoadUshortGpuSelectedDescriptors32"
+                                             : "BufferLoadUshortGpuSelectedDescriptors64");
+  const auto align256 = [](u32 bytes) { return (bytes + 255u) & ~255u; };
+  const auto selection_base = align256(static_cast<u32>(cases.size()) * 4u);
+  const auto descriptor_base = align256(selection_base + static_cast<u32>(cases.size()) * 4u);
+  const auto payload_base = align256(descriptor_base + static_cast<u32>(cases.size()) * 32u);
+  test.initial.resize((payload_base + cases.size() * 64u) / 4u);
   constexpr std::array payload{0x80ff7f01u, 0x8001ff00u, 0x40003c00u, 0x3fc00000u};
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
-    const u32 data_offset = 4096 + i * 64;
+    const u32 data_offset = payload_base + i * 64;
+    const uint64_t data_address = GuestBase + (input.unmapped ? 0x100000u : data_offset);
     const std::array<u32, 8> row{
-        static_cast<u32>(GuestBase + data_offset),
+        static_cast<u32>(data_address),
         1u | (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u),
         input.records, input.selector | (static_cast<u32>(input.format) << 12u) |
                            (input.mode << 28u),
         input.index, input.offset, input.soffset, 0};
-    std::copy(row.begin(), row.end(), test.initial.begin() + 128 + i * 8);
-    std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
+    std::copy(row.begin(), row.end(), test.initial.begin() + descriptor_base / 4u + i * 8);
+    if (!input.zero_payload)
+      std::copy(payload.begin(), payload.end(), test.initial.begin() + data_offset / 4);
     // Read the selection on the GPU, as GTA's descriptor waterfall does.
-    test.initial[64 + i] = std::size(cases) - 1 - i;
+    test.initial[selection_base / 4u + i] = std::size(cases) - 1 - i;
     test.expected.push_back(cases[std::size(cases) - 1 - i].expected);
   }
   auto &code = test.code;
   AppendSMovLiteral(&code, 28, 0);
+  AppendSMovLiteral(&code, 29, static_cast<u32>(cases.size()));
   const auto loop = static_cast<u32>(code.size());
   code.push_back(EncodeVop1(0x01, 30, 28));
   code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 30));
-  code.push_back(EncodeMubuf0(0x0c, 256));
+  code.push_back(EncodeMubuf0(0x0c, selection_base));
   code.push_back(EncodeMubuf1(2, 0, 30));
   code.push_back(EncodeVop1(0x02, 20, Vgpr(2)));
   code.push_back(EncodeSop2(0x1e, 20, 20, InlineU32(5)));
   code.push_back(EncodeSmem0(0x0b, 8, 0));
-  code.push_back(EncodeSmem1(512, 20));
+  code.push_back(EncodeSmem1(descriptor_base, 20));
   code.push_back(EncodeVop1(0x01, 21, 12));
   code.push_back(EncodeVop1(0x01, 22, 13));
-  code.push_back(EncodeMubuf0(0x00, 0, true, true));
+  code.push_back(EncodeMubuf0(formatted ? 0x00 : byte ? 0x08 : 0x0a, 0, true, true, !formatted));
   code.push_back(EncodeMubuf1(4, 2, 21, 14));
   AppendBufferStoreDword(&code, 4, 30);
   code.push_back(EncodeSop2(0x00, 28, 28, InlineU32(1)));
-  code.push_back(EncodeSopc(0x0a, 28, InlineU32(std::size(cases))));
+  code.push_back(EncodeSopc(0x0a, 28, 29));
   code.push_back(EncodeSopp(0x05, loop - static_cast<u32>(code.size()) - 1u));
   AppendEnd(&code);
   test.bda_mappings = {{GuestBase, 0}};
-  test.required_spirv = {"PhysicalStorageBuffer", "OpSwitch", "OpLoopMerge"};
+  test.fault_free_address = GuestBase + 0x100000u;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave;
+  test.has_compute_info = true;
+  test.required_spirv = {"PhysicalStorageBuffer", "OpLoopMerge", formatted ? "OpSwitch" : "Volatile"};
+  if (!formatted) test.forbidden_spirv = {"convert_indirect_buffer_format",
+                                         "indirect_buffer_format_geometry"};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
                   O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_LSHL_B32,
-                  O::S_BUFFER_LOAD_DWORDX8, O::BUFFER_LOAD_FORMAT_X,
+                  O::S_BUFFER_LOAD_DWORDX8, load,
                   O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_CMP_LT_U32,
                   O::S_CBRANCH_SCC1, O::S_ENDPGM};
   return test;
+}
+
+TestCase BufferLoadFormatXGpuSelectedDescriptors() {
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
+}
+
+TestCase BufferLoadFormatXGpuSelectedDescriptors64() {
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_FORMAT_X);
+}
+
+TestCase BufferLoadUshortGpuSelectedDescriptors() {
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_USHORT);
+}
+
+TestCase BufferLoadUshortGpuSelectedDescriptors64() {
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_USHORT);
+}
+
+TestCase BufferLoadUbyteGpuSelectedDescriptors() {
+  return BufferLoadGpuSelectedDescriptors(32u, ShaderOpcode::BUFFER_LOAD_UBYTE);
+}
+
+TestCase BufferLoadUbyteGpuSelectedDescriptors64() {
+  return BufferLoadGpuSelectedDescriptors(64u, ShaderOpcode::BUFFER_LOAD_UBYTE);
+}
+
+void CheckSharedIndirectBufferLoads(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  for (const u32 wave : {32u, 64u}) {
+    for (const auto &test : {BufferLoadsGpuSelectedDescriptors(1u, wave),
+                            BufferLoadsGpuSelectedDescriptors(3u, wave),
+                            BufferLoadsGpuSelectedDescriptors(4u, wave),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_UBYTE),
+                            BufferLoadGpuSelectedDescriptors(wave, ShaderOpcode::BUFFER_LOAD_USHORT)}) {
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      struct Profile { u32 components = 0, uses = 0, definitions = 0, calls = 0, reads = 0; };
+      std::map<std::string, Profile> profiles;
+      for (const auto *block : compiled.program.blocks)
+        for (const auto &inst : *block) {
+          const auto components = BufferComponentCount(inst.GetOpcode());
+          if (components == 0u || inst.GetOpcode() == ValueOpcode::ReadConstBuffer) continue;
+          const auto &memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+          if (memory.kind != ResourceKind::IndirectBuffer || memory.formatted) continue;
+          const auto name = "load_indirect_buffer_" + std::to_string(memory.data_bits) + "x" +
+                            std::to_string(components) + (memory.coherent ? "_coherent" : "");
+          auto &profile = profiles[name];
+          profile.components = components;
+          ++profile.uses;
+        }
+      std::map<u32, std::string> functions;
+      u32 function = 0, bda = 0, inline_reads = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpName) {
+          const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
+          if (name.starts_with("load_indirect_buffer_")) functions.emplace(words[1], name);
+          if (name == "get_bda_pointer") bda = words[1];
+        }
+        if (opcode == spv::OpFunction) {
+          function = words[2];
+          if (functions.contains(function)) ++profiles[functions.at(function)].definitions;
+        }
+        if (opcode == spv::OpFunctionCall) {
+          if (functions.contains(words[3])) ++profiles[functions.at(words[3])].calls;
+          if (words[3] == bda) {
+            if (functions.contains(function)) ++profiles[functions.at(function)].reads;
+            else ++inline_reads;
+          }
+        }
+        offset += words.size();
+      }
+      Require(test.name, "raw load function scope", functions.size() == profiles.size() && inline_reads == 0u,
+              "a raw load profile was unused, missing or still emitted inline");
+      for (const auto &[name, profile] : profiles)
+        Require(test.name, name.c_str(), profile.uses != 0u && profile.definitions == 1u &&
+                    profile.calls == profile.uses * (wave == 64u && vulkan.SubgroupSize() == 32u ? 2u : 1u) &&
+                    profile.reads == profile.components,
+                "raw load helpers duplicated definitions, calls or component reads");
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+      vulkan.Dispatch(test, compiled, buffer);
+      CompareWords(test, "shared raw loads, lane addressing, EXEC and bounds", test.expected,
+                   vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+      vulkan.DestroyBuffer(&buffer);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "SharedIndirectBufferLoads");
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -28003,6 +33228,53 @@ TestCase BufferStoreVariants() {
           {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT,
            O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3,
            O::BUFFER_STORE_DWORDX4, O::S_ENDPGM}};
+}
+
+TestCase BufferStoreD16Hi(bool halfword, bool masked, u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  if (halfword) {
+    test.name = wave_size == 32u
+        ? (masked ? "BufferStoreShortD16HiMasked32" : "BufferStoreShortD16HiAdjacentLanes32")
+        : (masked ? "BufferStoreShortD16HiMasked64" : "BufferStoreShortD16HiAdjacentLanes64");
+  } else {
+    test.name = masked ? "BufferStoreByteD16HiMasked" : "BufferStoreByteD16HiAdjacentLanes";
+  }
+  const u32 element_bytes = halfword ? 2u : 1u;
+  AppendVMovLiteral(&test.code, 4, 0xa5c39b72u);
+  test.code.push_back(EncodeVop2(0x25, 25, InlineU32(4), 0));
+  if (masked) {
+    AppendSMovLiteral(&test.code, 126, 0x55555555u);
+    AppendSMovLiteral(&test.code, 127, wave_size == 64 ? 0xaaaaaaaau : 0u);
+  }
+  // Captured b21e373811f28e31 pc 0x1b8c: e0646000 80020419.
+  // Short variant uses 3e8244db54b38b0c pc 0x211c with the same test registers.
+  test.code.push_back(EncodeMubuf0(halfword ? 0x1bu : 0x19u, 0, true, false, true));
+  test.code.push_back(EncodeMubuf1(4, 2, 25));
+  AppendEnd(&test.code);
+  test.initial = std::vector<u32>((wave_size * element_bytes + 16u) / 4u, 0x11223344u);
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size - 4u; lane++) {
+    const u32 mask = !masked ? 0xffffffffu : lane < 32 ? 0x55555555u : 0xaaaaaaaau;
+    if (((mask >> (lane % 32)) & 1u) == 0) continue;
+    const u32 byte = (lane + 4u) * element_bytes, shift = (byte % 4u) * 8u;
+    const u32 bits = halfword ? 0xffffu : 0xffu, value = halfword ? 0xa5c3u : 0xc3u;
+    test.expected[byte / 4u] = (test.expected[byte / 4u] & ~(bits << shift)) | (value << shift);
+  }
+  const auto descriptor = MakeStructuredStorageBufferData(element_bytes, wave_size);
+  std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 8);
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = wave_size * element_bytes;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = static_cast<uint8_t>(wave_size);
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32,
+                 halfword ? O::BUFFER_STORE_SHORT_D16_HI : O::BUFFER_STORE_BYTE_D16_HI, O::S_ENDPGM};
+  test.required_spirv = {"Volatile"};
+  test.forbidden_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  return test;
 }
 
 TestCase BufferFormatVariants() {
@@ -28415,6 +33687,290 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   test.has_user_data = true;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
   return test;
+}
+
+std::vector<TestCase> BufferLoadFormatD16XCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct LoadCase {
+    const char *name;
+    F format;
+    u32 input;
+    u32 expected;
+    u32 selector = 4;
+    u32 index = 0;
+    bool active = true;
+    bool overlap = false;
+    u32 stride = 4;
+  };
+  constexpr LoadCase inputs[] = {
+      {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
+      {"BufferLoadFormatD16XFloat32", F::k32Float, 0x3f000000u, 0xabcd3800u},
+      {"BufferLoadFormatD16XUint32", F::k32UInt, 0x1234fffeu, 0xabcdffffu},
+      {"BufferLoadFormatD16XUintAtMax", F::k32UInt, 0x0000ffffu, 0xabcdffffu},
+      {"BufferLoadFormatD16XUintMax32", F::k32UInt, 0xffffffffu, 0xabcdffffu},
+      {"BufferLoadFormatD16XSint32", F::k32SInt, 0xffff8001u, 0xabcd8001u},
+      {"BufferLoadFormatD16XSintAboveMax", F::k32SInt, 0x00008000u, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintBelowMin", F::k32SInt, 0xffff7fffu, 0xabcd8000u},
+      {"BufferLoadFormatD16XSintAtMax", F::k32SInt, 0x00007fffu, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintAtMin", F::k32SInt, 0xffff8000u, 0xabcd8000u},
+      {"BufferLoadFormatD16XSintMax32", F::k32SInt, 0x7fffffffu, 0xabcd7fffu},
+      {"BufferLoadFormatD16XSintMin32", F::k32SInt, 0x80000000u, 0xabcd8000u},
+      {"BufferLoadFormatD16XUnorm8", F::k8UNorm, 0xffu, 0xabcd3c00u},
+      {"BufferLoadFormatD16XSnorm16", F::k16SNorm, 0x8001u, 0xabcdbc00u},
+      {"BufferLoadFormatD16XFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1},
+      {"BufferLoadFormatD16XOobFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 4},
+      {"BufferLoadFormatD16XOobUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 4},
+      {"BufferLoadFormatD16XOobZero", F::k32Float, 0u, 0xabcd0000u, 4, 4},
+      {"BufferLoadFormatD16XZeroStrideFloatOne", F::k32Float, 0u, 0xabcd3c00u, 1, 0, true, false, 0},
+      {"BufferLoadFormatD16XZeroStrideUintOne", F::k32UInt, 0u, 0xabcd0001u, 1, 0, true, false, 0},
+      {"BufferLoadFormatD16XInactive", F::k32Float, 0u, 0xabcd1234u, 4, 0, false},
+      {"BufferLoadFormatD16XOverlappingAddress", F::k16UInt, 7u, 7u, 4, 0, true, true},
+  };
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 0, input.overlap ? input.index : 0xabcd1234u);
+    AppendVMovU32(&test.code, 1, input.index);
+    if (!input.active) {
+      test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    }
+    test.code.push_back(EncodeMubuf0(0x80u, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 0, input.overlap ? 0 : 1));
+    if (!input.active) {
+      test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    }
+    AppendStoreVgpr(&test.code, 0, 2);
+    AppendEnd(&test.code);
+    test.initial = {input.input, 0xdeadbeefu, 0u, 0xcafef00du};
+    test.expected = {input.input, 0xdeadbeefu, input.expected, 0xcafef00du};
+    test.user_data = MakeStructuredStorageBufferData(input.stride, 4, false, BufferFormat(input.format));
+    test.user_data[3] = (test.user_data[3] & ~0x30000007u) | input.selector;
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_D16_X,
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
+std::vector<TestCase> BufferLoadFormatD16VectorCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct LoadCase {
+    const char *name;
+    F format;
+    std::array<u32, 4> input;
+    std::array<u32, 2> expected;
+    u32 swizzle = DstSel(4, 5, 6, 7);
+    u32 stride = 16;
+    u32 index = 0;
+    bool active = true;
+    bool overlap = false;
+    u32 opcode = 0x83u;
+  };
+  constexpr LoadCase inputs[] = {
+      {"BufferLoadFormatD16XyzwFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
+      {"BufferLoadFormatD16XyzwFloat16", F::k16_16_16_16Float,
+       {0x38003c00u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
+      {"BufferLoadFormatD16XyzwUintSaturates", F::k32_32_32_32UInt,
+       {0u, 0x10000u, 0xffffu, 7u}, {0xffff0000u, 0x0007ffffu}},
+      {"BufferLoadFormatD16XyzwSintSaturates", F::k32_32_32_32SInt,
+       {0xffff7fffu, 7u, 0x8000u, 0xffff8000u}, {0x00078000u, 0x80007fffu}},
+      {"BufferLoadFormatD16XyzwUnorm", F::k8_8_8_8UNorm,
+       {0xffff0000u}, {0u, 0x3c003c00u}},
+      {"BufferLoadFormatD16XyzwSwizzle", F::k32_32_32_32Float,
+       {0u, 0x3f800000u, 0xc0000000u, 0x3f000000u},
+       {0xc0003800u, 0x3c003c00u}, DstSel(7, 6, 5, 1)},
+      {"BufferLoadFormatD16XyzwPartialRecord", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u},
+       {0u, 0u}, DstSel(4, 5, 6, 7), 12},
+      {"BufferLoadFormatD16XyzwOobOne", F::k32_32_32_32Float,
+       {}, {0x3c00u, 0x3c00u}, DstSel(1, 4, 1, 4), 16, 1},
+      {"BufferLoadFormatD16XyzwZeroStrideFloatOne", F::k32_32_32_32Float,
+       {}, {0x3c003c00u, 0x3c000000u}, DstSel(1, 1, 4, 1), 0},
+      {"BufferLoadFormatD16XyzwZeroStrideUintOne", F::k32_32_32_32UInt,
+       {}, {0x10000u, 1u}, DstSel(4, 1, 1, 4), 0},
+      {"BufferLoadFormatD16XyzwInactive", F::k32_32_32_32Float,
+       {}, {0xabcd1234u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, false},
+      {"BufferLoadFormatD16XyzwOverlappingAddress", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u},
+       {0x38003c00u, 0xc0000000u}, DstSel(4, 5, 6, 7), 16, 0, true, true},
+      {"BufferLoadFormatD16XyFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u},
+       {0x38003c00u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x81u},
+      {"BufferLoadFormatD16XyUintSaturates", F::k32_32UInt,
+       {0x10000u, 7u}, {0x0007ffffu, 0xbeef5678u}, DstSel(4, 5, 6, 7), 8, 0, true, false, 0x81u},
+      {"BufferLoadFormatD16XyzFloat32", F::k32_32_32_32Float,
+       {0x3f800000u, 0x3f000000u, 0xc0000000u, 0x3e800000u},
+       {0x38003c00u, 0xbeefc000u}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzSintSaturates", F::k32_32_32_32SInt,
+       {0xffff7fffu, 7u, 0x8000u, 0xffff8000u},
+       {0x00078000u, 0xbeef7fffu}, DstSel(4, 5, 6, 7), 16, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzOobOne", F::k32_32_32_32Float,
+       {}, {0x3c00u, 0xbeef3c00u}, DstSel(1, 4, 1, 4), 16, 1, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzZeroStrideFloatOne", F::k32_32_32_32Float,
+       {}, {0x3c003c00u, 0xbeef0000u}, DstSel(1, 1, 4, 1), 0, 0, true, false, 0x82u},
+      {"BufferLoadFormatD16XyzInactive", F::k32_32_32_32Float,
+       {}, {0xabcd1234u, 0xbeef5678u}, DstSel(4, 5, 6, 7), 16, 0, false, false, 0x82u},
+  };
+  constexpr O formats[] = {O::BUFFER_LOAD_FORMAT_D16_XY, O::BUFFER_LOAD_FORMAT_D16_XYZ,
+                           O::BUFFER_LOAD_FORMAT_D16_XYZW};
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs) {
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 16, input.overlap ? input.index : 0xabcd1234u);
+    AppendVMovLiteral(&test.code, 17, 0xbeef5678u);
+    AppendVMovLiteral(&test.code, 18, 0xcafef00du);
+    AppendVMovU32(&test.code, 12, input.index);
+    if (!input.active) test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    // Captured XYZW b21e373811f28e31 pc 0x1914: e20c2000 8001100c.
+    test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false));
+    test.code.push_back(EncodeMubuf1(16, 1, input.overlap ? 16 : 12));
+    if (!input.active) {
+      test.code.push_back(EncodeSMovB32(126, InlineU32(1)));
+      test.code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    }
+    for (u32 word = 0; word < 3; word++) AppendStoreVgpr(&test.code, 16 + word, 4 + word);
+    AppendEnd(&test.code);
+    test.initial.assign(input.input.begin(), input.input.end());
+    test.initial.resize(8, 0xdeadbeefu);
+    test.expected = test.initial;
+    test.expected[4] = input.expected[0];
+    test.expected[5] = input.expected[1];
+    test.expected[6] = 0xcafef00du;
+    const auto descriptor = MakeStructuredStorageBufferData(
+        input.stride, 1, false, BufferFormat(input.format));
+    std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 4);
+    test.user_data[7] = (test.user_data[7] & ~0x30000fffu) | input.swizzle;
+    test.has_user_data = true;
+    if (input.stride != 0 && input.active) {
+      test.storage_buffer_ranges = {{0, input.stride}, {0, 32}};
+    }
+    test.opcodes = {O::V_MOV_B32, formats[input.opcode - 0x81u],
+                    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    cases.push_back(std::move(test));
+  }
+  return cases;
+}
+
+std::vector<TestCase> BufferStoreFormatD16Cases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct StoreCase {
+    const char *name;
+    F format;
+    std::array<u32, 2> input;
+    std::array<u32, 4> expected;
+    u32 words = 1;
+    u32 opcode = 0x84u;
+  };
+  constexpr StoreCase inputs[] = {
+      {"BufferStoreFormatD16XFloat16", F::k16Float, {0x7e63c000u}, {0xffffc000u}},
+      {"BufferStoreFormatD16XFloat32", F::k32Float, {0x7e633800u}, {0x3f000000u}},
+      {"BufferStoreFormatD16XUint32", F::k32UInt, {0x7e63fffeu}, {0x0000fffeu}},
+      {"BufferStoreFormatD16XSint32", F::k32SInt, {0x7e63fffeu}, {0xfffffffeu}},
+      {"BufferStoreFormatD16XUnorm8", F::k8UNorm, {0x7e633800u}, {0xffffff80u}},
+      {"BufferStoreFormatD16XSnorm16", F::k16SNorm, {0x7e63b800u}, {0xffffc000u}},
+      {"BufferStoreFormatD16XZeroFill", F::k16_16Float, {0x7e633800u}, {0x00003800u}},
+      {"BufferStoreFormatD16HiXUint16", F::k16UInt, {0xfffe1234u}, {0xfffeu}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXFloat16", F::k16Float, {0xc0003c00u}, {0xc000u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXFloat32", F::k32Float, {0x3800c000u}, {0x3f000000u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXSint32", F::k32SInt, {0xfffe1234u}, {0xfffffffeu}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXUnorm8", F::k8UNorm, {0x38003c00u}, {0x80u}, 1, 0x27u},
+      {"BufferStoreFormatD16HiXZeroFill", F::k16_16Float, {0x38003c00u}, {0x00003800u}, 1, 0x27u},
+      {"BufferStoreFormatD16XyzwFloat16", F::k16_16_16_16Float,
+       {0xc0003c00u, 0x34003800u}, {0xc0003c00u, 0x34003800u}, 2, 0x87u},
+      {"BufferStoreFormatD16XyzwFloat32", F::k32_32_32_32Float,
+       {0xc0003c00u, 0x34003800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u, 0x3e800000u}, 4, 0x87u},
+      {"BufferStoreFormatD16XyzwUint32", F::k32_32_32_32UInt,
+       {0xffff0001u, 0x80007fffu}, {1u, 0xffffu, 0x7fffu, 0x8000u}, 4, 0x87u},
+      {"BufferStoreFormatD16XyzwSint32", F::k32_32_32_32SInt,
+       {0x8000ffffu, 0x7fff0001u}, {0xffffffffu, 0xffff8000u, 1u, 0x7fffu}, 4, 0x87u},
+      {"BufferStoreFormatD16XyzwSint8", F::k8_8_8_8SInt,
+       {0xff80ff7fu, 0x0080007fu}, {0x7f7f8080u}, 1, 0x87u},
+      {"BufferStoreFormatD16XyzwUnorm8", F::k8_8_8_8UNorm,
+       {0x3800c000u, 0x40003c00u}, {0xffff8000u}, 1, 0x87u},
+      {"BufferStoreFormatD16XyFloat32", F::k32_32Float,
+       {0x3800c000u}, {0xc0000000u, 0x3f000000u}, 2, 0x85u},
+      {"BufferStoreFormatD16XyUint16", F::k16_16UInt, {0xfffe0001u}, {0xfffe0001u}, 1, 0x85u},
+      {"BufferStoreFormatD16XyzFloat32", F::k32_32_32Float,
+       {0xc0003c00u, 0xdead3800u}, {0x3f800000u, 0xc0000000u, 0x3f000000u}, 3, 0x86u},
+      {"BufferStoreFormatD16XyzZeroFillsW", F::k16_16_16_16Float,
+       {0xc0003c00u, 0xdead3800u}, {0xc0003c00u, 0x00003800u}, 2, 0x86u},
+      {"BufferStoreFormatD16XyzUint8", F::k8_8_8_8UInt,
+       {0x00020001u, 0xdead0003u}, {0x00030201u}, 1, 0x86u},
+  };
+  constexpr O formats[] = {O::BUFFER_STORE_FORMAT_D16_X, O::BUFFER_STORE_FORMAT_D16_XY,
+                           O::BUFFER_STORE_FORMAT_D16_XYZ, O::BUFFER_STORE_FORMAT_D16_XYZW};
+  std::vector<TestCase> cases;
+  for (const auto &input : inputs)
+  for (const u32 wave : {32u, 64u})
+  for (u32 mask = 0; mask < (input.opcode == 0x27u ? 2u : 1u); ++mask) {
+    const bool wide = input.opcode >= 0x85u;
+    const bool high = input.opcode == 0x27u;
+    const bool multi_lane = wide || high;
+    const bool masked = wide || mask != 0;
+    if (!multi_lane && wave == 64u) continue;
+    const u32 payload_bytes = Prospero::NumBytesPerElement(input.format);
+    const u32 stride = high ? payload_bytes : input.words * 4u;
+    TestCase test;
+    test.name = input.name;
+    AppendVMovLiteral(&test.code, 66, input.input[0]);
+    if (wide) AppendVMovLiteral(&test.code, 67, input.input[1]);
+    if (multi_lane) {
+      test.code.push_back(EncodeVop2(0x25, 65, InlineU32(1), 0));
+    } else AppendVMovU32(&test.code, 65, 1);
+    if (masked) {
+      AppendSMovLiteral(&test.code, 126, 0x55555555u);
+      AppendSMovLiteral(&test.code, 127, wave == 64u ? 0x55555555u : 0u);
+    }
+    const auto store = [&] {
+      test.code.push_back(EncodeMubuf0(input.opcode, 0, true, false, multi_lane));
+      test.code.push_back(EncodeMubuf1(66, 0, 65));
+    };
+    store();
+    if (multi_lane) {
+      AppendVMovU32(&test.code, 65, wave + 1u);
+      store(); // Active lanes must not write beyond the descriptor range.
+      AppendVMovU32(&test.code, 65, 0u);
+      test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+      store(); // EXEC-zero must preserve the leading record.
+    }
+    AppendEnd(&test.code);
+    if (multi_lane) {
+      test.initial.assign(((wave + 2u) * stride + 3u) / 4u, 0xdeadbeefu);
+      test.expected = test.initial;
+      auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+      const auto payload = std::as_bytes(std::span(input.expected));
+      for (u32 lane = 0; lane + 2u < wave; lane += masked ? 2u : 1u)
+        std::copy_n(payload.begin(), payload_bytes,
+                    expected_bytes.begin() + (lane + 1u) * stride);
+      test.storage_buffer_range_bytes = wave * stride - 1u;
+      test.has_compute_info = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1u;
+      test.required_spirv = {"Volatile"};
+    } else {
+      test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+      test.expected = {0xdeadbeefu, input.expected[0], 0xcafef00du};
+    }
+    test.user_data = MakeStructuredStorageBufferData(stride, multi_lane ? wave : 3u,
+                                                    false, BufferFormat(input.format));
+    test.has_user_data = true;
+    test.opcodes = {O::V_MOV_B32,
+                    high ? O::BUFFER_STORE_FORMAT_D16_HI_X : formats[input.opcode & 3u],
+                    O::S_ENDPGM};
+    if (high) test.decoded_counts = {{"BUFFER_STORE_FORMAT_D16_HI_X", 3u}};
+    cases.push_back(std::move(test));
+  }
+  return cases;
 }
 
 std::vector<TestCase> FormattedStoreConversionCases() {
@@ -29034,23 +34590,23 @@ TestCase TBufferLoadFormatXSintSignExtendsSubDword() {
 
 TestCase TBufferStoreFormatXSintWritesSubDword() {
   using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovU32(&code, 20, 0);
-  AppendVMovLiteral(&code, 0, 0xffffff80u);
-  code.push_back(EncodeMtbuf0(0x04, 6, 0));
-  code.push_back(EncodeMtbuf1(0x04, 0, 0, 20));
-  AppendVMovU32(&code, 20, 4);
-  AppendVMovLiteral(&code, 1, 0xffff8001u);
-  code.push_back(EncodeMtbuf0(0x04, 12, 0));
-  code.push_back(EncodeMtbuf1(0x04, 1, 0, 20));
-  AppendEnd(&code);
-
-  return {"TBufferStoreFormatXSintWritesSubDword",
-          code,
-          {0x11223344u, 0x55667788u},
-          {0x11223380u, 0x55668001u},
-          {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "TBufferStoreFormatXSintWritesSubDword";
+  constexpr std::array<u32, 6> inputs{0xffffff80u, 0xffffff7fu, 128u,
+                                     0xffff8001u, 0xffff7fffu, 32768u};
+  constexpr std::array<u32, 6> encoded{0x80u, 0x80u, 0x7fu, 0x8001u, 0x8000u, 0x7fffu};
+  test.initial.assign(inputs.size(), 0x11223344u);
+  test.expected = test.initial;
+  for (u32 index = 0; index < inputs.size(); ++index) {
+    AppendVMovU32(&test.code, 20, index * 4u);
+    AppendVMovLiteral(&test.code, 0, inputs[index]);
+    test.code.push_back(EncodeMtbuf0(0x04, index < 3u ? 6u : 12u, 0));
+    test.code.push_back(EncodeMtbuf1(0x04, 0, 0, 20));
+    test.expected[index] = (test.expected[index] & (index < 3u ? 0xffffff00u : 0xffff0000u)) | encoded[index];
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_STORE_FORMAT_X, O::S_ENDPGM};
+  return test;
 }
 
 TestCase TBufferLoadFormatXy88IntegerComponents() {
@@ -29375,6 +34931,77 @@ TestCase TBufferStoreVariants() {
            O::S_ENDPGM}};
 }
 
+TestCase FlatLoadDlcCaptured(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64 ? "FlatLoadDlcCapturedWave64" : "FlatLoadDlcCapturedWave32";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendVMovU32(&code, 4, 0);
+  AppendVMovU32(&code, 5, 31);
+  // PPSA04288 CS 05b58beb842bacbf:0x638, FLAT_LOAD_DWORDX2 v[0:1], v[4:5] DLC.
+  code.insert(code.end(), {0xdc341000u, 0x007d0004u});
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  // The descriptor store aliases the physical address read by the next load.
+  AppendStoreVgpr(&code, 1, 8);
+  code.push_back(0xbbfd0000u); // S_WAITCNT_VSCNT null, 0.
+  code.insert(code.end(), {0xdc341000u, 0x007d0004u});
+  AppendStoreVgpr(&code, 0, 2);
+  AppendStoreVgpr(&code, 1, 3);
+  AppendEnd(&code);
+  test.initial = {0, 0, 0, 0, 0, 0, 0, 0, 0x11223344u, 0x55667788u};
+  test.expected = {0x11223344u, 0x55667788u, 0x55667788u, 0x55667788u,
+                   0, 0, 0, 0, 0x55667788u, 0x55667788u};
+  test.bda_mappings = {{0x1f00000000ull, 32}};
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::FLAT_LOAD_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_WAITCNT_VSCNT, O::S_ENDPGM};
+  test.required_spirv = {"OpDecorate %buffers Coherent", " 0 Coherent", "Volatile|Aligned 4"};
+  test.decoded_counts = {{"dlc=1", 2}};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase FlatStoreSlcCaptured() {
+  TestCase test;
+  test.name = "FlatStoreSlcCaptured";
+  auto& code = test.code;
+  code.push_back(EncodeSop1(0x0b, 26, InlineU32(1))); // s26 = 0x80000000.
+  AppendVMovLiteral(&code, 12, 0x000c0008u); // Packed halfwords 8 and 12 select byte offset 8.
+  code.insert(code.end(), {0x260c18f9u, 0x0504060cu, // Unsigned minimum of the two halfwords.
+      0xd5590007u, 0x0431fe1au, 0x70000000u});
+  AppendVMovLiteral(&code, 3, 0x12345678u);
+  // Exercise an SLC store through v[6:7].
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.insert(code.end(), {0xdc720000u, 0x007d0306u});
+  code.push_back(EncodeSop1(0x04, 126, 193)); // Restore EXEC before readback.
+  code.insert(code.end(), {0xd5590007u, 0x0431fe1au, 0x70000000u,
+      EncodeFlat0(0x0c, 0), EncodeFlat1(4, 0x7d, 0, 6)});
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(65, 0xa5a5a5a5u);
+  test.expected.assign(64, 0x12345678u);
+  test.expected.push_back(0xa5a5a5a5u);
+  test.opcodes = {ShaderOpcode::S_BREV_B32, ShaderOpcode::V_MIN_U32,
+      ShaderOpcode::V_MED3_U32, ShaderOpcode::V_MOV_B32, ShaderOpcode::FLAT_STORE_DWORD,
+      ShaderOpcode::S_MOV_B64, ShaderOpcode::FLAT_LOAD_DWORD,
+      ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.compute_info.scratch_size_dwords = 4;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.decoded_counts = {{"slc=1", 2}};
+  test.forbidden_spirv = {"get_bda_pointer"};
+  return test;
+}
+
 TestCase FlatLoadVariants() {
   using O = ShaderOpcode;
 
@@ -29577,27 +35204,23 @@ TestCase BranchVccnzUsesCarryProducedWaveMask() {
   return test;
 }
 
-TestCase ScalarLoadAlignsComponents() {
+TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendSMovLiteral(&code, 0, 1u);
   AppendSMovLiteral(&code, 2, 3u);
-  AppendSMovLiteral(&code, 3, 0u);
+  AppendSMovLiteral(&code, 3, 0xffff0000u);
   code.push_back(EncodeSmem0(0x00, 1, 1));
   code.push_back(EncodeSmem1(3, 0));
   AppendStoreSgpr(&code, 1, 0);
   AppendEnd(&code);
 
-  TestCase test{"ScalarLoadAlignsComponents",
-                code,
-                {0x11111111u, 0x22222222u},
-                {0x11111111u, 0x22222222u},
-                {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-  test.bda_mappings = {{0, 0}};
-  test.required_spirv = {"get_bda_pointer"};
-  test.forbidden_spirv = {"flattened_srt"};
-  return test;
+  return {"ScalarLoadAlignsComponentsAndMasksAddress",
+          code,
+          {0x11111111u, 0x22222222u},
+          {0x11111111u, 0x22222222u},
+          {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase ScalarLoadAlignsDynamicBase() {
@@ -29961,6 +35584,45 @@ TestCase DsReadWriteVariants() {
            O::DS_READ_I16, O::DS_WRITE_B64, O::DS_READ_B64, O::DS_WRITE_B96,
            O::DS_READ_B96, O::DS_WRITE_B128, O::DS_READ_B128,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsReadWriteFullRegionAddress(u32 wave_size, bool gds) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = gds ? (wave_size == 32u ? "DsGdsFullAddress32" : "DsGdsFullAddress64")
+                  : (wave_size == 32u ? "DsLdsFullAddress32" : "DsLdsFullAddress64");
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0));
+  code.insert(code.end(), {EncodeDs0(0x0d, 4, gds), EncodeDs1(0, 2, 1)});
+  AppendVMovLiteral(&code, 3, 0x10000u);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(1), 3));
+  AppendVMovLiteral(&code, 4, 0xdeadbeefu);
+  // A high region address must not alias the valid word in the same lane.
+  code.insert(code.end(), {EncodeDs0(0x0d, 4, gds), EncodeDs1(0, 4, 3),
+                           EncodeDs0(0x36, 4, gds), EncodeDs1(5, 0, 1),
+                           EncodeDs0(0x36, 4, gds), EncodeDs1(6, 0, 3)});
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, wave_size);
+  AppendEnd(&code);
+  test.initial.assign(wave_size * 2u, 0xdeadbeefu);
+  test.expected.resize(wave_size * 2u);
+  std::iota(test.expected.begin(), test.expected.begin() + wave_size, 1u);
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.lds_size_dwords = wave_size + 1u;
+  test.has_compute_info = true;
+  if (gds) {
+    test.gds_initial.resize(wave_size + 1u);
+    test.expected_gds.resize(wave_size + 1u);
+    std::iota(test.expected_gds.begin(), test.expected_gds.end(), 0u);
+  }
+  test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::V_MOV_B32, O::DS_WRITE_B32,
+                  O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.forbidden_spirv = {"%uint_65535"};
+  return test;
 }
 
 TestCase DsReadU16D16CapturedPreservesHighHalf() {
@@ -30481,6 +36143,144 @@ TestCase DsAtomic64Bounds(bool add) {
                   O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {add ? "OpAtomicIAdd %ulong" : "OpAtomicOr %ulong",
                          "WorkgroupMemoryExplicitLayoutKHR", "Aliased"};
+  return test;
+}
+
+TestCase DsAtomicReturn64() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsAtomicReturn64";
+  auto &code = test.code;
+  const auto pair = [&](u32 reg, uint64_t value) {
+    AppendVMovLiteral(&code, reg, static_cast<u32>(value));
+    AppendVMovLiteral(&code, reg + 1u, static_cast<u32>(value >> 32u));
+  };
+  const auto result = [&](u32 reg, uint64_t value) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(static_cast<u32>(value));
+    AppendStoreVgpr(&code, reg + 1u, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(static_cast<u32>(value >> 32u));
+  };
+  AppendVMovU32(&code, 7, 0);
+  AppendVMovLiteral(&code, 6, 0x13579bdfu);
+  code.push_back(EncodeDs0(0x0d, 24));
+  code.push_back(EncodeDs1(0, 6, 7));
+  struct Case { uint64_t before, value; u32 address, offset; };
+  constexpr std::array cases{
+      Case{0x7fffffffffffffffull, 0x8000000000000000ull, 0, 8},
+      Case{0x8000000000000000ull, 0x7fffffffffffffffull, 0, 8},
+      Case{0x8000000000000001ull, 0x8000000000000002ull, 0x10007, 2},
+      Case{0xffffffffffffffffull, 0, 0, 8}};
+  for (const auto &item : cases) {
+    pair(2, item.before);
+    code.push_back(EncodeDs0(0x4d, 8));
+    code.push_back(EncodeDs1(0, 2, 7));
+    pair(4, item.value);
+    AppendVMovLiteral(&code, 0, item.address);
+    // CS23e96bf5029f62fd pc 0xec8: d9a00008 00000400. VDst aliases ADDR.
+    code.push_back(EncodeDs0(0x68, item.offset));
+    code.push_back(0x00000400u);
+    result(0, item.before);
+    code.push_back(EncodeDs0(0x76, 8));
+    code.push_back(EncodeDs1(8, 0, 7));
+    result(8, std::max(item.before, item.value));
+  }
+  struct CompareCase { uint64_t before, compare, replacement; };
+  constexpr std::array compare_cases{
+      CompareCase{0xfedcba9876543210ull, 0xfedcba9876543210ull, 0x0123456789abcdefull},
+      CompareCase{0xfedcba9876543210ull, 0x0edcba9876543210ull, UINT64_MAX},
+      CompareCase{0xfedcba9876543210ull, 0xfedcba9876543211ull, UINT64_MAX},
+      CompareCase{UINT64_MAX, UINT64_MAX, 0}};
+  AppendVMovU32(&code, 63, 0);
+  for (const auto &item : compare_cases) {
+    pair(4, item.before);
+    code.push_back(EncodeDs0(0x4d, 16));
+    code.push_back(EncodeDs1(0, 4, 7));
+    pair(0, item.compare);
+    pair(2, item.replacement);
+    // pc 0x1048: DATA compares, DATA2 replaces, VDst aliases DATA2.
+    code.insert(code.end(), {0xd9c00010u, 0x0202003fu});
+    result(2, item.before);
+    code.push_back(EncodeDs0(0x76, 16));
+    code.push_back(EncodeDs1(8, 0, 7));
+    result(8, item.before == item.compare ? item.replacement : item.before);
+  }
+  pair(4, UINT64_MAX);
+  AppendVMovU32(&code, 0, 24); // One DWORD remains: ignore the entire atomic.
+  code.push_back(EncodeDs0(0x68));
+  code.push_back(EncodeDs1(2, 4, 0));
+  result(2, 0);
+  pair(2, 0xabcdef0112345678ull);
+  AppendVMovU32(&code, 0, 0);
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  code.insert(code.end(), {0xd9a00008u, 0x02000400u});
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  result(2, 0xabcdef0112345678ull); // Inactive lanes retain both destination DWORDs.
+  code.push_back(EncodeDs0(0x36, 24));
+  code.push_back(EncodeDs1(6, 0, 7));
+  AppendStoreVgpr(&code, 6, static_cast<u32>(test.expected.size()));
+  test.expected.push_back(0x13579bdfu);
+  AppendEnd(&code);
+  test.compute_info.lds_size_dwords = 7;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::DS_WRITE_B32, O::DS_WRITE_B64,
+                  O::DS_MAX_RTN_U64, O::DS_CMPST_RTN_B64, O::DS_READ_B32, O::DS_READ_B64,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicUMax %ulong", "OpAtomicCompareExchange %ulong", "WorkgroupMemoryExplicitLayoutKHR", "Aliased"};
+  test.forbidden_spirv = {"OpAtomicLoad", "OpLoopMerge"};
+  return test;
+}
+
+TestCase DsCompareStoreReturn32() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsCompareStoreReturn32";
+  auto &code = test.code;
+  const auto result = [&](u32 reg, u32 value) {
+    AppendStoreVgpr(&code, reg, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(value);
+  };
+  struct Case { u32 before, compare, replacement; };
+  constexpr std::array cases{Case{0x12345678u, 0x12345678u, 0x9abcdef0u},
+                             Case{0x12345678u, 0x9abcdef0u, 0x12345678u},
+                             Case{0x80000000u, 0u, 0x7fffffffu},
+                             Case{UINT32_MAX, UINT32_MAX, 0u}};
+  AppendVMovU32(&code, 7, 0);
+  for (const auto &item : cases) {
+    AppendVMovLiteral(&code, 2, item.before);
+    code.push_back(EncodeDs0(0x0d, 8));
+    code.push_back(EncodeDs1(0, 2, 7));
+    AppendVMovLiteral(&code, 5, item.compare);
+    AppendVMovLiteral(&code, 19, item.replacement);
+    AppendVMovU32(&code, 4, 8);
+    // CS04b812daaacd532f pc 0x3e8: DATA compares, DATA2 replaces, VDst aliases ADDR.
+    code.insert(code.end(), {0xd8c00000u, 0x04130504u});
+    result(4, item.before);
+    code.push_back(EncodeDs0(0x36, 8));
+    code.push_back(EncodeDs1(8, 0, 7));
+    result(8, item.before == item.compare ? item.replacement : item.before);
+  }
+  AppendVMovU32(&code, 5, 0);
+  AppendVMovU32(&code, 4, 12); // Past the three LDS DWORDs.
+  code.insert(code.end(), {0xd8c00000u, 0x04130504u});
+  result(4, 0);
+  AppendVMovLiteral(&code, 2, 0x12345678u);
+  code.push_back(EncodeDs0(0x0d, 8));
+  code.push_back(EncodeDs1(0, 2, 7));
+  AppendVMovLiteral(&code, 5, 0x12345678u);
+  AppendVMovU32(&code, 4, 8);
+  code.push_back(EncodeSMovB32(126, InlineU32(0)));
+  code.insert(code.end(), {0xd8c00000u, 0x04130504u});
+  code.push_back(EncodeSMovB32(126, InlineU32(1)));
+  result(4, 8); // An inactive lane keeps its destination and leaves memory alone.
+  code.push_back(EncodeDs0(0x36, 8));
+  code.push_back(EncodeDs1(8, 0, 7));
+  result(8, 0x12345678u);
+  AppendEnd(&code);
+  test.compute_info.lds_size_dwords = 3;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::DS_WRITE_B32, O::DS_CMPST_RTN_B32,
+                  O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicCompareExchange %uint"};
+  test.forbidden_spirv = {"OpLoopMerge"};
   return test;
 }
 
@@ -31334,6 +37134,65 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+TestCase CoherentBufferPairContention(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64 ? "CoherentBufferPairContentionWave64"
+                              : "CoherentBufferPairContentionWave32";
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 0);
+  AppendVMovU32(&code, 6, 0);
+  AppendSMovLiteral(&code, 20, 128);
+  const auto loop = code.size();
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0));
+  code.push_back(
+      EncodeVop1(0x37, 3, Vgpr(2))); // v_not_b32: correlated high word.
+  AppendBufferStoreOpcode(&code, 0x50, 2, 20);
+  code.push_back(EncodeMubuf0(0x0d, 0, false, true, true) | (1u << 15u));
+  code.push_back(EncodeMubuf1(4, 12, 20));
+  code.push_back(EncodeVop2(0x1d, 4, Vgpr(4), 5));
+  code.push_back(EncodeVop1(0x37, 4, Vgpr(4)));
+  code.push_back(EncodeVop2(0x1c, 6, Vgpr(4), 6));
+  code.push_back(EncodeSop2(0x01, 20, 20, InlineU32(1)));
+  code.push_back(EncodeSopc(0x07, 20, InlineU32(0)));
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(loop - code.size() - 1)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 2);
+  code.push_back(EncodeSopp(0x0a, 0));
+  // Restore a deterministic mailbox after all readers finish.
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovLiteral(&code, 3, 0xffffffffu);
+  AppendBufferStoreOpcode(&code, 0x50, 2, 20);
+  AppendEnd(&code);
+  test.initial.assign(wave_size * 2 + 2, 0);
+  test.initial[1] = 0xffffffffu;
+  test.expected = test.initial;
+  test.required_spirv = {"OpAtomicExchange %ulong", "OpAtomicLoad %ulong",
+                         "Int64Atomics", "OpLoopMerge"};
+  test.opcodes = {O::V_MOV_B32,
+                  O::S_MOV_B32,
+                  O::S_MOV_B64,
+                  O::V_ADD_NC_U32,
+                  O::V_NOT_B32,
+                  O::V_XOR_B32,
+                  O::V_OR_B32,
+                  O::BUFFER_ATOMIC_SWAP_X2,
+                  O::BUFFER_LOAD_DWORDX2,
+                  O::S_SUB_U32,
+                  O::S_CMP_LG_U32,
+                  O::S_CBRANCH_SCC1,
+                  O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD,
+                  O::S_BARRIER,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size * 2;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                                   bool store_completion = false) {
   using O = ShaderOpcode;
@@ -31496,6 +37355,40 @@ TestCase BufferAtomicAndX2GlcAndExec() {
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_ATOMIC_AND_X2,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpAtomicAnd %ulong", "Int64Atomics"};
+  return test;
+}
+
+TestCase BufferAtomicAddX2GlcAndExec() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferAtomicAddX2GlcAndExec";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  AppendVMovU32(&code, 20, 0);
+  const u32 values[][2] = {{0x0ff00ff0u, 0xf00ff00fu},
+                         {0xff00ff00u, 0x00ff00ffu},
+                         {0x76543210u, 0xfedcba98u}};
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendVMovLiteral(&code, 2, values[i][0]);
+    AppendVMovLiteral(&code, 3, values[i][1]);
+    if (i == 2) {
+      code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+    }
+    AppendBufferStoreOpcode(&code, 0x52, 2, 20, i != 1);
+    code.push_back(EncodeSop1(0x04, 126, 12));
+    AppendStoreVgpr(&code, 2, 2 + i * 2);
+    AppendStoreVgpr(&code, 3, 3 + i * 2);
+  }
+  AppendEnd(&code);
+  test.initial = {0x12345678u, 0x87654321u, 0, 0, 0, 0, 0, 0};
+  // The first add wraps at 64 bits; the second carries from the low dword.
+  // GLC returns the first old value, preserves the second operand, and EXEC = 0
+  // suppresses the third add and its writeback despite its nonzero operand.
+  test.expected = {0x21256568u, 0x78743430u, 0x12345678u, 0x87654321u,
+                   0xff00ff00u, 0x00ff00ffu, 0x76543210u, 0xfedcba98u};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_ATOMIC_ADD_X2,
+                 O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicIAdd %ulong", "Int64Atomics"};
   return test;
 }
 
@@ -31933,6 +37826,66 @@ TestCase DsAppendUsesEncodedGdsSelector() {
   return test;
 }
 
+TestCase DsOrderedCountAddressAndExec(u32 wave_size, bool pixel_counter) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = pixel_counter
+                  ? (wave_size == 64 ? "DsOrderedCountPixelAddressWave64"
+                                     : "DsOrderedCountPixelAddressWave32")
+                  : (wave_size == 64 ? "DsOrderedCountAddressAndExecWave64"
+                                     : "DsOrderedCountAddressAndExecWave32");
+  auto &code = test.code;
+  // Both the base and OFFSET0 are aligned independently; M0's low bits are
+  // a wave index, or a pixel packer ID, rather than a byte address or size.
+  AppendSMovLiteral(&code, 124, 0x01030003u);
+  code.push_back(EncodeSop1(0x04, 10, 126)); // Save the full EXEC mask.
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 0)); // ADDR value = lane + 1.
+  AppendVMovU32(&code, 9, 99); // DATA0 must not supply the count.
+  const u32 selected_lane = wave_size == 64 ? 47u : 7u;
+  const std::array<uint64_t, 3> masks = {
+      wave_size == 64 ? UINT64_MAX : uint64_t{UINT32_MAX},
+      uint64_t{1} << selected_lane, 0};
+  u32 counter = 1000;
+  for (bool exchange : {false, true}) {
+    for (size_t mode = 0; mode < masks.size(); ++mode) {
+      AppendVMovU32(&code, 3, 0xdeadbeefu);
+      AppendSMovLiteral(&code, 126, static_cast<u32>(masks[mode]));
+      AppendSMovLiteral(&code, 127, static_cast<u32>(masks[mode] >> 32u));
+      const u32 release_done = exchange && mode == 2 ? 3u : 0u;
+      const u32 offset1 = release_done | (pixel_counter ? 4u : 0u) |
+                          (exchange ? 0x10u : 0u);
+      code.push_back(EncodeDs0(0x3f, (offset1 << 8u) | 7u, true));
+      code.push_back(EncodeDs1(3, 9, 2));
+      code.push_back(EncodeSopp(0x0c, 0)); // Wait for the returned GDS value.
+      code.push_back(EncodeSop1(0x04, 126, 10)); // Restore EXEC before reading all lanes.
+      AppendStoreVgprAtLaneDwordOffset(&code, 3, 0,
+                                      static_cast<u32>(test.expected.size()));
+      test.expected.insert(test.expected.end(), wave_size, counter);
+      if (mode != 2) {
+        const u32 value = mode == 0 ? 1u : selected_lane + 1u;
+        counter = exchange ? value : counter + value;
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.initial.assign(test.expected.size(), 0xdeadbeefu);
+  const u32 counter_address = pixel_counter ? 0x110u : 0x104u;
+  test.gds_initial.assign(0x120u / sizeof(u32), 100);
+  test.gds_initial[counter_address / sizeof(u32)] = 1000;
+  test.expected_gds = test.gds_initial;
+  test.expected_gds[counter_address / sizeof(u32)] = counter;
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_ADD_NC_U32, O::V_MOV_B32,
+                  O::DS_ORDERED_COUNT, O::S_WAITCNT, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase DsAppendConsumeGdsRegionBounds() {
   using O = ShaderOpcode;
   struct Access {
@@ -32053,31 +38006,44 @@ TestCase ImageLoadFmaskUsesNativeSampleMapping() {
   return test;
 }
 
-TestCase ImageLoadR32SintUsesSignedSampledImage() {
+template <bool byte> TestCase ImageLoadSintUsesSignedSampledImage() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20, 2);
-  AppendVMovU32(&code, 21, 1);
-  code.push_back(EncodeMimg0(0x00, 0x1));
-  code.push_back(EncodeMimg1(0, 20));
-  AppendStoreVgpr(&code, 0, 0);
+  for (u32 pixel = 0; pixel < (byte ? 4u : 1u); ++pixel) {
+    AppendVMovU32(&code, 20, byte ? pixel : 2u);
+    AppendVMovU32(&code, 21, 1);
+    code.push_back(EncodeMimg0(0x00, 0x1));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, pixel);
+  }
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "ImageLoadR32SintUsesSignedSampledImage";
+  test.name = byte ? "ImageLoadR8SintUsesSignedSampledImage"
+                   : "ImageLoadR32SintUsesSignedSampledImage";
   test.code = code;
-  test.expected = {0xffffff80u};
+  if constexpr (byte) test.expected = {0xffffff80u, 0xffffffffu, 0u, 127u};
+  else test.expected = {0xffffff80u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.sampled_image_rgba.resize(16);
-  test.sampled_image_rgba[6] = 0xffffff80u;
-  test.sampled_image_format = vk::Format::eR32Sint;
+  test.sampled_image_rgba.resize(byte ? 4u : 16u);
+  if constexpr (byte) test.sampled_image_rgba[1] = 0x7f00ff80u;
+  else test.sampled_image_rgba[6] = 0xffffff80u;
+  test.sampled_image_format = byte ? vk::Format::eR8Sint : vk::Format::eR32Sint;
   test.sampled_image_dwords_per_pixel = 1;
-  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  constexpr auto format = byte ? Prospero::BufferFormat::k8SInt : Prospero::BufferFormat::k32SInt;
+  const auto surface = TextureGetSurfaceFormatInfo(format);
+  Require(test.name, "signed format metadata",
+          Prospero::NumBytesPerElement(format) == (byte ? 1u : 4u) &&
+              Prospero::SampledTextureNumericClass(format) == Prospero::TextureNumericClass::Sint &&
+              surface.vk_format == test.sampled_image_format &&
+              surface.conversion_format == Prospero::BufferFormat::kInvalid,
+          "signed sampled image lost its byte width, native mapping or numeric class");
+  test.user_data = MakeSampledTextureData(format);
   test.has_user_data = true;
   test.required_spirv = {"image_17", "OpTypeImage %int", "OpImageFetch %v4int",
-                         "OpBitcast %uint"};
+                         "OpBitcast %v4uint"};
   return test;
 }
 
@@ -32109,6 +38075,36 @@ TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   test.has_user_data = true;
   test.image_descriptor_swizzle = DstSel(6, 5, 4, 7);
   test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract"};
+  return test;
+}
+
+template <bool d16, bool sparse> TestCase ImageLoadPackedUnorm() {
+  TestCase test;
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_LOAD,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.name = d16 ? (sparse ? "ImageLoadPackedUnormD16Sparse" : "ImageLoadPackedUnormD16")
+                  : (sparse ? "ImageLoadPackedUnormSparse" : "ImageLoadPackedUnorm");
+  AppendVMovU32(&test.code, 20, 2u);
+  AppendVMovU32(&test.code, 21, 1u);
+  test.code.push_back(EncodeMimg0(0x00u, sparse ? 0x5u : 0xfu));
+  test.code.push_back(EncodeMimg1(0, 20, 0, 0, false, d16));
+  constexpr u32 words = (sparse ? 2u : 4u) / (d16 ? 2u : 1u);
+  for (u32 word = 0; word < words; ++word) AppendStoreVgpr(&test.code, word, word);
+  AppendEnd(&test.code);
+  test.sampled_image_rgba.assign(16, 0u);
+  test.sampled_image_rgba[6] = (1024u << 11u) | (1023u << 22u);
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = sparse ? DstSel(1, 4, 5, 0) : DstSel(6, 5, 4, 7);
+  const u32 green = std::bit_cast<u32>(1024.0f * (1.0f / 2047.0f));
+  test.expected = d16 ? std::vector<u32>{0x38013c00u, 0u}
+                      : std::vector<u32>{0x3f800000u, green, 0u, 0u};
+  test.expected.resize(words);
+  test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
+  if constexpr (d16) test.required_spirv.emplace_back("PackHalf2x16");
+  test.forbidden_spirv = {"OpTypeSampler", "OpImageGather"};
   return test;
 }
 
@@ -32147,10 +38143,88 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   return test;
 }
 
-template <bool rg> TestCase ImageSampleUScaled8() {
+template <bool sparse> TestCase ImageSamplePackedUnormBilinear() {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+  const std::vector<u32> unnormalized = {EncodeMimg0(0x27, 0x7) | (1u << 12u),
+                                          EncodeMimg1(0, 20, 0, 2)};
+  D::Instruction decoded;
+  D::DecodeInstruction(unnormalized, 0, decoded);
+  Require("ImageSamplePackedUnormBilinear", "coordinate mode",
+          decoded.image_sample_flags ==
+              (D::ImageSampleFlagLevelZero | D::ImageSampleFlagUnnormalized),
+          "unnormalized instruction coordinates lost their sampling restriction");
+  constexpr u32 channels[4][3] = {{0, 0, 0}, {2047, 0, 512},
+                                  {0, 2047, 1023}, {2047, 2047, 256}};
+  constexpr float coordinates[][2] = {{0.5f, 0.5f}, {0.375f, 0.625f},
+                                      {-0.25f, 1.25f}, {0.25f, 0.25f},
+                                      {0.75f, 0.25f}, {0.0f, 0.5f}};
+  TestCase test;
+  test.name = sparse ? "ImageSamplePackedUnormBilinearSparse" : "ImageSamplePackedUnormBilinear";
+  test.image_width = test.image_height = 2;
+  test.sampled_image_format = vk::Format::eR32Uint;
+  test.sampled_image_dwords_per_pixel = 1;
+  for (const auto &pixel : channels) {
+    test.sampled_image_rgba.push_back(pixel[0] | (pixel[1] << 11u) | (pixel[2] << 22u));
+  }
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.user_data[8] = 0x92u;
+  test.user_data[9] = 0x00fff000u;
+  test.user_data[10] = 0x0a500000u; // Captured linear guest sampler; gather uses integer texels.
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(6, 4, 5, 1);
+  test.expected_force_point_sampler = true;
+  test.expected_float_tolerance = 0.000005f;
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  for (const auto &uv : coordinates) {
+    AppendVMovLiteral(&code, 20, std::bit_cast<u32>(uv[0]));
+    AppendVMovLiteral(&code, 21, std::bit_cast<u32>(uv[1]));
+    code.push_back(EncodeMimg0(0x27, sparse ? 0x5 : 0xf));
+    code.push_back(EncodeMimg1(0, 20, 0, 2));
+    const float x = uv[0] * 2.0f - 0.5f, y = uv[1] * 2.0f - 0.5f;
+    const int ix = static_cast<int>(std::floor(x)), iy = static_cast<int>(std::floor(y));
+    const float fx = x - std::floor(x), fy = y - std::floor(y);
+    float rgba[4] = {0, 0, 0, 1};
+    for (u32 channel = 0; channel < 3; ++channel) {
+      for (int dy = 0; dy < 2; ++dy) for (int dx = 0; dx < 2; ++dx) {
+        const auto pixel = std::clamp(iy + dy, 0, 1) * 2 + std::clamp(ix + dx, 0, 1);
+        rgba[channel] += channels[pixel][channel] / (channel == 2 ? 1023.0f : 2047.0f) *
+                         (dx ? fx : 1.0f - fx) * (dy ? fy : 1.0f - fy);
+      }
+    }
+    constexpr u32 swizzle[4] = {2, 0, 1, 3};
+    u32 reg = 0;
+    for (u32 component = 0; component < 4; ++component) {
+      if (sparse && component != 0 && component != 2) continue;
+      AppendStoreVgpr(&code, reg++, test.expected.size());
+      test.expected.push_back(std::bit_cast<u32>(rgba[swizzle[component]]));
+    }
+  }
+  AppendVMovLiteral(&code, 0, 0x3f400000u);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.push_back(EncodeMimg0(0x27, 0x1));
+  code.push_back(EncodeMimg1(0, 20, 0, 2));
+  code.push_back(EncodeSop1(0x04, 126, 12));
+  AppendStoreVgpr(&code, 0, test.expected.size());
+  test.expected.push_back(0x3f400000u);
+  AppendEnd(&code);
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpImageGather", "OpBitFieldUExtract", "OpConvertUToF"};
+  test.forbidden_spirv = {"OpImageFetch", "OpImageSample", "OpImageRead", "OpImageWrite"};
+  return test;
+}
+
+template <bool rg, bool snorm = false> TestCase ImageSamplePacked8() {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
+  test.name = snorm ? "ImageSampleR8SNorm"
+                   : rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
   AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.375f));
   AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
   test.code.push_back(EncodeMimg0(0x20, 0xf));
@@ -32163,30 +38237,74 @@ template <bool rg> TestCase ImageSampleUScaled8() {
     AppendStoreVgpr(&test.code, component, component);
   }
   AppendEnd(&test.code);
-  // R varies horizontally; G varies vertically in the opposite direction.
-  // Bilinear samples must retain fractions despite host UNorm filter precision.
   test.image_width = test.image_height = 2;
-  test.sampled_image_rgba = rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
-                               : std::vector<u32>{0xff00ff00u};
-  test.sampled_image_format = rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
+  test.sampled_image_rgba =
+      snorm ? std::vector<u32>{0x7fc08180u}
+            : rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
+                 : std::vector<u32>{0xff00ff00u};
+  test.sampled_image_format =
+      snorm ? vk::Format::eR8Snorm
+            : rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
   test.sampled_image_dwords_per_pixel = 1;
-  test.sampler_filter = vk::Filter::eLinear;
-  test.expected_float_tolerance = 0.01f;
-  test.user_data = MakeSampledTextureData(rg ? Prospero::BufferFormat::k8_8UScaled
-                                            : Prospero::BufferFormat::k8UScaled);
+  test.sampler_filter = snorm ? vk::Filter::eNearest : vk::Filter::eLinear;
+  test.expected_float_tolerance = snorm ? 0.00002f : 0.01f;
+  test.user_data = MakeSampledTextureData(
+      snorm ? Prospero::BufferFormat::k8SNorm
+            : rg ? Prospero::BufferFormat::k8_8UScaled
+                 : Prospero::BufferFormat::k8UScaled);
   test.user_data[1] |= 1u << 30u;
   test.user_data[2] = 1u << 14u;
   test.user_data[50] = 12u * sizeof(u32);
   test.user_data[51] = 3u << 28u;
   test.has_user_data = true;
-  test.image_descriptor_swizzle = DstSel(rg ? 5 : 4, 4, 0, 1);
-  for (float value : {rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
-                      0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
-                      1.0f, 1.0f, 1.0f, 1.0f}) {
+  test.image_descriptor_swizzle = snorm ? DstSel(4, 5, 6, 7)
+                                      : DstSel(rg ? 5 : 4, 4, 0, 1);
+  constexpr float midpoint = -64.0f / 127.0f;
+  const std::array<float, 12> expected = snorm
+      // -128 and -127 both clamp to -1; the interior signed value normalizes by 127.
+      ? std::array<float, 12>{-1, 0, 0, 1, midpoint, 1, -1, -1, 1, 1, 1, 1}
+      // R varies horizontally; G varies vertically in the opposite direction.
+      : std::array<float, 12>{rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
+                             0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
+                             1.0f, 1.0f, 1.0f, 1.0f};
+  for (float value : expected) {
     test.expected.push_back(std::bit_cast<u32>(value));
   }
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// A kDepth k16UInt image load returns the stored D16 codes and integer swizzle constants.
+TestCase ImageLoadDepthBits() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageLoadDepthBits";
+  constexpr std::array<u32, 4> depth{0x2000u, 0xc000u, 0xffffu, 0x0001u};
+  for (u32 texel = 0; texel < depth.size(); ++texel) {
+    AppendVMovU32(&test.code, 20, texel % 2u);
+    AppendVMovU32(&test.code, 21, texel / 2u);
+    test.code.push_back(EncodeMimg0(0x00, 0xf));
+    test.code.push_back(EncodeMimg1(0, 20));
+    for (u32 component = 0; component < 4; ++component) {
+      AppendStoreVgpr(&test.code, component, texel * 4u + component);
+    }
+    test.expected.insert(test.expected.end(), {depth[texel], 0u, 0u, 1u});
+  }
+  AppendEnd(&test.code);
+  test.image_width = test.image_height = 2;
+  test.sampled_image_rgba = {depth[0] | depth[1] << 16u, depth[2] | depth[3] << 16u};
+  test.sampled_image_format = vk::Format::eR16Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k16UInt);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.user_data[3] |= static_cast<u32>(Prospero::TileMode::kDepth) << 20u;
+  test.user_data[50] = test.expected.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 0, 0, 1);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -32606,13 +38724,6 @@ TestCase ImageGatherExplicitLod() {
   }
   AppendEnd(&code);
 
-  // Mip 0 is all 1.0; mip 1 holds a distinct red value per texel.
-  auto mip1 = MakeRgbaImage(2, 2);
-  SetRgbaPixel(&mip1, 2, 0, 0, 0x40000000u, 0, 0, 0);
-  SetRgbaPixel(&mip1, 2, 1, 0, 0x40400000u, 0, 0, 0);
-  SetRgbaPixel(&mip1, 2, 0, 1, 0x40800000u, 0, 0, 0);
-  SetRgbaPixel(&mip1, 2, 1, 1, 0x40a00000u, 0, 0, 0);
-
   TestCase test;
   test.name = "ImageGatherExplicitLod";
   test.code = std::move(code);
@@ -32645,11 +38756,12 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
       "ImageGatherLodSamplerBounds", "ImageGatherLodTextureMinimum",
       "ImageGatherLodMipNone", "ImageGatherLodPointPostclampMaximum",
       "ImageGatherLodPointPreclampMaximum", "ImageGatherLodPointPostclampMinimum",
-      "ImageGatherLodPointPreclampMinimum"};
+      "ImageGatherLodPointPreclampMinimum", "ImageGatherLodLinearPrimary",
+      "ImageGatherLodLinearIgnoresPreclamp"};
   constexpr std::array lods = mode < 5
       ? std::array{-1.0f, 0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 9.0f}
       : std::array{-1.0f, 0.0f, 0.25f, 0.75f, 1.25f, 1.75f, 2.75f, 9.0f};
-  constexpr std::array<std::array<u32, 8>, 9> selected_mips{{
+  constexpr std::array<std::array<u32, 8>, 11> selected_mips{{
       {0, 0, 1, 2, 3, 4, 4, 4},
       {1, 1, 2, 3, 4, 4, 4, 4},
       {2, 2, 2, 3, 3, 3, 3, 3},
@@ -32659,9 +38771,11 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
       {0, 0, 0, 1, 1, 1, 1, 1},
       {2, 2, 2, 2, 2, 2, 3, 4},
       {1, 1, 1, 1, 1, 2, 3, 4},
+      {0, 0, 0, 0, 1, 1, 2, 4},
+      {0, 0, 0, 0, 1, 1, 2, 4},
   }};
   constexpr u32 lanes = lods.size();
-  constexpr u32 sampler_min = mode == 2 ? 256 : mode >= 7 ? 448 : 0;
+  constexpr u32 sampler_min = mode == 2 ? 256 : mode == 7 || mode == 8 ? 448 : 0;
   constexpr u32 sampler_max = mode == 2 ? 512 : mode == 3 ? 256
       : mode == 5 || mode == 6 ? 448 : 1024;
   TestCase test;
@@ -32706,8 +38820,8 @@ template <u32 mode> TestCase ImageGatherLodPerLane() {
   test.user_data[9] = sampler_min | (sampler_max << 12u);
   // Point preclamp selects whether the half-level rounding adjustment precedes
   // or follows the clamps. The streaming T# minimum follows the sampler bounds.
-  test.user_data[10] = mode == 4 ? 0x4001u : (1u << 26u);
-  if constexpr (mode == 6 || mode == 8) {
+  test.user_data[10] = mode == 4 ? 0x4001u : mode >= 9 ? 0x0a500000u : (1u << 26u);
+  if constexpr (mode == 6 || mode == 8 || mode == 10) {
     test.user_data[10] |= 1u << 28u;
   }
   test.user_data[18] = lanes * sizeof(u32);
@@ -32806,11 +38920,11 @@ TestCase ImageSampleOpcodeAliasUsesNormalCoords() {
   return test;
 }
 
-TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
+template <u32 wave_size> TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20, 1); // +1 X texel offset, a full 32-bit dword even with A16.
+  AppendVMovU32(&code, 20, 1); // +1 X remains a full dword with A16 coordinates.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -32820,24 +38934,148 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
-  // The coordinates select texel (2,1); the offset moves the read to texel (3,1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
-               0x41000000u);
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f000000u, 0, 0, 0);
   SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
-  test.name = "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu";
+  test.name = wave_size == 32 ? "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu32"
+                              : "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu64";
   test.code = code;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
   test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  // The offset written under the result's EXEC is the literal: a ConstOffset.
-  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
-  test.forbidden_spirv = {"OpBitFieldSExtract"};
+  test.required_spirv = {"UnpackHalf2x16", "Lod|ConstOffset"};
+  test.forbidden_spirv = {"OpBitFieldSExtract", "OpImageQuerySizeLod", "OpFDiv"};
   return test;
+}
+
+template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32 ? "ImageSampleOffsetsReadFourNeighbors32"
+                              : "ImageSampleOffsetsReadFourNeighbors64";
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  constexpr std::array offsets{0x01u, 0x3fu, 0x3f00u, 0x0100u};
+  constexpr std::array opcodes{0x37u, 0x37u, 0x34u, 0x32u};
+  for (u32 sample = 0; sample < offsets.size(); ++sample) {
+    AppendVMovLiteral(&test.code, 20, offsets[sample]);
+    u32 coordinate = 21;
+    if (opcodes[sample] == 0x32u) {
+      for (float gradient : {0.25f, 0.f, 0.f, 0.25f}) {
+        AppendVMovLiteral(&test.code, coordinate++, std::bit_cast<u32>(gradient));
+      }
+    }
+    // All instructions address the center of texel (2, 1) before applying the offset.
+    AppendVMovLiteral(&test.code, coordinate, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, coordinate + 1, std::bit_cast<u32>(0.375f));
+    if (opcodes[sample] == 0x34u) AppendVMovU32(&test.code, coordinate + 2, 0);
+    test.code.push_back(EncodeMimg0(opcodes[sample], 0x1));
+    test.code.push_back(EncodeMimg1(sample, 20));
+    AppendStoreVgpr(&test.code, sample, sample);
+  }
+  AppendEnd(&test.code);
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&test.sampled_image_rgba, 4, 2, 1, std::bit_cast<u32>(16.f), 0, 0, 0);
+  constexpr std::array<std::array<u32, 2>, 4> neighbors{{{3, 1}, {1, 1}, {2, 0}, {2, 2}}};
+  for (u32 sample = 0; sample < neighbors.size(); ++sample) {
+    const auto value = std::bit_cast<u32>(float(sample + 1));
+    SetRgbaPixel(&test.sampled_image_rgba, 4, neighbors[sample][0], neighbors[sample][1],
+                 value, 0, 0, 0);
+    test.expected.push_back(value);
+  }
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Lod|ConstOffset", "Grad|ConstOffset"};
+  test.forbidden_spirv = {"OpImageQuerySizeLod", "OpFDiv", "OpBitFieldSExtract", "OpSwitch"};
+  return test;
+}
+
+void CheckDynamicSampleOffsets(VulkanHarness &vulkan, u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 32u ? "DynamicSampleOffsets32" : "DynamicSampleOffsets64";
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.host_subgroup_size = vulkan.SubgroupSize();
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[2] = 7u | (7u << 14u);
+  test.user_data[3] |= 1u << 16u;
+  test.user_data[5] = 1u << 4u;
+  test.user_data[50] = wave_size * sizeof(u32);
+  // Read the offset selector from a texture, as the native shader does.
+  test.code = {EncodeVop2(0x1b, 20, InlineU32(7), 0),
+               EncodeVop2(0x16, 21, InlineU32(3), 0),
+               EncodeVop2(0x1b, 21, InlineU32(1), 21),
+               EncodeMimg0(0x00, 0x1), EncodeMimg1(4, 20),
+               EncodeVop2(0x1b, 20, InlineU32(3), 4),
+               EncodeVop2(0x16, 22, InlineU32(2), 4),
+               EncodeVop2(0x1b, 22, InlineU32(3), 22)};
+  for (u32 reg : {20u, 22u}) {
+    test.code.push_back(EncodeVop2(0x25, reg, InlineU32(63), reg));
+    test.code.push_back(EncodeVop2(0x1b, reg, InlineU32(63), reg));
+  }
+  test.code.push_back(EncodeVop2(0x1a, 22, InlineU32(8), 22));
+  test.code.push_back(EncodeVop2(0x1c, 20, Vgpr(22), 20));
+  AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
+  AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(0.375f));
+  AppendVMovLiteral(&test.code, 23, std::bit_cast<u32>(1.0f));
+  test.code.push_back(EncodeMimg0(0x34, 0x1)); // SAMPLE_L_O: offset is applied at mip 1.
+  test.code.push_back(EncodeMimg1(5, 20));
+  AppendStoreVgprAtLaneDwordOffset(&test.code, 5, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_AND_B32, O::V_LSHRREV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::V_OR_B32, O::V_MOV_B32, O::IMAGE_LOAD, O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"ImageGatherExtended", "Lod|Offset", "OpBitFieldSExtract %int"};
+  test.forbidden_spirv = {"OpSwitch", "OpImageQuerySizeLod", "OpFDiv"};
+  test.initial.assign(wave_size, 0xdeadbeefu);
+  for (u32 lane = 0; lane < wave_size; ++lane)
+    test.expected.push_back(std::bit_cast<u32>(float(100u + (lane & 15u))));
+  auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  const auto halves = wave_size > vulkan.SubgroupSize() ? 2u : 1u;
+  Require(test.name, "direct dynamic offset", tools.Disassemble(compiled.spirv, &text) &&
+              CountText(text, "OpImageSampleExplicitLod") == halves &&
+              CountText(text, "OpBitFieldSExtract %int") == 2u * halves,
+          "dynamic offsets expanded samples or lost signed six-bit components");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  if (wave_size == 32u) {
+    Require(test.name, "default feature gate",
+            !ShaderRecompiler::CompileOptions{}.profile->maintenance8,
+            "maintenance8 must reflect the enabled device feature");
+    ExpectFatal("DynamicSampleOffsetsRequireMaintenance8", [&] {
+      ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &test.compute_info});
+    });
+  }
+#endif
+  auto base = MakeRgbaImage(8, 8);
+  auto mip = MakeRgbaImage(4, 4);
+  for (u32 selector = 0; selector < 16u; ++selector) {
+    SetRgbaPixel(&base, 8, selector & 7u, selector >> 3u, 0x3f800000u | selector, 0, 0, 0);
+    SetRgbaPixel(&mip, 4, selector & 3u, selector >> 2u,
+                 std::bit_cast<u32>(float(100u + selector)), 0, 0, 0);
+  }
+  auto texture = vulkan.CreateImageMips(test.name, 8, 8, vk::Format::eR32G32B32A32Sfloat,
+      vk::ImageUsageFlagBits::eSampled, {base, mip}, 4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+      vk::ImageType::e2D, vk::ImageViewType::e2D, 1u);
+  const auto sampler = vulkan.CreateSampler(test.name, 2u);
+  auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, output, nullptr, &texture, nullptr, nullptr, sampler);
+  CompareWords(test, "image-derived offsets -1..2 at mip 1", test.expected,
+                vulkan.ReadBuffer(test.name, output, test.expected.size()));
+  vulkan.DestroyBuffer(&output);
+  vulkan.Device().destroySampler(sampler);
+  vulkan.DestroyImage(&texture);
+  std::printf("[compute] %-32s ok\n", test.name);
 }
 
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
@@ -32907,7 +39145,8 @@ TestCase ImageGatherCompareOpcodes() {
       O::V_MOV_B32,         O::IMAGE_GATHER4_C,      O::IMAGE_GATHER4_C_LZ,
       O::IMAGE_GATHER4_C_O, O::IMAGE_GATHER4_C_LZ_O, O::BUFFER_STORE_DWORD,
       O::S_ENDPGM};
-  test.required_spirv = {"OpImageDrefGather", "OpBitFieldSExtract"};
+  test.required_spirv = {"OpImageDrefGather", "ConstOffset"};
+  test.forbidden_spirv = {"OpBitFieldSExtract"};
   test.compile_only = true;
   return test;
 }
@@ -33188,6 +39427,835 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  constexpr std::array<u32, 8> lengths{16, 1, 4, 32, 48, 4, 32, 48};
+  constexpr std::array<u32, 8> source_records{16, 1, 2, 32, 40, 0, 32, 48};
+  constexpr std::array<u32, 8> destination_records{16, 1, 4, 24, 48, 4, 32, 44};
+  const auto alignment = static_cast<u32>(vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                                             .limits.minStorageBufferOffsetAlignment);
+  const auto slot_bytes = (512u + alignment - 1u) / alignment * alignment;
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 count : {0u, 1u, 8u}) {
+      TestCase test;
+      test.name = wave == 32 ? "BoundedFormattedBufferCopy32" : "BoundedFormattedBufferCopy64";
+      // Captured b3ade16b0485b3bd: uniform loop over two V# arrays; copy only lanes
+      // below each row's count. Scalar+vector guards and register reuse are intact.
+      test.code = {0xbfa00001u, 0xd7460000u, 0x04010c02u, 0xbeeb0380u,
+          0xf4000080u, 0xfa000120u, 0xbf8cc07fu, 0xbf0a026bu, 0xbf840015u,
+          0x97eaff6bu, 0x00000100u, 0xf40000c0u, 0xd4000000u, 0xbf8cc07fu,
+          0x7da80003u, 0xbf88000bu, 0x8f6a846bu, 0xf4080100u, 0xd4000000u,
+          0xbf8cc07fu, 0xe0002000u, 0x80010100u, 0xf4080200u, 0xd4000080u,
+          0xbf8c0070u, 0xe0102000u, 0x80020100u, 0x816b816bu, 0xbefe04c1u,
+          0xbf82ffe8u, 0xbf810000u};
+      constexpr u32 table_base = 256u;
+      test.initial.assign(slot_bytes * 19u / 4u, 0xdeadbeefu);
+      test.user_data[0] = table_base;
+      test.has_user_data = true;
+      test.has_compute_info = true;
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+      test.compute_info.lds_size_dwords = 0;
+      test.compute_info.group_id[0] = true;
+      test.compute_info.workgroup_register = 2;
+      test.compute_info.thread_ids_num = 1;
+      test.bda_mappings = {{0u, 0u}};
+      for (u32 key = 0; key < 8u; ++key) {
+        const auto src = slot_bytes * (key + 2u);
+        const auto dst = slot_bytes * (key + 10u);
+        for (const auto [row, address, records] :
+             {std::tuple{key * 4u, src, source_records[key]},
+              std::tuple{32u + key * 4u, dst, destination_records[key]}}) {
+          const auto word = table_base / 4u + row;
+          test.initial[word] = address;
+          test.initial[word + 1u] = 4u << 16u;
+          test.initial[word + 2u] = records;
+          test.initial[word + 3u] =
+              static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u | 4u;
+        }
+        test.initial[table_base / 4u + 64u + key] = lengths[key];
+        for (u32 lane = 0; lane < 64u; ++lane)
+          test.initial[src / 4u + lane] = 0x80000001u + key * 0x10000u + lane;
+      }
+      test.initial[table_base / 4u + 72u] = count;
+      test.expected = test.initial;
+      for (u32 key = 0; key < count; ++key)
+        for (u32 lane = 0; lane < std::min({wave, lengths[key], destination_records[key]}); ++lane)
+          test.expected[slot_bytes * (key + 10u) / 4u + lane] =
+              lane < source_records[key] ? 0x80000001u + key * 0x10000u + lane : 0u;
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      if (count == 0u) {
+        u32 formatted_reads = 0;
+        for (const auto* block : compiled.program.blocks) {
+          for (const auto& inst : *block) {
+            if (inst.GetOpcode() != ValueOpcode::LoadBufferU32) continue;
+            const auto& memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+            formatted_reads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
+          }
+        }
+        Require(test.name, "runtime zero loop bound", formatted_reads == 1u,
+                "runtime loop count must retain the GPU formatted source read");
+      }
+      Require(test.name, "finite writable descriptors",
+              compiled.resources.buffers.size() == std::max(1u, count),
+              "the bounded loop lost or overprobed a destination");
+      test.storage_buffer_ranges.resize(compiled.resources.buffers.size());
+      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
+        const auto& descriptor = compiled.resources.buffers[resource].dwords;
+        test.storage_buffer_ranges[resource] =
+            {descriptor[0], std::max(4u, descriptor[2] * 4u)};
+      }
+      if (count == 8u) {
+        std::set<u32> nonuniform;
+        std::vector<u32> stores;
+        u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
+        u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
+        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
+        bool geometry_pure = true, geometry_cases = true;
+        for (size_t offset = 5; offset < compiled.spirv.size();) {
+          const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpName) {
+            const std::string_view name(reinterpret_cast<const char *>(words.data() + 2));
+            if (name == "get_bda_pointer") bda_function = words[1];
+            if (name == "convert_indirect_buffer_format") conversion_function = words[1];
+            if (name == "indirect_buffer_format_geometry") geometry_function = words[1];
+          }
+          if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+            nonuniform.insert(words[1]);
+          if (opcode == spv::OpStore) stores.push_back(words[1]);
+          if (opcode == spv::OpFunction) {
+            function = words[2];
+            conversion_definitions += function == conversion_function;
+            geometry_definitions += function == geometry_function;
+          }
+          if (function == geometry_function && function != 0u) {
+            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
+                             opcode != spv::OpFunctionCall;
+            if (opcode == spv::OpSwitch) {
+              ++geometry_switches;
+              constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
+              geometry_cases &= words.size() == 3u + 2u * formats;
+              if (words.size() == 3u + 2u * formats) {
+                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
+                for (u32 format = 0; format < formats; ++format)
+                  geometry_cases &= words[3u + 2u * format] == format;
+              }
+            }
+          }
+          if (opcode == spv::OpFunctionCall) {
+            if (words[3] == bda_function) ++bda_calls;
+            if (words[3] == conversion_function) ++conversion_calls;
+            if (words[3] == geometry_function) ++geometry_calls;
+          }
+          if (opcode == spv::OpFunctionEnd) function = 0;
+          offset += words.size();
+        }
+        Require(test.name, "one shared formatted conversion",
+                conversion_definitions == 1u &&
+                    conversion_calls == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+                "formatted loads must call one conversion function across virtual halves");
+        Require(test.name, "one shared pure format geometry",
+                geometry_definitions == 1u && geometry_calls == conversion_calls &&
+                    geometry_switches == 1u && geometry_cases && geometry_pure,
+                "format geometry duplicated, lost a format/default or acquired memory accesses");
+        Require(test.name, "one shared indirect store per virtual half",
+                std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
+                    (wave > vulkan.SubgroupSize() ? 2 : 1),
+                "formatted identity lowering duplicated the store per descriptor");
+        Require(test.name, "shared formatted payload read", bda_calls <= 12u,
+                "formatted source load duplicated BDA reads per format or component");
+        std::printf("[compute] BoundedFormattedBufferCopy%u: %zu SPIR-V words, %u BDA calls\n",
+                    wave, compiled.spirv.size(), bda_calls);
+      }
+      auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+      vulkan.Dispatch(test, compiled, output);
+      const auto actual = vulkan.ReadBuffer(test.name, output, test.expected.size());
+      vulkan.DestroyBuffer(&output);
+      CompareWords(test, "bounded rows, formatted raw bits, source OOB zero and destination canaries",
+                   test.expected, actual);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "BoundedFormattedBufferCopy");
+}
+
+void CheckBoundedRecordBufferAccess(VulkanHarness &vulkan) {
+  using namespace ShaderRecompiler::IR;
+  using F = Prospero::BufferFormat;
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 count : {0u, 2u, 3u, 6u}) {
+      TestCase test;
+      test.name = wave == 32 ? "BoundedRecordBufferAccess32" : "BoundedRecordBufferAccess64";
+      constexpr u32 table = 256u;
+      test.initial.assign((slot * 13u + 6u * wave * 16u) / 4u, 0xdeadbeefu);
+      test.has_user_data = test.has_compute_info = true;
+      test.user_data[0] = table;
+      test.user_data[1] = 8u << 16u;
+      test.user_data[2] = 6u * 192u / 8u;
+      test.user_data[3] = 0x5204u;
+      test.user_data[4] = count;
+      const std::array<u32, 4> output{slot * 13u, 16u << 16u, 6u * wave, 0x5204u};
+      std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.lds_size_dwords = 0;
+      auto &code = test.code;
+      code.insert(code.end(), {EncodeSMovB32(32, InlineU32(0)), EncodeSop1(0x04, 36, 126)});
+      AppendVMovLiteral(&code, 13, 0x80000000u);
+      code.insert(code.end(), {EncodeVopc(0xc2, InlineU32(6), 0),
+          EncodeVop2(0x01, 12, Vgpr(0), 13)});
+      AppendVMovLiteral(&code, 14, 0x55555556u);
+      code.insert(code.end(), {EncodeVopc(0xc2, InlineU32(6), 0),
+          EncodeVop2(0x01, 15, Vgpr(0), 14)});
+      AppendVMovLiteral(&code, 10, 0xa5c39b72u);
+      const auto header = code.size();
+      code.push_back(EncodeSopc(0x04, 32, 4));
+      const auto exit_branch = code.size();
+      code.push_back(0);
+      code.insert(code.end(), {EncodeSop2(0x26, 33, 32, 255), 192u,
+          EncodeSmem0(0x0a, 8, 0), EncodeSmem1(160u, 33),
+          EncodeSmem0(0x0a, 12, 0), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0),
+          EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 12),
+          EncodeMubuf0(0x83, 0, true, false, true), EncodeMubuf1(6, 2, 12),
+          EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 32, InlineU32(std::countr_zero(wave))),
+          EncodeVop2(0x25, 20, 34, 0),
+          EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
+      AppendSMovLiteral(&code, 126, 0x55555555u);
+      AppendSMovLiteral(&code, 127, wave == 64 ? 0x55555555u : 0u);
+      code.insert(code.end(), {EncodeMubuf0(0x19, 0, true, false, true), EncodeMubuf1(10, 3, 15),
+          EncodeSop1(0x04, 126, 36), EncodeSop2(0x02, 32, 32, InlineU32(1))});
+      code.push_back(EncodeSopp(0x02, header - code.size() - 1u));
+      code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+      AppendEnd(&code);
+      for (u32 row = 0; row < 6u; ++row) {
+        const u32 src = slot * (row + 1u) + (row + 1u) * 4u;
+        const u32 dst = slot * (row + 7u) + row + 1u;
+        const auto format = count == 6u && row == 0u ? F::k32_32_32_32Float :
+                            count == 6u && row == 1u ? F::k8_8_8_8UNorm : F::k16_16_16_16Float;
+        const bool empty_one = row == (count == 3u ? 0u : 2u);
+        const u32 swizzle = empty_one ? DstSel(1, 4, 1, 4) : DstSel(4, 5, 6, 7);
+        std::array<u32, 4> input{empty_one ? 0u : src, 16u << 16u,
+                                empty_one ? 0u : 2u, static_cast<u32>(format) << 12u | swizzle};
+        if (row == 3u) input.fill(0u);
+        const std::array<u32, 4> destination{dst, 3u << 16u, 16u, 0x5204u};
+        std::copy(input.begin(), input.end(), test.initial.begin() + table / 4u + row * 48u + 40u);
+        std::copy(destination.begin(), destination.end(), test.initial.begin() + table / 4u + row * 48u + 44u);
+        for (u32 record = 0; record < 2u; ++record) {
+          const auto word = src / 4u + record * 4u;
+          if (format == F::k32_32_32_32Float) {
+            const std::array<u32, 4> data{0x3f800000u, 0x3f000000u, 0u, 0xc0000000u};
+            std::copy(data.begin(), data.end(), test.initial.begin() + word);
+          } else if (format == F::k8_8_8_8UNorm) test.initial[word] = 0xffffffffu;
+          else {
+            test.initial[word] = 0x38003c00u;
+            test.initial[word + 1u] = 0xc0000000u;
+          }
+        }
+      }
+      test.expected = test.initial;
+      auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+      for (u32 row = 0; row < count; ++row) {
+        for (u32 lane = 0; lane < wave; ++lane) {
+          std::array<u32, 2> value{};
+          if (row == (count == 3u ? 0u : 2u)) value = {0x3c00u, 0x3c00u};
+          else if (row != 3u && lane < 2u && !(row == 5u && lane == 1u))
+            value = count == 6u && row == 1u ? std::array<u32, 2>{0x3c003c00u, 0x3c003c00u}
+                                            : std::array<u32, 2>{0x38003c00u, 0xc0000000u};
+          const u32 out = slot * 13u / 4u + (row * wave + lane) * 4u;
+          for (u32 word = 0; word < 4u; ++word) test.expected[out + word] = value[word % 2u];
+          if (lane < 16u && lane != 6u && (lane & 1u) == 0u)
+            expected_bytes[slot * (row + 7u) + row + 1u + lane * 3u] = std::byte{0xc3};
+        }
+      }
+      if (count == 2u || count == 3u) {
+        test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
+        test.forbidden_spirv = {"OpSwitch", "PhysicalStorageBuffer", "convert_indirect_buffer_format",
+                               "indirect_buffer_format_geometry"};
+      } else if (count == 6u) test.required_spirv = {"OpSwitch"};
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      Require(test.name, "mixed native aliases", count != 6u ||
+                  (compiled.program.info.buffer_u8 && compiled.program.info.buffer_u16),
+              "mixed candidates lost an 8-bit or 16-bit native binding");
+      u32 selections = 0;
+      for (auto *block : compiled.program.blocks)
+        for (const auto &inst : *block) selections += inst.GetOpcode() == ValueOpcode::GetBufferResourceIndex;
+      Require(test.name, "shared loop selection", count == 0u ? selections <= 2u : selections == 2u,
+              "repeated formatted loads repeated the descriptor lookup");
+      for (u32 resource = 0; resource < compiled.resources.buffers.size(); ++resource) {
+        ShaderBufferResource descriptor{};
+        std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4u, descriptor.fields);
+        const u32 address = descriptor.Base48();
+        const u32 prefix = address % alignment;
+        u32 bytes = std::max(4u, static_cast<u32>(descriptor.GetSize()));
+        if (address == slot * 5u + 20u) bytes = 24u;
+        if (address == slot * 6u + 24u) bytes = 23u;
+        test.storage_buffer_ranges.emplace_back(address - prefix, bytes + prefix);
+        const u32 binding = compiled.program.info.buffers[resource].descriptor_index;
+        if (binding != UINT32_MAX)
+          compiled.packed_user_data[compiled.program.bindings.memory_offset_dword + binding / 4u] |=
+              prefix << ((binding % 4u) * 8u);
+      }
+      auto output_buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, output_buffer);
+      CompareWords(test, "row keys, mixed formats, empty-One, partial payloads, prefixes and byte canaries",
+                   test.expected, vulkan.ReadBuffer(test.name, output_buffer, test.expected.size()));
+      vulkan.DestroyBuffer(&output_buffer);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "BoundedRecordBufferAccess");
+}
+
+void CheckGpuSelectedRecordBufferAccess(VulkanHarness &vulkan) {
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  constexpr u32 selectors = 256u, table = 512u;
+  // Multiplication by 192 wraps: these keys reach congruence slots 1,4,0,3,2,1,OOB,7,5.
+  constexpr std::array keys{0u, 1u, 0x15555555u, 0x15555556u, 0x2aaaaaabu,
+                            0x40000000u, UINT32_MAX, 2u, 0x2aaaaaacu};
+  for (const u32 components : {0u, 2u, 3u, 4u})
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 table_bytes : {0u, 536u, 544u}) {
+      TestCase test;
+      test.name = wave == 32u ? "GpuSelectedRecordBufferAccess32" : "GpuSelectedRecordBufferAccess64";
+      test.initial.assign((slot * 13u + keys.size() * wave * 16u) / 4u, 0xdeadbeefu);
+      test.has_user_data = test.has_compute_info = true;
+      const std::array<u32, 8> descriptors{selectors, 12u << 16u, keys.size(), 0x5204u,
+                                           table, 0u, table_bytes, 0x5204u};
+      std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
+      const std::array<u32, 4> output{slot * 13u, 16u << 16u, u32(keys.size()) * wave, 0x5204u};
+      std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+      test.compute_info.wave_size = wave;
+      test.compute_info.threads_num[0] = wave;
+      test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+      test.compute_info.thread_ids_num = 1;
+      test.compute_info.group_id[0] = true;
+      test.compute_info.workgroup_register = 24u;
+      test.compute_info.lds_size_dwords = 0;
+      test.dispatch_x = keys.size();
+      test.bda_mappings = {{0u, 0u}};
+      auto &code = test.code;
+      // A vector load keeps this regression on the unbounded affine-table path.
+      code.insert(code.end(), {EncodeVop1(0x01, 2, 24),
+          EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(3, 0, 2),
+          EncodeSopp(0x0c, 0), EncodeVop1(0x02, 32, Vgpr(3)),
+          EncodeSop2(0x26, 33, 32, 255), 192u,
+          EncodeSop2(0x02, 33, 33, 255), 96u});
+      if (components == 0u)
+        code.insert(code.end(), {EncodeSmem0(0x0a, 36, 2), EncodeSmem1(144u, 33)});
+      code.insert(code.end(), {
+          EncodeSmem0(0x0a, 8, 2), EncodeSmem1(160u, 33),
+          EncodeSmem0(0x0a, 12, 2), EncodeSmem1(176u, 33), EncodeSopp(0x0c, 0)});
+      if (components == 0u) {
+        code.insert(code.end(), {
+          EncodeMubuf0(0x83, 0, true, false), EncodeMubuf1(4, 2, 0),
+          EncodeMubuf0(0x0a, 0, true, false), EncodeMubuf1(6, 9, 0),
+          EncodeMubuf0(0x00, 0, true, false), EncodeMubuf1(7, 9, 0)});
+      } else {
+        for (u32 component = components; component < 4u; ++component)
+          AppendVMovLiteral(&code, 4u + component, 0x13579bdfu);
+        code.insert(code.end(), {EncodeMubuf0(components - 1u, 0, true, false, true),
+                                 EncodeMubuf1(4, 2, 0)});
+      }
+      code.insert(code.end(), {
+          EncodeSopp(0x0c, 0), EncodeSop2(0x1e, 34, 24, InlineU32(std::countr_zero(wave))),
+          EncodeVop2(0x25, 20, 34, 0),
+          EncodeMubuf0(0x1e, 0, true, false), EncodeMubuf1(4, 4, 20)});
+      AppendVMovLiteral(&code, 10, 0xa5c39b72u);
+      AppendSMovLiteral(&code, 126, 0x55555555u);
+      AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
+      code.insert(code.end(), {EncodeMubuf0(0x19, 0, true, false, true), EncodeMubuf1(10, 3, 20)});
+      AppendEnd(&code);
+      for (u32 row = 0; row < 6u; ++row) {
+        std::array<u32, 8> record{slot * (row + 1u), 8u << 16u, 1u,
+            static_cast<u32>(Prospero::BufferFormat::k16_16_16_16Float) << 12u | DstSel(4, 5, 6, 7),
+            slot * (row + 7u), 1u << 16u, u32(keys.size()) * wave, 0x5204u};
+        if (components != 0u) {
+          constexpr std::array formats{Prospero::BufferFormat::k16_16Float,
+              Prospero::BufferFormat::k16_16_16_16SNorm, Prospero::BufferFormat::k10_10_10_2SNorm};
+          const std::array swizzles{DstSel(4, 5, 0, 1), DstSel(7, 4, 1, 0), DstSel(5, 4, 7, 6)};
+          record[3] = (u32(formats[row % 3u]) << 12u) | swizzles[row % 3u];
+          if (row == 3u) std::fill_n(record.begin(), 4u, 0u);
+        }
+        std::copy(record.begin(), record.end(), test.initial.begin() + (table + 192u + row * 64u) / 4u);
+        // BDA loads use a separate tuple, as the captured shader's record members do.
+        if (components == 0u) {
+          std::copy_n(record.begin(), 4u, test.initial.begin() + (table + 176u + row * 64u) / 4u);
+          test.initial[slot * (row + 1u) / 4u] = ((0x3800u + row) << 16u) | (0x3c00u + row);
+          test.initial[slot * (row + 1u) / 4u + 1u] = ((0xc000u + row) << 16u) | (0x4000u + row);
+        } else {
+          constexpr std::array<std::array<u32, 2>, 3> payload{{
+              {0x3800bc00u, 0u}, {0x7fff8000u, 0x80010000u}, {0xc007fe00u, 0u}}};
+          std::copy(payload[row % 3u].begin(), payload[row % 3u].end(),
+                    test.initial.begin() + slot * (row + 1u) / 4u);
+        }
+      }
+      // Compile against poison selectors. A separate GPU dispatch writes the actual keys.
+      auto compiled = CompileCase(test, vulkan.SubgroupSize());
+      if (table_bytes == 0u || components != 0u)
+        test.forbidden_spirv = {"convert_indirect_buffer_format", "load_indirect_buffer_",
+                               "indirect_buffer_format_geometry"};
+      else
+        test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+      CheckSpirvEmission(test, compiled.spirv);
+      u32 bda_function = 0, bda_calls = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpName &&
+            std::string_view(reinterpret_cast<const char *>(words.data() + 2)) == "get_bda_pointer")
+          bda_function = words[1];
+        if (opcode == spv::OpFunctionCall && words[3] == bda_function) ++bda_calls;
+        offset += words.size();
+      }
+      Require(test.name, "empty descriptor table specialization", (bda_calls == 0u) == (table_bytes == 0u || components != 0u),
+              "empty table retained BDA reads or nonempty table lost GPU descriptor loads");
+      for (const auto &descriptor : compiled.resources.buffers) {
+        ShaderBufferResource resource{};
+        std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
+        test.storage_buffer_ranges.emplace_back(resource.Base48(),
+            components != 0u && resource.Base48() == slot * 5u ? 6u : std::max(4u, u32(resource.GetSize())));
+      }
+      TestCase producer;
+      producer.name = "GpuRecordSelectorProducer";
+      producer.initial = test.initial;
+      producer.has_compute_info = true;
+      producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+          producer.compute_info.threads_num[2] = 1u;
+      producer.compute_info.wave_size = 32u;
+      producer.compute_info.lds_size_dwords = 0;
+      for (u32 group = 0; group < keys.size(); ++group) {
+        AppendVMovLiteral(&producer.code, 1, keys[group]);
+        AppendVMovLiteral(&producer.code, 2, selectors + group * 12u);
+        AppendBufferStoreDword(&producer.code, 1, 2);
+      }
+      AppendEnd(&producer.code);
+      const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+      test.expected = test.initial;
+      auto bytes = std::as_writable_bytes(std::span(test.expected));
+      for (u32 group = 0; group < keys.size(); ++group) {
+        test.expected[selectors / 4u + group * 3u] = keys[group];
+        const u32 dynamic = keys[group] * 192u + 96u;
+        const u32 row = dynamic / 64u;
+        for (u32 lane = 0; lane < wave; ++lane) {
+          const u32 out = slot * 13u / 4u + (group * wave + lane) * 4u;
+          const bool source = uint64_t{dynamic} + 160u + 16u <= table_bytes && lane == 0u;
+          if (components == 0u) {
+            test.expected[out] = source ? test.initial[slot * (row + 1u) / 4u] : 0u;
+            test.expected[out + 1u] = source ? test.initial[slot * (row + 1u) / 4u + 1u] : 0u;
+            const bool bda_source = uint64_t{dynamic} + 144u + 16u <= table_bytes && lane == 0u;
+            test.expected[out + 2u] = bda_source ? 0x3c00u + row : 0u;
+            test.expected[out + 3u] = bda_source ? 0x3f800000u + (row << 13u) : 0u;
+          } else {
+            constexpr std::array<std::array<u32, 4>, 3> values{{
+                {0xbf800000u, 0x3f000000u, 0u, 0x3f800000u},
+                {0xbf800000u, 0xbf800000u, 0x3f800000u, 0u},
+                {0x3f800000u, 0xbf800000u, 0xbf800000u, 0u}}};
+            constexpr std::array<std::array<u32, 4>, 3> defaults{{
+                {0u, 0u, 0u, 0x3f800000u}, {0u, 0u, 0x3f800000u, 0u}, {0u, 0u, 0u, 0u}}};
+            const bool descriptor = uint64_t{dynamic} + 160u + 16u <= table_bytes && row != 3u;
+            for (u32 component = 0; component < 4u; ++component)
+              test.expected[out + component] = component >= components ? 0x13579bdfu :
+                  !descriptor ? 0u : source && row != 4u ? values[row % 3u][component] : defaults[row % 3u][component];
+          }
+          if (uint64_t{dynamic} + 176u + 16u <= table_bytes && (lane & 1u) == 0u)
+            bytes[slot * (row + 7u) + group * wave + lane] = std::byte{0xc3};
+        }
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+      vulkan.Dispatch(producer, producer_shader, buffer);
+      vulkan.Dispatch(test, compiled, buffer);
+      CompareWords(test, "GPU selectors, wrapped offsets, partial descriptors, OOB and masked byte stores",
+                   test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+      vulkan.DestroyBuffer(&buffer);
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "GpuSelectedRecordBufferAccess");
+}
+
+void CheckGuardedWaterfallBufferRecords(VulkanHarness &vulkan) {
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  constexpr u32 selectors = 256u, table = 512u;
+  enum class Guard { AndNot, DirectGt, NarrowingLoop };
+  for (const auto guard : {Guard::AndNot, Guard::DirectGt, Guard::NarrowingLoop})
+  for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
+                                      std::pair{64u, true}}) {
+    const bool direct_gt = guard == Guard::DirectGt;
+    const bool outer_loop = guard == Guard::NarrowingLoop;
+    const u32 iterations = outer_loop ? 2u : 1u;
+    const std::string name = std::string(direct_gt ? "GuardedWaterfallGtRecords" : outer_loop
+        ? "GuardedWaterfallLoopRecords" : "GuardedWaterfallRecords") +
+        (upper_only ? "Upper64" : std::to_string(wave));
+    TestCase test;
+    test.name = name.c_str();
+    test.initial.assign((slot * 3u + wave * iterations * 16u + 16u) / 4u, 0xdeadbeefu);
+    std::fill_n(test.initial.begin() + table / 4u, 976u / 4u, 0u);
+    constexpr std::array poison{0x012b6890u, 0x501502f9u, 0x493ba30eu, 0x3ea2f352u};
+    std::copy(poison.begin(), poison.end(), test.initial.begin() + (table + 480u) / 4u);
+    test.has_user_data = test.has_compute_info = true;
+    const std::array<u32, 8> descriptors{table, 488u << 16u, 2u, 0x5204u,
+                                        selectors, 4u << 16u, wave, 0x5204u};
+    std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin());
+    const std::array output{slot * 3u, 16u << 16u, wave * iterations, 0x5204u};
+    std::copy(output.begin(), output.end(), test.user_data.begin() + 16u);
+    for (u32 row = 0; row < 2u; ++row) {
+      const std::array descriptor{slot * (row + 1u), 12u << 16u, wave,
+          (u32(Prospero::BufferFormat::k32_32_32Float) << 12u) | DstSel(4, 5, 6, 1)};
+      std::copy(descriptor.begin(), descriptor.end(),
+                test.initial.begin() + (table + row * 488u + 216u) / 4u);
+      for (u32 lane = 0; lane < wave; ++lane)
+        for (u32 component = 0; component < 3u; ++component)
+          test.initial[slot * (row + 1u) / 4u + lane * 3u + component] =
+              0x3f800000u + (row << 20u) + (lane << 12u) + (component << 8u);
+    }
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1;
+    test.compute_info.lds_size_dwords = 0;
+    auto &code = test.code;
+    code.push_back(EncodeVop1(0x01, 30, Vgpr(0)));
+    if (upper_only) {
+      AppendSMovLiteral(&code, 126, 0u);
+      AppendSMovLiteral(&code, 127, UINT32_MAX);
+    }
+    if (outer_loop) code.insert(code.end(), {EncodeVop2(0x1b, 10, InlineU32(8), 30),
+                                           EncodeVopc(0xd2, InlineU32(0), 10)});
+    code.insert(code.end(), {EncodeSop1(0x04, 20, 126),
+        EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(5, 1, 30), EncodeSopp(0x0c, 0)});
+    if (outer_loop) {
+      // Save the initial-EXEC comparison before the loop, as in native 9d4c.
+      code.insert(code.end(), {EncodeVopc(0xc3, 2, 5), EncodeSop1(0x04, 52, 106)});
+      AppendSMovLiteral(&code, 36, 0u);
+    }
+    const auto outer = code.size();
+    if (direct_gt) code.push_back(EncodeVopc(0xd4, 2, 5)); // Keep N > local key in EXEC.
+    else if (outer_loop) code.insert(code.end(), {
+        EncodeSop2(0x1e, 37, 36, InlineU32(std::countr_zero(wave))),
+        EncodeVop2(0x25, 31, 37, 30), EncodeSop1(0x37, 50, 52)});
+    else code.insert(code.end(), {EncodeVopc(0xc3, 2, 5),
+                                 EncodeSop1(0x37, 52, 106)}); // Exclude N <= local key.
+    const auto empty = code.size();
+    code.push_back(0u);
+    code.push_back(EncodeSop1(0x04, 54, 126));
+    const auto loop = code.size();
+    code.push_back(EncodeSop1(0x14, 34, 54));
+    AppendVop3(&code, 0x360, 32, Vgpr(5), 34);
+    code.insert(code.end(), {EncodeVopc(0xc2, 32, 5), EncodeSop1(0x24, 58, 106)});
+    const auto skip = code.size();
+    code.push_back(0u);
+    code.insert(code.end(), {EncodeSop2(0x26, 33, 32, 255), 488u,
+        EncodeSmem0(0x0a, 12, 0), EncodeSmem1(216u, 33), EncodeSopp(0x0c, 0),
+        EncodeMubuf0(0x02, 0, true, false, true), EncodeMubuf1(6, 3, 30),
+        EncodeSopp(0x0c, 0), EncodeMubuf0(0x1f, 0, true, false),
+        EncodeMubuf1(6, 4, outer_loop ? 31u : 30u)});
+    code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+    code.insert(code.end(), {EncodeSop2(0x15, 54, 54, 106), EncodeSop1(0x04, 126, 58)});
+    code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+    code[empty] = EncodeSopp(0x08, code.size() - empty - 1u);
+    if (outer_loop) {
+      code.push_back(EncodeSop1(0x04, 126, 50));
+      AppendVMovLiteral(&code, 9, 0x13579bdfu);
+      code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 31),
+          EncodeVop2(0x1b, 10, InlineU32(4), 30), EncodeVopc(0xd2, InlineU32(0), 10),
+          EncodeSop2(0x00, 36, 36, InlineU32(1)), EncodeSopc(0x0a, 36, InlineU32(iterations))});
+      code.push_back(EncodeSopp(0x05, static_cast<int16_t>(outer - code.size() - 1u)));
+    }
+    code.push_back(EncodeSop1(0x04, 126, 20));
+    AppendVMovLiteral(&code, 9, 0x76543210u);
+    code.insert(code.end(), {EncodeMubuf0(0x1c, 12u, true, false), EncodeMubuf1(9, 4, 30)});
+    AppendEnd(&code);
+    test.decoded_counts = {{direct_gt ? "V_CMPX_GT_U32" : "V_CMP_LE_U32", 1u}};
+    if (outer_loop) test.decoded_counts.insert(test.decoded_counts.end(),
+        {{"V_CMPX_EQ_U32", 2u}, {"S_CBRANCH_SCC1", 2u}});
+    test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "Volatile"};
+    test.forbidden_spirv = {"load_indirect_buffer_", "indirect_buffer_format_geometry"};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    for (const auto &descriptor : compiled.resources.buffers) {
+      ShaderBufferResource resource{};
+      std::copy_n(descriptor.dwords.begin(), 4u, resource.fields);
+      test.storage_buffer_ranges.emplace_back(resource.Base48(), std::max(4u, u32(resource.GetSize())));
+    }
+    TestCase producer;
+    producer.name = "WaterfallRecordKeyProducer";
+    producer.initial = test.initial;
+    producer.has_compute_info = true;
+    producer.compute_info.wave_size = 32u;
+    producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+        producer.compute_info.threads_num[2] = 1u;
+    producer.compute_info.lds_size_dwords = 0;
+    test.expected = test.initial;
+    // Exclude key == N and the key that wraps to the unsupported descriptor at byte 480.
+    constexpr std::array keys{0u, 1u, 2u, 0x029f79b5u};
+    for (u32 lane = 0; lane < wave; ++lane) {
+      const u32 key = keys[lane % keys.size()];
+      AppendVMovLiteral(&producer.code, 1, key);
+      AppendVMovLiteral(&producer.code, 2, selectors + lane * 4u);
+      AppendBufferStoreDword(&producer.code, 1, 2);
+      test.expected[selectors / 4u + lane] = key;
+      if (upper_only && lane < 32u) continue;
+      if (outer_loop && (lane & 8u) != 0u) continue;
+      for (u32 iteration = 0; iteration < iterations; ++iteration) {
+        if (iteration != 0u && (lane & 4u) != 0u) continue;
+        const u32 out = slot * 3u / 4u + (iteration * wave + lane) * 4u;
+        if (key < 2u)
+          std::copy_n(test.initial.begin() + slot * (key + 1u) / 4u + lane * 3u, 3u,
+                      test.expected.begin() + out);
+        if (outer_loop) test.expected[out + 3u] = 0x13579bdfu;
+      }
+      test.expected[slot * 3u / 4u + lane * 4u + 3u] = 0x76543210u;
+    }
+    AppendEnd(&producer.code);
+    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(producer, producer_shader, buffer);
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "same-lane bound, narrowing loop, key == N, poison, EXEC restoration and canaries",
+                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+  }
+  std::printf("[compute] %-32s ok\n", "GuardedWaterfallBufferRecords");
+}
+
+void CheckGpuSelectedFormattedRecordStore(VulkanHarness &vulkan) {
+  constexpr u32 selectors = 128, table = 256, stride = 592, member = 448;
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  const u32 slot = (4096u + alignment - 1u) / alignment * alignment;
+  for (const bool wide : {false, true})
+  for (const u32 wave : {32u, 64u}) {
+    const std::array keys{wide ? 31u : 5u, 0u, 3u, 1u, 4u, 2u, 6u};
+    const auto selector_index = [wide](u32 group) { return wide ? group ^ 1u : group; };
+    TestCase test;
+    test.name = wide ? "GpuSelectedFormattedRgba16Store" : "GpuSelectedFormattedRecordStore";
+    test.initial.assign((slot * 7u + keys.size() * wave * 4u) / 4u, 0xdeadbeefu);
+    auto bytes = std::as_writable_bytes(std::span(test.initial));
+    if (wide) std::fill_n(test.initial.begin() + table / 4u, 32u * 4u, 0u);
+    for (u32 row = 0; row < 6u; ++row) {
+      if (wide && row != 0u && row != 3u) continue;
+      const std::array descriptor{slot * (row + 1u), (wide ? 8u : 1u) << 16u, 20u,
+          wide ? (u32(Prospero::BufferFormat::k16_16_16_16Float) << 12u) | DstSel(4, 5, 6, 7)
+               : (u32(Prospero::BufferFormat::k8SInt) << 12u) | DstSel(4, 0, 0, 0)};
+      std::copy(descriptor.begin(), descriptor.end(),
+                test.initial.begin() + (table + (wide ? row * 16u : row * stride + member)) / 4u);
+      for (u32 element = 0; element < 20u; ++element) {
+        if (wide) {
+          test.initial[slot * (row + 1u) / 4u + element * 2u] = 0x40003c00u;
+          test.initial[slot * (row + 1u) / 4u + element * 2u + 1u] = 0x38003400u;
+        } else bytes[slot * (row + 1u) + element] = std::byte(0x80u + row + element);
+      }
+    }
+    auto records = MakeStructuredStorageBufferData(stride, 6u);
+    records[0] = table;
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 32u);
+    if (wide) { test.user_data[32] = table - 48u; test.user_data[33] = 0u; }
+    auto selector_buffer = MakeStructuredStorageBufferData(0u, (keys.size() + u32(wide)) * 4u);
+    selector_buffer[0] = selectors;
+    std::copy_n(selector_buffer.begin(), 4, test.user_data.begin() + 4u);
+    auto output = MakeStructuredStorageBufferData(0u, keys.size() * wave * 4u);
+    output[0] = slot * 7u;
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48u);
+    test.has_user_data = test.has_compute_info = true;
+    test.bda_mappings = {{0u, 0u}};
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    test.dispatch_x = keys.size();
+    auto &code = test.code;
+    // Keep the finite32-key proof independent of workgroup-prefix materialization:
+    // this fixture changes GPU keys after compiling its complete candidate domain.
+    if (wide) code.push_back(EncodeSop2(0x12, 23, 44, InlineU32(1)));
+    code.push_back(EncodeSop2(0x1e, 23, wide ? 23u : 44u, InlineU32(2)));
+    if (wide) {
+      code.insert(code.end(), {EncodeSmem0(0x08, 22, 2), EncodeSmem1(0, 23),
+          EncodeSop2(0x27, 22, 22, 255), (5u << 16u) | 16u,
+          EncodeSop2(0x1e, 23, 22, InlineU32(4)),
+          EncodeSmem0(0x02, 8, 16), EncodeSmem1(48, 23)});
+    } else {
+      code.insert(code.end(), {EncodeVop1(0x01, 30, 23), EncodeMubuf0(0x0c),
+          EncodeMubuf1(4, 1, 30), EncodeVop2(0x16, 6, InlineU32(16), 4)});
+      AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+          EncodeSmem0(0x0a, 8, 16), EncodeSmem1(member, 23)});
+    }
+    code.insert(code.end(), {EncodeMubuf0(0x00, 0, true, false, true), EncodeMubuf1(4, 2, 0),
+        EncodeSop2(0x1e, 34, 44, InlineU32(std::countr_zero(wave))),
+        EncodeVop2(0x25, 30, 34, 0), EncodeVop2(0x1a, 30, InlineU32(2), 30)});
+    AppendBufferStoreDword(&code, 4, 30);
+    if (wide) {
+      // The existing direct RGBA16 fixture proves these rounded FP32-to-FP16 values.
+      for (const auto [vgpr, bits] : std::array<std::pair<u32, u32>, 4>{{
+          {10u, 0x3f807e63u}, {11u, 0xc0000000u}, {12u, 0x3f000000u}, {13u, 0x3e800000u}}})
+        AppendVMovLiteral(&code, vgpr, bits);
+    } else {
+      code.push_back(EncodeVop2(0x1a, 10, InlineU32(5), 0));
+      code.insert(code.end(), {EncodeVop2(0x25, 10, 255, 10), u32(-200)});
+    }
+    AppendSMovLiteral(&code, 126, 0x55555555u);
+    AppendSMovLiteral(&code, 127, wave == 64u ? 0x55555555u : 0u);
+    // Captured e01c6000/80010f01, adjusted only to v10:13/v0 and s8:11.
+    code.insert(code.end(), {EncodeMubuf0(wide ? 0x07 : 0x04, 0, true, false, true),
+                            EncodeMubuf1(10, 2, 0)});
+    AppendEnd(&code);
+    test.decoded_counts = {{"V_LSHLREV_B32", wide ? 1u : 2u},
+        {wide ? "BUFFER_STORE_FORMAT_XYZW" : "BUFFER_STORE_FORMAT_X", 1u}};
+    test.required_spirv = {"get_bda_pointer", "convert_indirect_buffer_format"};
+    if (!wide) test.required_spirv.push_back("StorageBufferArrayNonUniformIndexing");
+    test.forbidden_spirv = {"OpAtomicCompareExchange"};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (!wide) {
+      std::set<u32> nonuniform;
+      u32 shared_stores = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+          nonuniform.insert(words[1]);
+        if (opcode == spv::OpStore && nonuniform.contains(words[1])) ++shared_stores;
+        offset += words.size();
+      }
+      Require(test.name, "one shared store after the null candidate",
+              shared_stores == (wave > vulkan.SubgroupSize() ? 2u : 1u),
+              "homogeneous children duplicated the native store per descriptor");
+    }
+    u32 bda_loads = 0, native_stores = 0;
+    for (const auto *block : compiled.program.blocks)
+      for (const auto &inst : *block) {
+        using namespace ShaderRecompiler::IR;
+        if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 &&
+            inst.GetOpcode() != (wide ? ValueOpcode::StoreBufferU32x4 : ValueOpcode::StoreBufferU32)) continue;
+        const auto &memory = compiled.program.memory_info[inst.Flags<MemoryFlags>().index];
+        if (inst.GetOpcode() == ValueOpcode::LoadBufferU32)
+          bda_loads += memory.kind == ResourceKind::IndirectBuffer && memory.formatted;
+        else
+          native_stores += memory.kind == ResourceKind::Buffer && memory.formatted;
+      }
+    Require(test.name, "shared scalar descriptor reads", bda_loads == 1u && native_stores == 1u,
+            "native store planning replaced the BDA read or bypassed formatted conversion");
+    for (const auto &value : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4u, descriptor.fields);
+      auto range = std::max(4u, u32(descriptor.GetSize()));
+      if (wide && descriptor.Base48() == slot * 4u) range -= 11u; // Last active record is partial.
+      test.storage_buffer_ranges.emplace_back(descriptor.Base48(), range);
+    }
+    TestCase producer;
+    producer.name = "FormattedRecordSelectorProducer";
+    producer.initial = test.initial;
+    producer.has_compute_info = true;
+    producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+        producer.compute_info.threads_num[2] = 1u;
+    producer.compute_info.wave_size = 32u;
+    for (u32 group = 0; group < keys.size(); ++group) {
+      AppendVMovLiteral(&producer.code, 1, (keys[group] << 16u) | 0xbeefu);
+      AppendVMovLiteral(&producer.code, 2, selectors + selector_index(group) * 4u);
+      AppendBufferStoreDword(&producer.code, 1, 2);
+    }
+    AppendEnd(&producer.code);
+    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+    test.expected = test.initial;
+    auto expected_bytes = std::as_writable_bytes(std::span(test.expected));
+    for (u32 group = 0; group < keys.size(); ++group) {
+      const auto row = keys[group];
+      test.expected[selectors / 4u + selector_index(group)] = (row << 16u) | 0xbeefu;
+      for (u32 lane = 0; lane < wave; ++lane) {
+        const bool valid = wide ? row == 0u || row == 3u : row < 6u;
+        test.expected[slot * 7u / 4u + group * wave + lane] =
+            valid && lane < 20u ? (wide ? 0x3f800000u : u32(int32_t(0x80u + row + lane) - 256)) : 0u;
+        if (valid && lane < (wide && row == 3u ? 18u : 20u) && (lane & 1u) == 0u) {
+          if (wide) {
+            test.expected[slot * (row + 1u) / 4u + lane * 2u] = 0xc0003c04u;
+            test.expected[slot * (row + 1u) / 4u + lane * 2u + 1u] = 0x34003800u;
+          } else expected_bytes[slot * (row + 1u) + lane] =
+              std::byte(u32(std::clamp(int32_t(lane * 32u) - 200, -128, 127)) & 255u);
+        }
+      }
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(producer, producer_shader, buffer);
+    vulkan.Dispatch(test, compiled, buffer);
+    CompareWords(test, "shared BDA reads, formatted conversion, EXEC, OOB and neighboring canaries",
+                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
+
+void CheckFiniteBufferSelection(VulkanHarness &vulkan) {
+  for (const u32 wave : {32u, 64u}) {
+    TestCase test;
+    test.name = wave == 32 ? "FiniteBufferSelection32" : "FiniteBufferSelection64";
+    const u32 first_lane = wave == 32 ? 1u : 33u;
+    // Water Lighting's masked V_CNDMASK -> READFIRSTLANE -> S_LOAD_DWORDX4 -> store.
+    test.code = {EncodeSMovB32(126, InlineU32(wave == 32 ? 6u : 0u)),
+                 EncodeSMovB32(127, InlineU32(wave == 64 ? 6u : 0u)),
+                 EncodeMubuf0(0x0cu, 0, true, false), EncodeMubuf1(20, 2, 0),
+                 EncodeSopp(0x0cu, 0)};
+    AppendVMovU32(&test.code, 4, 0);
+    test.code.push_back(EncodeSopc(0x0au, 2, InlineU32(1)));
+    const auto skip = test.code.size();
+    test.code.push_back(0);
+    for (u32 key = 1; key < 5u; ++key) {
+      AppendVMovU32(&test.code, 22, key);
+      test.code.push_back(EncodeVopc(0xc2u, InlineU32(key), 20));
+      test.code.push_back(EncodeVop2(0x01u, 4, Vgpr(4), 22));
+    }
+    test.code[skip] = EncodeSopp(0x05u, static_cast<u32>(test.code.size() - skip - 1u));
+    test.code.insert(test.code.end(), {
+        EncodeVop1(0x02u, 3, Vgpr(4)), EncodeSop2(0x31u, 12, 3, InlineU32(32)),
+        EncodeSmem0(0x02u, 4), EncodeSmem1(0, 12), EncodeSopp(0x0cu, 0),
+        EncodeVop2(0x25u, 1, 0xffu, 0), 0x1000u,
+        EncodeMubuf0(0x1cu, 0, true, false, true), EncodeMubuf1(1, 1, 0)});
+    AppendEnd(&test.code);
+    constexpr u32 table = 256u, input = 512u, output = 1024u, slot = 512u;
+    test.initial.assign((output + 5u * slot) / 4u, 0xdeadbeefu);
+    test.has_user_data = true;
+    test.user_data[0] = table;
+    test.user_data[2] = 1u;
+    const std::array<u32, 4> input_descriptor{input, 4u << 16u, wave, 0x5204u};
+    std::copy(input_descriptor.begin(), input_descriptor.end(), test.user_data.begin() + 8u);
+    for (u32 key = 0; key < 5u; ++key) {
+      const std::array<u32, 4> descriptor{output + key * slot, 4u << 16u, wave, 0x5204u};
+      std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + table / 4u + 8u + key * 4u);
+    }
+    test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+    test.compute_info.lds_size_dwords = 0;
+    test.compute_info.thread_ids_num = 1;
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "finite destination count", compiled.resources.buffers.size() == 6u,
+            "selector lost a destination or retained a dynamic descriptor load");
+    for (const auto& descriptor : compiled.resources.buffers)
+      test.storage_buffer_ranges.emplace_back(descriptor.dwords[0], descriptor.dwords[2] * 4u);
+    for (u32 key = 0; key < 5u; ++key) {
+      for (u32 lane = 0; lane < wave; ++lane)
+        test.initial[input / 4u + lane] = lane == first_lane ? key : (key + 1u) % 5u;
+      test.expected = test.initial;
+      for (const auto lane : {first_lane, first_lane + 1u})
+        test.expected[(output + key * slot) / 4u + lane] = 0x1000u + lane;
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, "first active lane, masked writes and destination canaries", test.expected, actual);
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+}
+
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   using namespace ShaderRecompiler::IR;
   TestCase test;
@@ -33195,8 +40263,6 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   test.initial.assign(64, 0xdeadbeefu);
   test.storage_buffer_range_bytes = 64;
   test.storage_buffer_offsets = {12, 108};
-  test.required_spirv = {"OpSwitch"};
-  test.forbidden_spirv = {"PhysicalStorageBuffer"};
 
   CompiledShader compiled;
   auto &program = compiled.program;
@@ -33208,24 +40274,31 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
-  program.block_info.push_back({.id = 0});
 
   auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
   auto &selector = block->AppendNewInst(ValueOpcode::BitwiseAnd32,
                                       {Value(&lane), Value(7u)});
   auto &key = block->AppendNewInst(ValueOpcode::IAdd32,
                                  {Value(&selector), Value(8u)});
+  auto &selection = block->AppendNewInst(ValueOpcode::GetBufferResourceIndex, {Value(&key)});
+  selection.SetFlags<uint32_t>(0u);
   auto &handle = block->AppendNewInst(
       ValueOpcode::GetBufferResource,
-      {Value(&key), Value(0u), Value(0u), Value(0u)});
+      {Value(&selection), Value(0u), Value(0u), Value(0u)});
   handle.SetFlags<uint32_t>(0u);
-  auto &offset = block->AppendNewInst(ValueOpcode::IMul32,
-                                    {Value(&lane), Value(4u)});
+  auto &lane_offset = block->AppendNewInst(ValueOpcode::IMul32,
+                                         {Value(&lane), Value(4u)});
+  auto &overflow = block->AppendNewInst(ValueOpcode::IEqual32,
+                                       {Value(&lane), Value(6u)});
+  auto &offset = block->AppendNewInst(ValueOpcode::SelectU32,
+                                    {Value(&overflow), Value(UINT32_MAX), Value(&lane_offset)});
+  auto &index = block->AppendNewInst(ValueOpcode::SelectU32,
+                                   {Value(&overflow), Value(0x40000000u), Value(&lane)});
   auto &data = block->AppendNewInst(ValueOpcode::IAdd32,
                                   {Value(&lane), Value(0x1000u)});
   auto &exec = block->AppendNewInst(ValueOpcode::INotEqual32,
                                   {Value(&lane), Value(4u)});
-  block->AppendNewInst(ValueOpcode::StoreBufferU32,
+  auto &store = block->AppendNewInst(ValueOpcode::StoreBufferU32,
                       {Value(&handle), Value(0u), Value(&offset), Value(0u),
                        Value(&data), Value(&exec)});
   program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
@@ -33241,42 +40314,87 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
-  program.descriptor_sources[0].indirect_descriptor.emplace().table_stride = 16;
+  program.descriptor_sources[0].indirect_descriptor =
+      DescriptorSource::IndirectDescriptor{.table_stride = 16};
   ShaderComputeInputInfo compute;
   compute.wave_size = 32;
   compute.host_subgroup_size = vulkan.SubgroupSize();
   compute.threads_num[0] = 32;
   compute.threads_num[1] = compute.threads_num[2] = 1;
-  for (const u32 null_buffers : {0u, 1u, 2u}) {
+  enum class Layout { Shared, NullChild, AllNull, DifferentStride, ShiftedPushData, StorageData,
+                      Indexed, IndexedNullChild, IndexedSingle };
+  for (const auto layout : {Layout::Shared, Layout::NullChild, Layout::AllNull,
+                           Layout::DifferentStride, Layout::ShiftedPushData, Layout::StorageData,
+                           Layout::Indexed, Layout::IndexedNullChild, Layout::IndexedSingle}) {
+    const bool indexed = layout == Layout::Indexed || layout == Layout::IndexedNullChild ||
+                         layout == Layout::IndexedSingle;
+    const bool null_child = layout == Layout::NullChild || layout == Layout::IndexedNullChild;
+    const bool single = layout == Layout::AllNull || layout == Layout::IndexedSingle;
     program.info.buffers = {root, candidate};
-    if (null_buffers != 0u) program.info.buffers[1].packed_stride = 0;
-    if (null_buffers == 2u) {
+    if (indexed) {
+      for (auto &buffer : program.info.buffers) buffer.packed_stride = 4;
+    }
+    program.descriptor_sources[0].indirect_descriptor->indexed = indexed;
+    program.memory_info[0].idxen = indexed;
+    program.memory_info[0].offen = !indexed;
+    store.SetArg(1, indexed ? Value(&index) : Value(0u));
+    store.SetArg(2, indexed ? Value(0u) : Value(&offset));
+    if (null_child) program.info.buffers[1].packed_stride = 0;
+    if (layout == Layout::DifferentStride) program.info.buffers[1].packed_stride = 2;
+    if (single) {
       // Materialization deduplicates all null destinations into one unmapped root.
       program.info.buffers.resize(1);
-      program.info.buffers[0].packed_stride = 0;
+      if (layout == Layout::AllNull) program.info.buffers[0].packed_stride = 0;
       program.info.buffers[0].indirect_root = BufferResource::NoIndirectBuffer;
       program.info.buffers[0].indirect_search_iterations = 0;
       program.info.buffers[0].indirect_resources.clear();
     }
-    program.binding_layout_complete = false;
-    AllocateBindings(program);
-    const auto *buffers = FindBinding(program.bindings, DescriptorBindingKind::Buffers);
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    const auto push_start = layout == Layout::ShiftedPushData ? 3u :
+                            layout == Layout::StorageData ? PushData::NoStart : 0u;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute}, push_start);
     Require(test.name, "candidate bindings",
-            buffers != nullptr && buffers->resources ==
-                (null_buffers == 2u ? std::vector<u32>{0u} : std::vector<u32>{0u, 1u}),
+            program.bindings.descriptor_counts[0] == (single ? 1u : 2u) &&
+                program.info.buffers[0].descriptor_index == 0u &&
+                (single || program.info.buffers[1].descriptor_index == 1u),
             "indirect store lost a buffer binding");
     compiled.packed_user_data.resize(program.bindings.ShaderDataDwords());
     compiled.packed_user_data[program.bindings.memory_offset_dword] = 12u | (108u << 8u);
-    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
     ValidateSpirv(test.name, compiled.spirv);
-    if (null_buffers == 2u) {
-      test.required_spirv.clear();
+    test.required_spirv.clear();
+    test.forbidden_spirv = {"PhysicalStorageBuffer"};
+    if (!single && !null_child && layout != Layout::DifferentStride) {
+      test.required_spirv = {"StorageBufferArrayNonUniformIndexing"};
       test.forbidden_spirv.push_back("OpSwitch");
+      std::set<u32> nonuniform;
+      std::vector<u32> accessed_pointers;
+      u32 prefix_extracts = 0;
+      for (size_t offset = 5; offset < compiled.spirv.size();) {
+        const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+          nonuniform.insert(words[1]);
+        if (opcode == spv::OpArrayLength) accessed_pointers.push_back(words[3]);
+        if (opcode == spv::OpStore) accessed_pointers.push_back(words[1]);
+        if (opcode == spv::OpBitFieldUExtract) ++prefix_extracts;
+        offset += words.size();
+      }
+      Require(test.name, "shared store and nonuniform pointers",
+              prefix_extracts == 1u && accessed_pointers.size() == 2u &&
+                  std::ranges::all_of(accessed_pointers, [&](u32 pointer) {
+                    return nonuniform.contains(pointer);
+                  }),
+              "indirect store retained static prefixes, was duplicated or lost a NonUniform pointer decoration");
+    } else if (single) {
+      test.forbidden_spirv.push_back("OpSwitch");
+    } else {
+      test.required_spirv = {"OpSwitch"};
     }
-    CheckSpirvText(test, compiled.spirv);
+    CheckSpirvEmission(test, compiled.spirv);
 
     for (const bool swapped : {false, true}) {
-      if (null_buffers != 0u && swapped) continue;
+      if (layout != Layout::Shared && layout != Layout::IndexedNullChild && swapped) continue;
       // Repeated keys select two distinct logical buffers within one native allocation.
       // Keys below, between and above the live keys must not select either buffer.
       compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
@@ -33284,9 +40402,15 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
                                          12u, swapped ? 1u : 0u,
                                          14u, swapped ? 0u : 1u};
       test.expected = test.initial;
-      for (const u32 lane : {2u, 6u, 10u, 12u, 14u}) {
+      for (u32 lane = 0; lane < 16u; ++lane) {
+        if (lane == 4u || lane == 6u) continue;
+        if (layout == Layout::IndexedSingle) {
+          test.expected[test.storage_buffer_offsets[0] / 4u + lane] = 0x1000u + lane;
+          continue;
+        }
+        if (lane != 2u && lane != 10u && lane != 12u && lane != 14u) continue;
         const u32 resource = (lane & 7u) == 4u ? swapped : !swapped;
-        if (null_buffers == 2u || (null_buffers == 1u && resource == 1u)) continue;
+        if (layout == Layout::AllNull || (null_child && resource == 1u)) continue;
         test.expected[test.storage_buffer_offsets[resource] / 4u + lane] = 0x1000u + lane;
       }
       auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
@@ -33299,7 +40423,1002 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void CheckIndirectImageKeySwitch() {
+void CheckFiniteFirstLaneImageChoice(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 table = 512u, stride = 440u, poison = 0xdeadbeefu;
+  for (const u32 wave : {32u, 64u})
+  for (const u32 count : {0u, 4u}) {
+    TestCase test;
+    test.name = "FiniteFirstLaneImageChoice";
+    test.initial.assign((table + 4u * stride) / 4u, poison);
+    for (u32 row = 0; row < 4u; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = 10u + row;
+      image[3] = DstSel(4, 0, 0, 1) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8, test.initial.begin() + (table + row * stride) / 4u);
+    }
+    auto records = MakeStructuredStorageBufferData(stride, count);
+    records[0] = table;
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 56);
+    const auto output = MakeStructuredStorageBufferData(0, wave * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = wave;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+    test.compute_info.thread_ids_num = 1;
+    auto &code = test.code;
+    code.push_back(EncodeSop1(0x04, 40, 126));
+    code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0));
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVop1(0x01, 20u + word, InlineU32(0)));
+    // Masked vector descriptor writes become synchronized Select/Phi chains.
+    for (u32 row = 0; row < 4u; ++row) {
+      code.push_back(EncodeVopc(0xd2, InlineU32(row), 1));
+      const auto skip = code.size();
+      code.push_back(0u);
+      code.insert(code.end(), {EncodeSmem0(0x0b, 8, 28), EncodeSmem1(row * stride, 125)});
+      for (u32 word = 0; word < 8u; ++word)
+        code.push_back(EncodeVop1(0x01, 20u + word, 8u + word));
+      code[skip] = EncodeSopp(0x08, code.size() - skip - 1u);
+      code.push_back(EncodeSop1(0x04, 126, 40));
+    }
+    AppendVMovLiteral(&code, 5, poison);
+    AppendVMovLiteral(&code, 10, 0x3f000000u);
+    AppendVMovLiteral(&code, 11, 0x3f000000u);
+    code.push_back(EncodeVop2(0x1b, 2, InlineU32(31), 0));
+    code.push_back(EncodeVopc(0xd5, InlineU32(0), 2));
+    const auto loop = code.size();
+    // Same native waterfall as 7ceb0f3417f926f9, including narrowing EXEC.
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVop1(0x02, 32u + word, Vgpr(20u + word)));
+    code.push_back(EncodeSop1(0x04, 44, 126));
+    for (u32 word = 0; word < 8u; ++word)
+      code.push_back(EncodeVopc(0xd2, 32u + word, 20u + word));
+    code.insert(code.end(), {EncodeMimg0(0x27, 1), EncodeMimg1(5, 10, 8, 13),
+                            EncodeSop2(0x15, 126, 44, 126)});
+    code.push_back(EncodeSopp(0x09, loop - code.size() - 1u));
+    code.push_back(EncodeSop1(0x04, 126, 40));
+    code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+    AppendBufferStoreDword(&code, 5, 30);
+    AppendEnd(&code);
+    test.opcodes = {O::S_MOV_B64, O::V_AND_B32, O::V_MOV_B32,
+        O::V_CMPX_EQ_U32, O::V_CMPX_NE_U32, O::S_CBRANCH_EXECZ,
+        O::S_BUFFER_LOAD_DWORDX8, O::V_READFIRSTLANE_B32, O::IMAGE_SAMPLE,
+        O::S_ANDN2_B64, O::S_CBRANCH_EXECNZ, O::V_LSHLREV_B32,
+        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "finite correlated image choices", compiled.resources.images.size() <= 5u,
+            "descriptor words formed an uncorrelated product");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(float(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    const auto sampler = vulkan.CreateSampler(test.name, 1);
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    test.expected = test.initial;
+    for (u32 lane = 0; lane < wave; ++lane)
+      if ((lane & 31u) != 0u)
+        test.expected[lane] = count == 0u ? 0u : std::bit_cast<u32>(float(10u + (lane & 3u)));
+    CompareWords(test, "first active lane, descriptor correlation and inactive canaries", test.expected,
+                 vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u count=%u ok\n", test.name, wave, count);
+  }
+}
+
+void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
+  TestCase test;
+  test.name = "FiniteInlineSamplerPhi";
+  auto &code = test.code;
+  code.insert(code.end(), {EncodeSop1(0x04, 36, InlineU32(0)),
+      EncodeSop1(0x04, 38, InlineU32(0)), EncodeSop1(0x04, 24, 126),
+      EncodeVop1(0x01, 10, 16), EncodeVopc(0xd5, InlineU32(0), 10)});
+  const auto skip_sampler = code.size();
+  code.push_back(EncodeSopp(0x08));
+  // Actual correlated inline sampler words from 905b2e2c: zero or {0,fff000,a500000,0}.
+  code.insert(code.end(), {EncodeSop2(0x24, 37, InlineU32(12), InlineU32(12)),
+      EncodeSop1(0x04, 38, 255), 0x0a500000u});
+  code[skip_sampler] = EncodeSopp(0x08, code.size() - skip_sampler - 1u);
+  code.push_back(EncodeSop1(0x04, 126, 24));
+  AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+  AppendVMovLiteral(&code, 1, 0x12345678u);
+  AppendVMovLiteral(&code, 2, 0x87654321u);
+  code.insert(code.end(), {EncodeVopc(0xd4, InlineU32(2), 10),
+      EncodeMimg0(0x27, 1), EncodeMimg1(1, 20, 0, 9),
+      EncodeMimg0(0x27, 1), EncodeMimg1(2, 20, 2, 9),
+      EncodeSop1(0x04, 126, 24), EncodeVop1(0x01, 30, 16),
+      EncodeVop2(0x1a, 31, InlineU32(3), 30),
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 12, 31),
+      EncodeMubuf0(0x1c, 4), EncodeMubuf1(2, 12, 31)});
+  AppendEnd(&code);
+  test.initial.assign(7, 0xa5a5a5a5u);
+  test.expected = {std::bit_cast<u32>(4.0f), 0xfffffff9u,
+      std::bit_cast<u32>(2.0f), 0xfffffff9u, 0x12345678u, 0x87654321u, 0xa5a5a5a5u};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[3] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  const auto signed_image = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  std::copy_n(signed_image.begin(), 8, test.user_data.begin() + 8);
+  test.user_data[11] |= static_cast<u32>(Prospero::ImageType::kColor2D) << 28u;
+  test.user_data[50] = test.initial.size() * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.has_user_data = true;
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 16;
+  test.has_compute_info = true;
+  test.dispatch_x = 3;
+  test.opcodes = {ShaderOpcode::S_MOV_B64, ShaderOpcode::S_BFM_B32,
+      ShaderOpcode::S_CBRANCH_EXECZ, ShaderOpcode::V_MOV_B32, ShaderOpcode::V_CMPX_NE_U32,
+      ShaderOpcode::V_CMPX_GT_U32, ShaderOpcode::V_LSHLREV_B32,
+      ShaderOpcode::IMAGE_SAMPLE, ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.required_spirv = {"OpPhi", "NonUniform", "OpImageSampleExplicitLod"};
+  auto compiled = CompileCase(test, vulkan.SubgroupSize());
+  std::set<u32> nonuniform_ids;
+  std::vector<std::pair<u32, u32>> sampled_ids;
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpDecorate &&
+        words[2] == spv::DecorationNonUniform) nonuniform_ids.insert(words[1]);
+    if (static_cast<spv::Op>(words[0] & 0xffffu) == spv::OpSampledImage)
+      sampled_ids.emplace_back(words[2], words[4]);
+    offset += words.size();
+  }
+  Require(test.name, "dynamic sampler decorations", sampled_ids.size() >= 2 &&
+              std::ranges::all_of(sampled_ids, [&](const auto &ids) {
+                return nonuniform_ids.contains(ids.first) && nonuniform_ids.contains(ids.second);
+              }),
+          "fetched sampler or sampled image lost its NonUniform decoration");
+  const auto &samplers = compiled.program.info.samplers;
+  u32 roots = 0;
+  for (const auto &root : samplers) {
+    if (root.indirect_resources.empty()) continue;
+    ++roots;
+    Require(test.name, "correlated sampler candidates", root.indirect_resources.size() == 2,
+            "finite sampler was folded or lost a correlated branch state");
+    for (const auto child : root.indirect_resources)
+      Require(test.name, "sampler class remapping", child < samplers.size() &&
+                  samplers[child].force_point_filtering == root.force_point_filtering &&
+                  samplers[child].integer_border == root.integer_border,
+              "a finite candidate retained another image class's sampler");
+  }
+  Require(test.name, "finite sampler class variants", roots == 2 && samplers.size() == 4 &&
+              compiled.resources.samplers.size() == 2,
+          "the two-state sampler did not retain both float and signed image classes");
+  constexpr std::array<u32, 4> zero_sampler{};
+  constexpr std::array<u32, 4> linear_sampler{0, 0x00fff000u, 0x0a500000u, 0};
+  Require(test.name, "inline sampler states",
+          std::ranges::all_of(compiled.resources.samplers, [&](const auto &value) {
+            return std::equal(zero_sampler.begin(), zero_sampler.end(), value.dwords.begin()) ||
+                std::equal(linear_sampler.begin(), linear_sampler.end(), value.dwords.begin());
+          }) && compiled.resources.samplers[0] != compiled.resources.samplers[1],
+          "descriptor words were mixed between the two native sampler states");
+  auto pixels = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4; ++y)
+    for (u32 x = 2; x < 4; ++x) SetRgbaPixel(&pixels, 4, x, y, std::bit_cast<u32>(4.0f), 0, 0, 0);
+  std::array<VulkanHarness::Image, 2> images{
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {pixels}, 4, vk::ImageLayout::eShaderReadOnlyOptimal,
+          vk::ImageType::e2D, vk::ImageViewType::e2D, 1),
+      vulkan.CreateImageMips(test.name, 4, 4, vk::Format::eR32Sint,
+          vk::ImageUsageFlagBits::eSampled, {std::vector<u32>(16, 0xfffffff9u)}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1)};
+  std::vector<vk::Sampler> native_samplers;
+  for (const auto &resource : samplers) {
+    ShaderSamplerResource descriptor{};
+    std::copy_n(compiled.resources.samplers[resource.snapshot_index].dwords.begin(), 4, descriptor.fields);
+    const auto filter = !resource.force_point_filtering && descriptor.XyMagFilter() == 1
+        ? vk::Filter::eLinear : vk::Filter::eNearest;
+    native_samplers.push_back(vulkan.CreateSampler(test.name, 1, filter));
+  }
+  auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+  vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, nullptr, images, native_samplers);
+  CompareWords(test, "point, linear, remapped signed sampler and inactive output", test.expected,
+      vulkan.ReadBuffer(test.name, output, test.expected.size()));
+  vulkan.DestroyBuffer(&output);
+  for (const auto sampler : native_samplers) vulkan.Device().destroySampler(sampler);
+  for (auto &image : images) vulkan.DestroyImage(&image);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
+void CheckCountedRowImageSelector(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  using F = Prospero::BufferFormat;
+  constexpr u32 poison = 0x345d1746u;
+  const auto alignment = static_cast<u32>(vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                                             .limits.minStorageBufferOffsetAlignment);
+  for (const bool masked : {false, true})
+  for (const u32 wave : {32u, 64u}) {
+    const auto output_words = masked ? 48u * wave : 64u;
+    const auto slot = (output_words * 4u + alignment - 1u) / alignment * alignment;
+    const u32 srt = slot, counts = slot * 2u, keys = slot * 3u, material = slot * 4u;
+    const auto tile_list = slot * 5u;
+    TestCase test;
+    test.name = masked ? (wave == 32u ? "MaskedRowImageSelector32" : "MaskedRowImageSelector64")
+                       : (wave == 32u ? "CountedRowImageSelector32" : "CountedRowImageSelector64");
+    test.initial.resize((masked ? tile_list + 12u : material + 396u * 4u) / 4u, 0u);
+    std::fill_n(test.initial.begin(), output_words, 0xdeadbeefu);
+    const std::array<u32, 12> descriptors{counts, 4u << 16u, 3u, 0x14004u,
+        keys, 4u << 16u, 48u, 0x14004u, material, 396u << 16u, 4u, 0x14004u};
+    std::copy(descriptors.begin(), descriptors.end(), test.initial.begin() + srt / 4u);
+    test.initial[counts / 4u] = 3u;
+    test.initial[counts / 4u + 2u] = 1u;
+    std::fill_n(test.initial.begin() + keys / 4u, 48u, poison);
+    test.initial[keys / 4u] = 2u;
+    test.initial[keys / 4u + 1u] = 0x80000001u;
+    test.initial[keys / 4u + 2u] = 0x1890cedeu; // Dynamic +184 wraps to material byte32.
+    test.initial[keys / 4u + 32u] = 3u;
+    const auto put_image = [&](u32 offset, u32 identity, F format) {
+      auto at = test.initial.begin() + (material + offset) / 4u;
+      at[0] = identity;
+      at[1] = static_cast<u32>(format) << 20u;
+      at[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    };
+    for (u32 key = 0; key < 4u; ++key)
+      put_image(key * 396u + 184u, 0x100u + key, F::k32_32_32_32Float);
+    put_image(32u, 0x104u, F::k32_32_32_32Float);
+    put_image(256u, 0x200u, F::k8SScaled);
+    if (masked) {
+      // The scalar tile list reverses workgroups; row selection must remain on the GPU.
+      test.initial[tile_list / 4u] = 2u;
+      test.initial[tile_list / 4u + 1u] = 1u;
+      test.user_data[52] = tile_list;
+      test.user_data[53] = 4u << 16u;
+      test.user_data[54] = 3u;
+      test.user_data[55] = 0x14004u;
+    }
+    test.expected = test.initial;
+    for (const auto [index, bits] : std::array<std::pair<u32, u32>, 4>{{
+             {0u, 0x3f800002u}, {1u, 0x3f800001u}, {2u, 0x3f800004u}, {32u, 0x3f800003u}}}) {
+      if (masked) {
+        for (u32 lane = 1u; lane < wave; lane += 2u)
+          test.expected[index * wave + lane] = bits;
+      } else test.expected[index] = bits;
+    }
+    test.user_data[0] = srt;
+    test.user_data[50] = output_words * 4u;
+    test.user_data[51] = 3u << 28u;
+    test.has_user_data = true;
+    test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = masked ? wave : 1u;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = masked ? 1 : 0;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    test.dispatch_x = 3u;
+    auto &code = test.code;
+    code.insert(code.end(), {EncodeSmem0(0x03, 8), EncodeSmem1(0, 125),
+                            EncodeSmem0(0x02, 16), EncodeSmem1(32, 125)});
+    code.push_back(EncodeSop2(0x1e, 22, 44, InlineU32(2)));
+    if (masked) {
+      code.push_back(EncodeVop1(0x01, 2, Vgpr(0))); // Preserve the lane for disjoint output addresses.
+      code.insert(code.end(), {EncodeSmem0(0x08, 23, 26), EncodeSmem1(0, 22)});
+      code.push_back(EncodeVop1(0x01, 18, 23));
+      code.push_back(EncodeVop1(0x02, 22, Vgpr(18)));
+      code.push_back(EncodeSop2(0x1e, 22, 22, InlineU32(2)));
+    }
+    code.insert(code.end(), {EncodeSmem0(0x08, 21, 4), EncodeSmem1(0, 22)});
+    AppendSMovLiteral(&code, 20, 0u);
+    AppendVMovU32(&code, 0, 0x3f000000u);
+    AppendVMovU32(&code, 1, 0x3f000000u);
+    const auto masked_exit_branch = masked ? code.size() + 2u : 0u;
+    if (masked) {
+      code.push_back(EncodeVop2(0x1b, 6, InlineU32(1), 2));
+      code.push_back(EncodeVopc(0xd5, InlineU32(0), 6));
+      code.push_back(0u); // Skip the loop when the new EXEC is empty.
+    }
+    const auto header = code.size();
+    code.push_back(EncodeSopc(0x0a, 20, 21));
+    const auto exit_branch = code.size();
+    code.push_back(0u);
+    if (masked) {
+      code.insert(code.end(), {EncodeVop3Word0(0x346, 3),
+                              EncodeVop3Word1(Vgpr(18), InlineU32(4), 20)});
+      code.push_back(EncodeVop1(0x02, 22, Vgpr(3)));
+    } else {
+      code.push_back(EncodeSop2(0x1e, 22, 44, InlineU32(4)));
+      code.push_back(EncodeSop2(0x02, 22, 22, 20));
+    }
+    code.push_back(EncodeSop2(0x1e, 22, 22, InlineU32(2)));
+    code.insert(code.end(), {EncodeSmem0(0x08, 23, 6), EncodeSmem1(0, 22)});
+    code.push_back(EncodeSop2(0x26, 24, 23, 255)); code.push_back(396u);
+    code.push_back(EncodeSop2(0x02, 24, 24, 255)); code.push_back(184u);
+    code.insert(code.end(), {EncodeSmem0(0x0b, 32, 8), EncodeSmem1(0, 24),
+                            EncodeMimg0(0x27, 1), EncodeMimg1(4, 0, 8, 10)});
+    if (masked) {
+      code.push_back(EncodeVop2(0x1a, 5, InlineU32(2), 2));
+      code.insert(code.end(), {EncodeVop3Word0(0x346, 30),
+          EncodeVop3Word1(22, InlineU32(std::countr_zero(wave)), Vgpr(5))});
+    } else code.push_back(EncodeVop1(0x01, 30, 22));
+    AppendBufferStoreDword(&code, 4, 30);
+    code.push_back(EncodeSop2(0x02, 20, 20, InlineU32(1)));
+    code.push_back(EncodeSopp(0x02, header - code.size() - 1u));
+    code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+    if (masked) code[masked_exit_branch] = EncodeSopp(0x08, code.size() - masked_exit_branch - 1u);
+    AppendEnd(&code);
+    test.opcodes = {O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORD,
+        O::S_BUFFER_LOAD_DWORDX8, O::S_MOV_B32, O::S_LSHL_B32, O::S_ADD_I32,
+        O::S_MUL_I32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0, O::S_BRANCH,
+        O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    if (masked) test.opcodes.insert(test.opcodes.end(), {O::V_READFIRSTLANE_B32,
+        O::V_LSHL_ADD_U32, O::V_LSHLREV_B32, O::V_AND_B32, O::V_CMPX_NE_U32, O::S_CBRANCH_EXECZ});
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "exact active images", compiled.resources.images.size() == 4u &&
+                std::ranges::all_of(compiled.resources.images, [](const auto &image) {
+                  return image.dwords[0] >= 0x101u && image.dwords[0] <= 0x104u;
+                }), "unused row entries selected malformed material fields");
+    for (u32 word = 0; word < 4u; ++word)
+      Require(test.name, "count descriptor capture",
+              std::ranges::any_of(compiled.resources.specialization_reads, [&](const auto &read) {
+                return read.first <= srt + word * 4u &&
+                    read.first + read.second >= srt + (word + 1u) * 4u;
+              }), "count V# loaded from SRT escaped writable-alias capture");
+    for (const auto &buffer : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(buffer.dwords.begin(), 4u, descriptor.fields);
+      test.storage_buffer_ranges.emplace_back(static_cast<u32>(descriptor.Base48()),
+                                              static_cast<u32>(descriptor.GetSize()));
+    }
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &image : compiled.resources.images)
+      images.push_back(vulkan.CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {{0x3f800000u + image.dwords[0] - 0x100u, 0u, 0u, 0u}},
+          4u, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D, vk::ImageViewType::e2D, 1));
+    auto sampler = vulkan.CreateSampler(test.name, 1);
+    auto output = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, output, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    CompareWords(test, "active row images, wrapped keys and untouched unused slots", test.expected,
+                 vulkan.ReadBuffer(test.name, output, test.expected.size()));
+    vulkan.DestroyBuffer(&output);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+}
+
+void CheckPointerImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 base = 256u, table_offset = 24364u;
+  for (const u32 variant : {0u, 1u, 2u, 3u, 4u})
+  for (const u32 wave : {32u, 64u}) {
+    const bool packed = variant == 2u, post_tested = variant >= 3u;
+    const u32 count = post_tested ? (variant == 3u ? 1u : 6u) : variant * 2u;
+    TestCase test;
+    test.name = post_tested ? "PostTestedPointerImageTable"
+                           : packed ? "PackedPointerImageTable" : "CountedPointerImageTable";
+    test.dispatch_x = packed ? 4u : 1u;
+    test.bda_mappings = {{0u, 0u}};
+    test.initial.resize((base + table_offset + 32u * 32u) / 4u);
+    std::fill_n(test.initial.begin(), test.dispatch_x, 0xdeadbeefu);
+    test.initial[(base + 492u) / 4u] = count;
+    for (u32 row = 0; row < 32u; ++row) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = row + 1u;
+      image[3] = DstSel(4, 0, 0, 1) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8,
+          test.initial.begin() + (base + table_offset + row * 32u) / 4u);
+    }
+    test.initial[(base + 2756u) / 4u] = 1u;
+    test.initial[(base + 2756u + 48u) / 4u] = 31u;
+    constexpr std::array fields{31u, 0u, 7u, 1u};
+    for (u32 row = 0; row < fields.size(); ++row)
+      test.initial[(base + 5008u + row * 60u) / 4u] = 0xffe00abcu | (fields[row] << 12u);
+    test.user_data[0] = base;
+    const auto output = MakeStructuredStorageBufferData(0u, test.dispatch_x * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+        test.compute_info.threads_num[2] = 1u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    auto &code = test.code;
+    AppendVMovLiteral(&code, 0, 0u);
+    AppendVMovLiteral(&code, 20, post_tested ? 0u : 0x3f000000u);
+    AppendVMovLiteral(&code, 21, post_tested ? 0u : 0x3f000000u);
+    size_t loop = 0, exit = 0, skip = 0;
+    if (post_tested) {
+      // Captured 5f3fdf61a7ca4a20: load row before incrementing and testing next < 6.
+      code.push_back(EncodeSMovB32(20, InlineU32(0)));
+      loop = code.size();
+      code.push_back(EncodeSop2(0x1e, 23, 20, InlineU32(5)));
+    } else if (packed) {
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 44, InlineU32(60)),
+          EncodeSop2(0x02, 23, 23, 255), 5008u,
+          EncodeSmem0(0x00, 24), EncodeSmem1(0, 23),
+          EncodeSop2(0x20, 24, 24, InlineU32(12)),
+          EncodeSop2(0x1e, 23, 24, InlineU32(5)),
+          EncodeSop2(0x0e, 23, 23, 255), 992u});
+    } else {
+      code.insert(code.end(), {EncodeSmem0(0x00, 21), EncodeSmem1(492, 125),
+                              EncodeSMovB32(20, InlineU32(0))});
+      loop = code.size();
+      code.push_back(EncodeSopc(0x0a, 20, 21));
+      exit = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 20, InlineU32(48)),
+          EncodeSop2(0x02, 23, 23, 255), 2756u,
+          EncodeSmem0(0x00, 24), EncodeSmem1(0, 23),
+          EncodeSopc(0x03, 24, InlineU32(0))});
+      skip = code.size(); code.push_back(0u);
+      code.push_back(EncodeSop2(0x1e, 23, 24, InlineU32(5)));
+    }
+    code.insert(code.end(), {EncodeSop2(0x02, 23, 23, 255), table_offset,
+        EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+        EncodeMimg0(post_tested ? 0x00 : 0x27, 1), EncodeMimg1(4, 20, 2, 10),
+        EncodeVop2(0x03, 0, Vgpr(4), 0)});
+    if (post_tested) {
+      code.insert(code.end(), {EncodeSop2(0x02, 20, 20, InlineU32(1)),
+                              EncodeSopc(0x04, 20, InlineU32(count))});
+      code.push_back(EncodeSopp(0x05, loop - code.size() - 1u));
+    } else if (!packed) {
+      code[skip] = EncodeSopp(0x04, code.size() - skip - 1u);
+      code.push_back(EncodeSop2(0x02, 20, 20, InlineU32(1)));
+      code.push_back(EncodeSopp(0x02, loop - code.size() - 1u));
+      code[exit] = EncodeSopp(0x04, code.size() - exit - 1u);
+    }
+    code.push_back(EncodeSop2(0x1e, 25, 44, InlineU32(2)));
+    code.push_back(EncodeVop1(0x01, 30, 25));
+    AppendBufferStoreDword(&code, 0, 30);
+    AppendEnd(&code);
+    test.opcodes = {O::S_ADD_I32, O::S_LSHL_B32,
+        O::S_LOAD_DWORDX8, post_tested ? O::IMAGE_LOAD : O::IMAGE_SAMPLE, O::V_ADD_F32, O::V_MOV_B32,
+        O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+    if (!post_tested) test.opcodes.insert(test.opcodes.end(), {O::S_LOAD_DWORD, O::S_MUL_I32});
+    if (post_tested) test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_CMP_LT_I32,
+                                                           O::S_CBRANCH_SCC1});
+    else if (packed) test.opcodes.insert(test.opcodes.end(), {O::S_LSHR_B32, O::S_AND_B32});
+    else test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B32, O::S_CMP_LT_U32,
+        O::S_CMP_GE_I32, O::S_CBRANCH_SCC0, O::S_BRANCH});
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    Require(test.name, "bounded image candidates",
+            packed ? compiled.resources.images.size() == 32u
+                   : compiled.resources.images.size() == std::max(count, 1u),
+            "descriptor planning escaped its selector domain");
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {std::bit_cast<u32>(static_cast<float>(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    auto sampler = post_tested ? vk::Sampler{} : vulkan.CreateSampler(test.name, 1);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    std::vector<u32> expected(test.dispatch_x, std::bit_cast<u32>(post_tested ? float(count * (count + 1u) / 2u) : count == 0u ? 0.0f : 34.0f));
+    if (packed) for (u32 row = 0; row < fields.size(); ++row)
+      expected[row] = std::bit_cast<u32>(static_cast<float>(fields[row] + 1u));
+    CompareWords(test, "bounded pointer selectors and packed fields", expected,
+                 vulkan.ReadBuffer(test.name, buffer, expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    if (sampler) vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u count=%u ok\n", test.name, wave, count);
+  }
+}
+
+void CheckNestedPointerImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 list_address = 160;
+  constexpr std::array small_keys{5u, 0u, 3u, 1u, 4u, 2u};
+  constexpr std::array large_keys{58u, 0u, 33u, 31u, 34u, 32u, 59u, 65535u};
+  constexpr std::array list{2u, 1u, 4u, 0u, 5u, 3u};
+  for (const auto [member_mode, counted] : {std::pair{0u, false}, std::pair{0x98u, false},
+       std::pair{0x16cu, false}, std::pair{64u, false}, std::pair{64u, true},
+       std::pair{UINT32_MAX, false}})
+  for (const auto [wave, upper_only] : {std::pair{32u, false}, std::pair{64u, false},
+                                      std::pair{64u, true}}) {
+    const bool large_samplers = member_mode == UINT32_MAX;
+    const u32 member = large_samplers ? 0u : member_mode;
+    const bool child_table = member == 64u, compact = member != 0u && !child_table;
+    const bool waterfall = child_table || large_samplers;
+    const std::span<const u32> keys = large_samplers ? std::span<const u32>(large_keys)
+                                                   : std::span<const u32>(small_keys);
+    constexpr u32 objects = 4096u;
+    if (upper_only && !waterfall) continue;
+    const u32 keys_address = child_table ? 1024u : large_samplers ? 512u : 128u;
+    const u32 table = waterfall ? 2048u : 256u;
+    const u32 rows = large_samplers ? 59u : child_table ? 4u : keys.size(), children = child_table ? 3u : 1u;
+    const u32 records_count = counted ? 2u : rows, count_address = 768u;
+    const u32 stride = large_samplers ? 32u : child_table ? 136u : compact ? 0x330u : 592u;
+    const u32 object_stride = large_samplers ? 16u : child_table ? 1536u : 0x430u;
+    const u32 table_bytes = (rows - 1u) * stride + member + 16u;
+    const u32 lanes = waterfall ? wave : keys.size();
+    const u32 outputs = child_table ? wave * 2u : lanes;
+    TestCase test;
+    test.name = large_samplers ? (upper_only ? "LargeIndirectSamplerWaterfallUpper64" : "LargeIndirectSamplerWaterfall")
+              : counted ? (upper_only ? "CountedPointerChildTableUpper64" : "CountedPointerChildTable")
+              : child_table ? (upper_only ? "IndexedPointerChildTableUpper64" : "IndexedPointerChildTable")
+              : member == 0x16cu ? "CompactPairedImageSamplerTable"
+              : compact ? "CompactRecordImageSamplerTable" : "NestedPointerImageSamplerTable";
+    test.initial.resize((compact ? table + table_bytes : objects + rows * object_stride) / 4u,
+                        (compact || child_table) ? 0xdeadbeefu : 0u);
+    std::fill_n(test.initial.begin(), outputs, 0xdeadbeefu);
+    std::fill_n(test.initial.begin() + keys_address / 4u, child_table ? wave * 2u : lanes, UINT32_MAX);
+    if (compact) std::copy(list.begin(), list.end(), test.initial.begin() + list_address / 4u);
+    for (u32 row = 0; row < records_count; ++row) {
+      const u32 object = compact || large_samplers ? table + row * stride : objects + row * object_stride;
+      if (!compact && !large_samplers) {
+        test.initial[(table + row * stride) / 4u] = object;
+        // The actual vector path sign-extends WORD0 and discards the packed upper bits.
+        test.initial[(table + row * stride) / 4u + 1u] = child_table ? 0xbeef0000u : 0u;
+      }
+      for (u32 child = 0; child < children; ++child) {
+        auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+        image[0] = 10u + row * children + child;
+        image[1] |= 1u << 30u; // Two texels: zero, then the selected child's value.
+        image[3] = DstSel(4, 0, 0, 1) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+        std::copy_n(image.begin(), compact ? 4u : 8u,
+                    test.initial.begin() + (object + (child_table ? child * 368u + member
+                                                             : large_samplers ? 0u : compact ? member : 0x3d0u)) / 4u);
+      }
+      const std::array sampler{large_samplers ? row : 0u, 0x00fff000u,
+                              (row & 1u) ? 0x0a500000u : 0u, 0u};
+      std::copy(sampler.begin(), sampler.end(), test.initial.begin() +
+          (large_samplers ? objects + row * 16u : child_table ? table + row * stride + 80u
+                       : object + (compact ? 0x88u : 0x3f8u)) / 4u);
+    }
+    if (compact) {
+      // Member 0x16c admits this tuple's residue; only the paired selector list excludes it.
+      const std::array unreachable{0x00fff000u, 0x09500000u, 0u, 0x900672b0u};
+      std::copy(unreachable.begin(), unreachable.end(),
+                test.initial.begin() + (table + (member == 0x16cu ? 0x17cu : 0xbcu)) / 4u);
+    }
+    auto records = MakeStructuredStorageBufferData(compact ? 0u : stride,
+                                                    compact ? table_bytes : records_count);
+    records[0] = table;
+    std::copy_n(records.begin(), 4, test.user_data.begin() + 32);
+    auto key_buffer = MakeStructuredStorageBufferData(child_table ? 8u : 0u,
+        child_table ? wave : lanes * 4u);
+    key_buffer[0] = keys_address;
+    std::copy_n(key_buffer.begin(), 4, test.user_data.begin() + 4);
+    if (large_samplers) {
+      auto samplers = MakeStructuredStorageBufferData(16u, rows);
+      samplers[0] = objects;
+      std::copy_n(samplers.begin(), 4, test.user_data.begin() + 36);
+    }
+    if (compact) {
+      auto indices = MakeStructuredStorageBufferData(0, list.size() * 4u);
+      indices[0] = list_address;
+      std::copy_n(indices.begin(), 4, test.user_data.begin() + 36);
+    }
+    const auto output = MakeStructuredStorageBufferData(0, outputs * 4u);
+    std::copy_n(output.begin(), 4, test.user_data.begin() + 48);
+    if (counted) {
+      test.user_data[52] = count_address;
+      test.initial[count_address / 4u] = records_count;
+    }
+    test.bda_mappings = {{0u, 0u}};
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = waterfall ? wave : 1u;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = waterfall ? 1u : 0u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44;
+    test.dispatch_x = waterfall ? 1u : keys.size();
+    auto &code = test.code;
+    size_t loop = 0, empty = 0, skip_child = 0;
+    if (waterfall) {
+      code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+      if (counted)
+        code.insert(code.end(), {EncodeSmem0(0x00, 54, 26), EncodeSmem1(0, 125),
+                                EncodeSopp(0x0c, 0)});
+      if (upper_only) {
+        AppendSMovLiteral(&code, 126, 0u);
+        AppendSMovLiteral(&code, 127, UINT32_MAX);
+      }
+      code.push_back(EncodeSop1(0x04, 60, 126));
+    }
+    if (child_table) {
+      code.insert(code.end(), {EncodeMubuf0(0x0d, 0, true, false),
+                              EncodeMubuf1(4, 1, 0), EncodeSopp(0x0c, 0)});
+      AppendVMovLiteral(&code, 6, UINT32_MAX);
+      for (u32 row = 0; row < rows; ++row) {
+        if (counted)
+          code.insert(code.end(), {EncodeSopc(0x08, 54, InlineU32(row)),
+                                  EncodeSop2(0x0b, 62, 126, InlineU32(0))});
+        code.push_back(EncodeVopc(0xc2, InlineU32(row), 4));
+        if (counted) code.push_back(EncodeSop2(0x0f, 106, 106, 62));
+        AppendVop3(&code, 0x101, 6, Vgpr(6), InlineU32(row), 106);
+      }
+      code.push_back(EncodeVopc(0x93, InlineU32(0), 6)); // Only finite nonnegative parent rows.
+      empty = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(10, 8, 6),
+                              EncodeSopp(0x0c, 0)});
+      AppendVop3(&code, 0x149, 11, Vgpr(11), InlineU32(0), InlineU32(16));
+      loop = code.size();
+      code.insert(code.end(), {EncodeVop1(0x02, 22, Vgpr(6)),
+          EncodeVop1(0x02, 20, Vgpr(10)), EncodeVop1(0x02, 21, Vgpr(11)),
+          EncodeVop1(0x02, 24, Vgpr(5)), EncodeVopc(0xc2, 22, 6), EncodeSop1(0x04, 56, 106)});
+      for (const auto [sgpr, vgpr] : {std::pair{20u, 10u}, std::pair{21u, 11u}, std::pair{24u, 5u}})
+        code.insert(code.end(), {EncodeVopc(0xc2, sgpr, vgpr), EncodeSop2(0x0f, 56, 56, 106)});
+      code.insert(code.end(), {EncodeSop1(0x24, 58, 56), EncodeSopc(0x09, 24, InlineU32(children))});
+      skip_child = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeSop2(0x26, 23, 24, 255), 368u,
+          EncodeSmem0(0x03, 8, 10), EncodeSmem1(member, 23),
+          EncodeSop2(0x26, 25, 22, 255), stride,
+          EncodeSmem0(0x0a, 16, 16), EncodeSmem1(80u, 25), EncodeSopp(0x0c, 0)});
+    } else {
+      if (!waterfall) {
+        code.push_back(EncodeSop2(0x1e, 23, 44, InlineU32(2)));
+        code.push_back(EncodeVop1(0x01, 30, 23));
+      }
+      code.insert(code.end(), {EncodeMubuf0(0x0c), EncodeMubuf1(4, 1, 30),
+                              EncodeVop2(0x16, 6, InlineU32(16), 4)});
+      if (large_samplers) {
+        code.insert(code.end(), {EncodeVop2(0x1b, 7, 255, 4), 65535u});
+        loop = code.size();
+        code.insert(code.end(), {EncodeVop1(0x02, 22, Vgpr(6)),
+            EncodeVop1(0x02, 23, Vgpr(7)), EncodeVopc(0xc2, 22, 6),
+            EncodeSop1(0x04, 56, 106), EncodeVopc(0xc2, 23, 7),
+            EncodeSop2(0x0f, 56, 56, 106), EncodeSop1(0x24, 58, 56)});
+      } else AppendVop3(&code, 0x360, 22, Vgpr(6), InlineU32(0));
+    }
+    if (compact) {
+      code.insert(code.end(), {EncodeSop2(0x1e, 23, 22, InlineU32(2)),
+                              EncodeSmem0(0x08, 22, 18), EncodeSmem1(0, 23),
+                              EncodeSop2(0x26, 23, 22, 255), stride});
+      if (member == 0x98u)
+        code.insert(code.end(), {EncodeSmem0(0x0b, 8, 16), EncodeSmem1(0x88u, 23)});
+      else code.insert(code.end(), {EncodeSmem0(0x0a, 8, 16), EncodeSmem1(0x88u, 23),
+                                   EncodeSmem0(0x0a, 12, 16), EncodeSmem1(member, 23)});
+      for (u32 reg = 16u; reg < 20u; ++reg) AppendSMovLiteral(&code, reg, 0xdeadbeefu);
+    } else if (large_samplers) code.insert(code.end(), {
+        EncodeSop2(0x1e, 24, 23, InlineU32(5)), EncodeSmem0(0x0b, 8, 16), EncodeSmem1(0, 24),
+        EncodeSop2(0x1e, 24, 22, InlineU32(4)), EncodeSmem0(0x0a, 16, 18), EncodeSmem1(0, 24)});
+    else if (!child_table) code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+                            EncodeSmem0(0x09, 20, 16), EncodeSmem1(0, 23),
+                            EncodeSmem0(0x03, 8, 10), EncodeSmem1(0x3d0, 125),
+                            EncodeSmem0(0x02, 16, 10), EncodeSmem1(0x3f8, 125)});
+    AppendVMovLiteral(&code, 20, std::bit_cast<u32>(0.5f));
+    AppendVMovLiteral(&code, 21, std::bit_cast<u32>(0.5f));
+    code.insert(code.end(), {EncodeMimg0(0x27, 1, 0, false, 1, compact),
+                            EncodeMimg1(12, 20, compact ? 3u : 2u, compact ? 2u : 4u)});
+    AppendBufferStoreDword(&code, 12, 30);
+    if (waterfall) {
+      if (child_table) code[skip_child] = EncodeSopp(0x05, code.size() - skip_child - 1u);
+      code.push_back(EncodeSop2(0x15, 126, 58, 56));
+      code.push_back(EncodeSopp(0x09, static_cast<int16_t>(loop - code.size() - 1u)));
+      if (child_table) code[empty] = EncodeSopp(0x08, code.size() - empty - 1u);
+      code.push_back(EncodeSop1(0x04, 126, 60));
+    }
+    if (child_table) {
+      AppendVMovLiteral(&code, 12, 0x76543210u);
+      code.insert(code.end(), {EncodeMubuf0(0x1c, wave * 4u), EncodeMubuf1(12, 12, 30)});
+    }
+    AppendEnd(&code);
+    if (child_table) {
+      test.decoded_counts = {{"BUFFER_LOAD_DWORDX2", 2u}, {"V_READFIRSTLANE_B32", 4u},
+          {"V_BFE_I32", 1u}, {"V_CMPX_LE_I32", 1u}, {"S_CBRANCH_EXECNZ", 1u}};
+      test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle", "OpBitFieldSExtract"};
+      if (counted) test.decoded_counts.insert(test.decoded_counts.end(),
+          {{"S_LOAD_DWORD ", 1u}, {"S_CMP_GT_U32", rows}, {"S_CSELECT_B64", rows}});
+    } else {
+      test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_LSHRREV_B32,
+          large_samplers ? O::V_READFIRSTLANE_B32 : O::V_READLANE_B32,
+          O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+      if (large_samplers) test.required_spirv = {"OpLoopMerge", "OpGroupNonUniformShuffle"};
+      else test.opcodes.insert(test.opcodes.end(), {O::S_LSHL_B32, O::V_MOV_B32, O::S_MUL_I32});
+    }
+    if (compact) {
+      test.opcodes.insert(test.opcodes.end(), {O::S_BUFFER_LOAD_DWORD,
+          member == 0x98u ? O::S_BUFFER_LOAD_DWORDX8 : O::S_BUFFER_LOAD_DWORDX4, O::S_MOV_B32});
+      test.decoded_counts = {{"r128=1", 1}};
+    } else if (large_samplers) test.opcodes.insert(test.opcodes.end(),
+        {O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORDX4});
+    else if (!child_table) test.opcodes.insert(test.opcodes.end(),
+        {O::S_BUFFER_LOAD_DWORDX2, O::S_LOAD_DWORDX8, O::S_LOAD_DWORDX4});
+    const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    if (large_samplers) {
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string text;
+      const auto halves = wave > vulkan.SubgroupSize() ? 2u : 1u;
+      Require(test.name, "expanded sampler bindings and emitted size",
+              compiled.resources.samplers.size() == rows + 1u &&
+                  compiled.program.info.samplers.size() == rows + 1u &&
+                  tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, "OpImageSampleExplicitLod") == halves &&
+                  SpirvCodeWords(compiled.spirv) <= 8192u * halves,
+              "59 sampler records hit the SGPR root limit or duplicated image sampling bodies");
+    }
+    if (large_samplers)
+      Require(test.name, "GPU waterfall keys remain unread by materialization",
+          std::ranges::none_of(compiled.resources.specialization_reads, [&](const auto &span) {
+            return span.first < keys_address + lanes * 4u && keys_address < span.first + span.second;
+          }), "host planning captured GPU-only packed selector bytes");
+    if (child_table) {
+      std::vector<u32> candidates;
+      for (const auto &image : compiled.resources.images)
+        if (image.dwords[0] != 0u) candidates.push_back(image.dwords[0]);
+      std::ranges::sort(candidates);
+      std::vector<u32> expected_candidates(records_count * children);
+      std::iota(expected_candidates.begin(), expected_candidates.end(), 10u);
+      Require(test.name, "complete child domain", candidates == expected_candidates,
+              "parent/child planning omitted a record or admitted poisoned padding");
+      Require(test.name, "GPU selectors remain unread by materialization",
+          std::ranges::none_of(compiled.resources.specialization_reads, [&](const auto &span) {
+            return span.first < keys_address + wave * 8u && keys_address < span.first + span.second;
+          }), "host planning captured GPU-only selector bytes");
+      if (counted)
+        Require(test.name, "runtime parent count is captured",
+            std::ranges::any_of(compiled.resources.specialization_reads, [&](const auto &span) {
+              return span.first <= count_address && count_address - span.first < span.second &&
+                  sizeof(u32) <= span.second - (count_address - span.first);
+            }), "the proven scalar count was absent from the captured alias ranges");
+    }
+    if (compact) {
+      std::vector<u32> candidates;
+      for (const auto &image : compiled.resources.images) candidates.push_back(image.dwords[0]);
+      std::ranges::sort(candidates);
+      Require(test.name, "paired R128 descriptor boundary",
+        candidates == std::vector<u32>{10u, 11u, 12u, 13u, 14u, 15u} &&
+            std::ranges::all_of(compiled.resources.images, [](const auto &image) {
+              return image.dword_count == 8u &&
+                  std::ranges::all_of(std::span(image.dwords).subspan(4u),
+                                      [](u32 word) { return word == 0u; });
+            }), "paired selector admitted poison or omitted the trailing 16-byte image");
+    }
+    for (const auto &value : compiled.resources.buffers) {
+      ShaderBufferResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4, descriptor.fields);
+      test.storage_buffer_ranges.emplace_back(descriptor.Base48(),
+                                               std::max(4u, u32(descriptor.GetSize())));
+    }
+    std::vector<VulkanHarness::Image> images;
+    for (const auto &descriptor : compiled.resources.images)
+      images.push_back(vulkan.CreateImage2D(test.name, 2, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled,
+          {0u, std::bit_cast<u32>(float(descriptor.dwords[0]))}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal));
+    std::vector<vk::Sampler> samplers;
+    for (const auto &resource : compiled.program.info.samplers) {
+      ShaderSamplerResource descriptor{};
+      std::copy_n(compiled.resources.samplers[resource.snapshot_index].dwords.begin(),
+                  4, descriptor.fields);
+      samplers.push_back(vulkan.CreateSampler(test.name, 1,
+          descriptor.XyMagFilter() == 1 ? vk::Filter::eLinear : vk::Filter::eNearest));
+    }
+    TestCase producer;
+    producer.name = "NestedPointerSelectorProducer";
+    producer.initial = test.initial;
+    producer.has_compute_info = true;
+    producer.compute_info.threads_num[0] = producer.compute_info.threads_num[1] =
+        producer.compute_info.threads_num[2] = 1;
+    producer.compute_info.wave_size = 32;
+    test.expected = test.initial;
+    for (u32 group = 0; group < lanes; ++group) {
+      const u32 outer = child_table ? (group % 8u == 7u ? UINT32_MAX : group % rows) : keys[group % keys.size()];
+      const u32 child = child_table ? (group / 8u) % 4u : 0u;
+      const u32 address = keys_address + group * (child_table ? 8u : 4u);
+      const u32 image_key = large_samplers && outer < rows ? (outer + group / keys.size()) % rows : outer;
+      const u32 packed_key = child_table ? outer : (outer << 16u) | (large_samplers ? image_key : 0xbeefu);
+      AppendVMovLiteral(&producer.code, 1, packed_key);
+      AppendVMovLiteral(&producer.code, 2, address);
+      AppendBufferStoreDword(&producer.code, 1, 2);
+      test.expected[address / 4u] = packed_key;
+      if (child_table) {
+        AppendVMovLiteral(&producer.code, 1, child);
+        AppendVMovLiteral(&producer.code, 2, address + 4u);
+        AppendBufferStoreDword(&producer.code, 1, 2);
+        test.expected[address / 4u + 1u] = child;
+        if (upper_only && group < 32u) continue;
+        test.expected[wave + group] = 0x76543210u;
+        if (outer >= records_count || child >= children) continue;
+      }
+      if (large_samplers && upper_only && group < 32u) continue;
+      if (!child_table && outer >= rows) {
+        test.expected[group] = 0u;
+        continue;
+      }
+      const u32 row = compact ? list[outer] : outer;
+      test.expected[group] = std::bit_cast<u32>(float(10u + (large_samplers ? image_key : row * children + child)) *
+                                                ((row & 1u) ? 0.5f : 1.0f));
+    }
+    AppendEnd(&producer.code);
+    const auto producer_shader = CompileCase(producer, vulkan.SubgroupSize());
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size(), true);
+    vulkan.Dispatch(producer, producer_shader, buffer);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                     nullptr, images, samplers);
+    CompareWords(test, "GPU-selected parent/child, paired sampler, EXEC restoration and canaries",
+                 test.expected, vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+    vulkan.DestroyBuffer(&buffer);
+    for (const auto sampler : samplers) vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s wave=%u ok\n", test.name, wave);
+  }
+}
+
+void CheckGuardedRecordImageTable(VulkanHarness &vulkan) {
+  using O = ShaderOpcode;
+  constexpr u32 table = 256u;
+  for (const u32 variant : {0u, 1u, 2u, 3u})
+  for (const u32 wave : {32u, 64u})
+  for (const u32 count : {0u, 2u, 3u}) {
+    const bool masked = variant == 1u, bitset = variant == 2u, witnessed = variant == 3u;
+    const u32 stride = bitset ? 32u : masked ? 784u : 272u;
+    const u32 offset = bitset ? 3344u : masked ? 672u : witnessed ? 32856u : 3696u;
+    const u32 count_offset = witnessed ? 35948u : masked ? 0u : 4u;
+    const u32 rows = bitset ? 12u : count, members = bitset ? 1u : 2u;
+    const u32 lanes = masked || witnessed ? 2u : 1u;
+    TestCase test;
+    test.name = witnessed ? (wave == 32u ? "WitnessedRecordTable32" : "WitnessedRecordTable64")
+                         : bitset ? (wave == 32u ? "BitsetRecordTable32" : "BitsetRecordTable64")
+                       : masked ? (wave == 32u ? "ExecGuardedRecordTable32" : "ExecGuardedRecordTable64")
+                       : (wave == 32u ? "GuardedRecordImageTable32" : "GuardedRecordImageTable64");
+    test.initial.resize((table + std::max(offset + stride * rows, count_offset + 4u)) / 4u, 0xdeadbeefu);
+    test.initial[(table + count_offset) / 4u] = bitset ? (1u << count) - 1u : count;
+    for (u32 row = 0; row < rows; ++row)
+    for (u32 member = 0; member < members; ++member) {
+      auto image = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+      image[0] = (row + 1u) * (member == 0u ? 1u : 10u);
+      image[3] = DstSel(4, 0, 0, 1) |
+          (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      std::copy_n(image.begin(), 8,
+          test.initial.begin() + (table + offset + row * stride + member * 32u) / 4u);
+    }
+    test.user_data[0] = table;
+    auto destination = MakeSampledTextureData(Prospero::BufferFormat::k32Float);
+    destination[0] = 0x10000u;
+    destination[1] |= (4u * lanes - 1u) << 30u;
+    destination[2] |= (4u * lanes - 1u) >> 2u;
+    destination[3] = DstSel(4, 0, 0, 1) |
+        (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::copy_n(destination.begin(), 8, test.user_data.begin() + 32);
+    test.has_user_data = test.has_compute_info = true;
+    test.compute_info.wave_size = wave;
+    test.compute_info.threads_num[0] = lanes;
+    test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+    test.compute_info.thread_ids_num = 1u;
+    test.compute_info.group_id[0] = true;
+    test.compute_info.workgroup_register = 44u;
+    test.dispatch_x = 4u;
+    auto &code = test.code;
+    code.insert(code.end(), {EncodeSop2(0x20, 20, InlineU32(5), 44),
+                            EncodeSmem0(0x00, 21), EncodeSmem1(count_offset, 125)});
+    if (bitset) code.insert(code.end(), {
+        EncodeSop2(0x0e, 20, 20, 21),
+        EncodeSop2(0x27, 20, 20, 255), 12u << 16u});
+    code.push_back(EncodeSop1(0x04, 30, 126)); // Preserve EXEC for the final write.
+    code.push_back(EncodeVop1(0x01, 13, Vgpr(0))); // Odd lane is already done.
+    AppendVMovLiteral(&code, 10, 0xdeadbeefu);
+    AppendVMovLiteral(&code, 0, 0u);
+    AppendVMovLiteral(&code, 20, 0x3f000000u);
+    AppendVMovLiteral(&code, 21, 0x3f000000u);
+    if (witnessed) code.push_back(EncodeVopc(0xd2, InlineU32(0), 13));
+    const auto loop = code.size();
+    code.push_back(EncodeSop1(0x13, 22, 20)); // Find the next set bit in the GPU worklist.
+    size_t empty_exit = 0;
+    if (!witnessed) {
+      code.push_back(EncodeSopc(0x07, 22, 193));
+      empty_exit = code.size(); code.push_back(0u);
+    }
+    size_t range_exit = 0;
+    if (!bitset) {
+      if (masked) code.insert(code.end(), {EncodeSop2(0x0b, 28, 126, InlineU32(0)),
+                                          EncodeSop1(0x04, 126, 28)});
+      code.push_back(EncodeSopc(0x09, 22, 21));
+      if (witnessed) code.insert(code.end(), {
+          EncodeSop2(0x0b, 4, 126, InlineU32(0)),
+          EncodeSopc(0x06, 193, 22),
+          EncodeSop2(0x0b, 106, 126, InlineU32(0)),
+          EncodeSop2(0x11, 106, 4, 106)});
+      if (masked) code.insert(code.end(), {
+          EncodeVopc(0xc2, 249, 22), // Mask the FF1 sentinel into s2:s3.
+          EncodeVopcSdwa(193, 2, 1, 6, 6, 0, 0, 0, 0, 0, 0, 1, 1),
+          EncodeVop2(0x1c, 10, 253, 13), // SCC encoded as 0/1, OR per-lane done.
+          EncodeVopc(0xc5, InlineU32(0), 10),
+          EncodeSop2(0x11, 106, 106, 2),
+          EncodeSop2(0x15, 126, 28, 106)});
+      range_exit = code.size(); code.push_back(0u);
+    }
+    code.insert(code.end(), {EncodeSop2(0x26, 23, 22, 255), stride,
+                            EncodeSop2(0x02, 23, 23, 255), offset});
+    size_t skip_first = 0;
+    if (!bitset) {
+      code.push_back(EncodeSopc(0x0d, 22, InlineU32(0)));
+      skip_first = code.size(); code.push_back(0u);
+    }
+    code.insert(code.end(), {EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+                            EncodeMimg0(0x27, 1), EncodeMimg1(4, 20, 2, 10),
+                            EncodeVop2(0x03, 0, Vgpr(4), 0)});
+    if (bitset) {
+      // An optional second sample reuses the dominating descriptor load.
+      code.push_back(EncodeSopc(0x0d, 22, InlineU32(0)));
+      const auto skip_second = code.size(); code.push_back(0u);
+      code.insert(code.end(), {EncodeMimg0(0x27, 1), EncodeMimg1(4, 20, 2, 10),
+                              EncodeVop2(0x03, 0, Vgpr(4), 0)});
+      code[skip_second] = EncodeSopp(0x05, code.size() - skip_second - 1u);
+    } else {
+      code[skip_first] = EncodeSopp(0x05, code.size() - skip_first - 1u);
+      // Both sides of the optional first sample reach the second descriptor.
+      code.insert(code.end(), {EncodeSop2(0x02, 23, 23, InlineU32(32)),
+                              EncodeSmem0(0x03, 8), EncodeSmem1(0, 23),
+                              EncodeMimg0(0x27, 1), EncodeMimg1(4, 20, 2, 10),
+                              EncodeVop2(0x03, 0, Vgpr(4), 0)});
+    }
+    code.insert(code.end(), {EncodeSop2(0x1e, 24, InlineU32(1), 22),
+                            EncodeSop2(0x14, 20, 20, 24)});
+    code.push_back(EncodeSopp(0x02, loop - code.size() - 1u));
+    if (!witnessed) code[empty_exit] = EncodeSopp(0x04, code.size() - empty_exit - 1u);
+    if (!bitset) code[range_exit] =
+        EncodeSopp(witnessed ? 0x07 : masked ? 0x08 : 0x05, code.size() - range_exit - 1u);
+    code.push_back(EncodeSop1(0x04, 126, 30));
+    code.push_back(EncodeSop2(0x26, 25, 44, InlineU32(lanes)));
+    code.push_back(EncodeVop2(0x25, 30, 25, 13));
+    AppendVMovLiteral(&code, 31, 0u);
+    code.insert(code.end(), {EncodeMimg0(0x08, 1), EncodeMimg1(0, 30, 8, 0)});
+    AppendEnd(&code);
+    test.opcodes = {O::S_LSHR_B32, O::S_LOAD_DWORD, O::V_MOV_B32, O::S_FF1_I32_B32,
+        O::S_MUL_I32, O::S_ADD_I32, O::S_LOAD_DWORDX8, O::IMAGE_SAMPLE,
+        O::V_ADD_F32, O::S_LSHL_B32, O::S_ANDN2_B32, O::S_BRANCH,
+        O::IMAGE_STORE, O::S_ENDPGM};
+    if (witnessed) test.opcodes.insert(test.opcodes.end(), {O::V_CMPX_EQ_U32,
+        O::S_CSELECT_B64, O::S_CMP_EQ_U32, O::S_OR_B64, O::S_CBRANCH_VCCNZ});
+    else test.opcodes.insert(test.opcodes.end(), {O::S_CMP_LG_U32, O::S_CBRANCH_SCC0});
+    if (bitset) test.opcodes.insert(test.opcodes.end(), {O::S_AND_B32, O::S_BFE_U32,
+        O::S_BITCMP1_B32, O::S_CBRANCH_SCC1});
+    else test.opcodes.insert(test.opcodes.end(), {O::S_CMP_GE_U32, O::S_CBRANCH_SCC1,
+                                                O::S_BITCMP1_B32});
+    if (masked) test.opcodes.insert(test.opcodes.end(), {O::S_CSELECT_B64,
+        O::V_CMP_EQ_U32, O::V_OR_B32, O::V_CMP_NE_U32, O::S_OR_B64,
+        O::S_ANDN2_B64, O::S_CBRANCH_EXECZ});
+    test.opcodes.insert(test.opcodes.end(), {O::S_MOV_B64, O::V_ADD_NC_U32});
+    auto compiled = CompileCase(test, vulkan.SubgroupSize());
+    const auto sampled_count = std::ranges::count_if(compiled.program.info.images,
+        [](const auto &image) {
+          return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+        });
+    Require(test.name, "bounded descriptor rows",
+            rows == 0u ? sampled_count <= members : sampled_count == rows * members,
+            "the runtime count lost a row or probed record padding");
+    std::vector<VulkanHarness::Image> images(compiled.program.info.images.size());
+    u32 storage_index = 0;
+    for (u32 resource = 0; resource < images.size(); ++resource) {
+      if (compiled.program.info.images[resource].resource_class ==
+          ShaderRecompiler::IR::ImageResourceClass::Storage) {
+        storage_index = resource;
+        images[resource] = vulkan.CreateImage2D(test.name, 4u * lanes, 1, vk::Format::eR32Sfloat,
+            vk::ImageUsageFlagBits::eStorage, std::vector<u32>(4u * lanes, 0xdeadbeefu), 1,
+            vk::ImageLayout::eGeneral);
+        continue;
+      }
+      const auto value = static_cast<float>(compiled.resources.images[resource].dwords[0]);
+      images[resource] = vulkan.CreateImage2D(test.name, 1, 1, vk::Format::eR32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {std::bit_cast<u32>(value)}, 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    auto sampler = vulkan.CreateSampler(test.name, 1);
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, images);
+    std::vector<u32> expected(4u * lanes, 0u);
+    if (count != 0u) {
+      expected[0] = std::bit_cast<u32>(bitset ? (count == 3 ? 8.0f : 2.0f)
+                                                    : (count == 3 ? 44.0f : 11.0f));
+      expected[lanes] = std::bit_cast<u32>(bitset ? 2.0f : 20.0f);
+      expected[2u * lanes] = std::bit_cast<u32>(bitset ? 2.0f : 11.0f);
+    }
+    CompareWords(test, "GPU worklist, guarded count and image writes", expected,
+                 vulkan.ReadImage(test.name, &images[storage_index]));
+    vulkan.DestroyBuffer(&buffer);
+    vulkan.Device().destroySampler(sampler);
+    for (auto &image : images) if (image.image != nullptr) vulkan.DestroyImage(&image);
+    std::printf("[compute] %s count=%u ok\n", test.name, count);
+  }
+}
+
+void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
@@ -33313,7 +41432,6 @@ void CheckIndirectImageKeySwitch() {
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
-  program.block_info.push_back({.id = 0});
 
   auto &key = block->AppendNewInst(ValueOpcode::LaneId);
   auto &image =
@@ -33344,7 +41462,7 @@ void CheckIndirectImageKeySwitch() {
   std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
   auto &sample = block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
-      {Value(&image), Value(&sampler), Value(&address)}, memory_flag_bits);
+      {Value(&image), Value(&sampler), Value(&address), Value(true)}, memory_flag_bits);
   auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
                                         {Value(&sample), Value(0u)});
   block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
@@ -33352,8 +41470,10 @@ void CheckIndirectImageKeySwitch() {
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_descriptor =
-      DescriptorSource::IndirectDescriptor{.material_source = 0, .table_source = 0,
-          .selector_stride = 224, .selector_offset = 12, .table_stride = 32};
+      DescriptorSource::IndirectDescriptor{
+          .selector = DescriptorSource::IndirectDescriptor::SelectorRead{
+              .source = 0, .stride = 224, .offset = 12},
+          .table_source = 0, .table_stride = 32};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
@@ -33374,8 +41494,9 @@ void CheckIndirectImageKeySwitch() {
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
-  AllocateBindings(program);
   ShaderComputeInputInfo compute{};
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     {.compute = &compute});
   ValidateSpirv(name, spirv);
@@ -33402,6 +41523,19 @@ void CheckIndirectImageKeySwitch() {
           sampled_image != 0u && std::ranges::find(nonuniform, sampled_image) != nonuniform.end(),
           "the sample operand lacks its nonuniform decoration");
 
+  program.info.images[0].indirect_search_iterations = 0;
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv("DenseIndirectImageTable", spirv);
+  Require(name, "dense image map disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble dense image table shader");
+  Require(name, "bounded dense image selection",
+          CountText(text, "OpULessThan") == 1 &&
+              CountText(text, "OpImageSampleExplicitLod") == 1 &&
+              text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
+          "dense image selection lost its bounds check or native nonuniform array");
+
   // Materialized children follow all native roots, including unrelated images.
   root.indirect_resources = {0u};
   program.info.images = {root, candidate};
@@ -33411,8 +41545,8 @@ void CheckIndirectImageKeySwitch() {
     program.info.images.push_back(candidate);
   }
   program.info.images[0] = root;
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
   spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
   ValidateSpirv(name, spirv);
   Require(name, "large image array disassembly", tools.Disassemble(spirv, &text),
@@ -33421,6 +41555,69 @@ void CheckIndirectImageKeySwitch() {
           text.find("OpSwitch") == std::string::npos &&
               CountText(text, "OpImageSampleExplicitLod") == 1,
           "materialized images expanded into per-candidate samples");
+
+  program.info.images[root.indirect_resources[103]].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.info.images[root.indirect_resources[103]].cube = true;
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "mixed image types", tools.Disassemble(spirv, &text) &&
+              CountText(text, "OpImageSampleExplicitLod") == 2,
+          "one cube duplicated the surrounding 2D samples");
+
+  for (u32 ordinal = 1; ordinal < root.indirect_resources.size(); ordinal += 2u) {
+    auto &alternating = program.info.images[root.indirect_resources[ordinal]];
+    alternating.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    alternating.cube = true;
+  }
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "alternating image types", tools.Disassemble(spirv, &text) &&
+              CountText(text, "OpImageSampleExplicitLod") == 2,
+          "alternating cube and 2D descriptors expanded the typed samples");
+  // The descriptor selector may grow, but 189 candidates still need only two
+  // sample bodies and should fit comfortably within a 32 KiB module.
+  Require(name, "alternating image emitted size", spirv.size() <= 8192u,
+          "alternating descriptors exceeded the 32 KiB SPIR-V regression budget");
+
+  // A resident heap selects its typed kind and element from a device slot word.
+  auto heap_root = root;
+  heap_root.heap = true;
+  heap_root.indirect_search_iterations = 0;
+  heap_root.indirect_resources = {0u, 1u, 2u};
+  auto heap_kind = candidate;
+  heap_kind.heap = true;
+  auto heap_uint = heap_kind;
+  heap_uint.numeric_class = Prospero::TextureNumericClass::Uint;
+  for (const bool mixed : {true, false}) {
+    program.info.images = {heap_root, heap_kind};
+    if (mixed) program.info.images.push_back(heap_uint);
+    program.info.images[0].indirect_resources.resize(program.info.images.size());
+    // ApplyResourceSpecialization adds the integer sampler variant of a Uint kind.
+    program.info.samplers.resize(1);
+    if (mixed) {
+      program.info.samplers.push_back(program.info.samplers[0]);
+      program.info.samplers[1].integer_border = true;
+    }
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
+    spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv("ResidentImageHeap", spirv);
+    Require(name, "image heap disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble the image heap shader");
+    Require(name, "image heap selection",
+            program.info.uses_image_heap && CountText(text, "OpConvertUToPtr") == 1 &&
+                CountText(text, "UMin") == 1 &&
+                CountText(text, "OpSwitch") == (mixed ? 1 : 0) &&
+                CountText(text, "OpImageSampleExplicitLod") == (mixed ? 2 : 1) &&
+                CountText(text, "DescriptorSet 1") == (mixed ? 2 : 1) &&
+                text.find("PhysicalStorageBuffer64") != std::string::npos,
+            "image heap kinds did not sample the slot-selected heap element");
+  }
 
   program.memory_info[0].image_dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
@@ -33440,8 +41637,8 @@ void CheckIndirectImageKeySwitch() {
               ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
               : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
     }
-    program.binding_layout_complete = false;
-    AllocateBindings(program);
+    program.shader_info_complete = false;
+    CollectShaderInfo(program, {.compute = &compute});
     spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
     ValidateSpirv(name, spirv);
     Require(name, "mixed SPIR-V disassembly", tools.Disassemble(spirv, &text),
@@ -33477,6 +41674,416 @@ void CheckIndirectImageKeySwitch() {
     }
     Require(name, "mixed sample count", samples == 3u,
             "mixed candidate switch did not retain every image");
+  }
+  // Keep an unrelated native root between the null image and appended children,
+  // then select both sides of a cube boundary and the unmapped suffix on the GPU.
+  root.indirect_resources = {0u, 2u, 3u, 4u, 5u, 6u};
+  root.indirect_search_iterations = 0;
+  program.info.images.assign(7, candidate);
+  program.info.images[0] = root;
+  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
+  program.info.images[4].dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.info.images[4].cube = true;
+  for (u32 component = 0; component < 4u; ++component) {
+    constexpr std::array values{1.5f, 1.5f, 0.0f, 0.0f};
+    address.SetArg(component, Value(std::bit_cast<u32>(values[component])));
+  }
+  auto &byte_offset = *block->PrependNewInst(
+      std::next(block->begin()), ValueOpcode::IMul32, {Value(&key), Value(4u)});
+  image.SetArg(0, Value(&byte_offset));
+  auto &output = block->AppendNewInst(ValueOpcode::GetBufferResource,
+                                      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  output.SetFlags<u32>(0u);
+  program.memory_info.push_back({.kind = ResourceKind::Buffer, .offen = true});
+  auto &store = block->AppendNewInst(
+      ValueOpcode::StoreBufferU32,
+      {Value(&output), Value(0u), Value(&byte_offset), Value(0u), Value(&sample_x), Value(true)});
+  store.SetFlags(MemoryFlags{1u, 0u});
+  program.info.buffers.push_back({.packed_stride = 1, .written = true});
+  program.shader_info_complete = false;
+  CollectShaderInfo(program, {.compute = &compute});
+
+  TestCase test;
+  test.name = "IndirectImageContiguousRuns";
+  CompiledShader compiled;
+  compiled.program = std::move(program);
+  constexpr std::array ordinals{0u, 1u, 2u, 3u, 4u, 5u, 2u, 0u};
+  compiled.resources.flattened_srt.push_back(ordinals.size());
+  compiled.resources.flattened_srt.insert(compiled.resources.flattened_srt.end(),
+                                          ordinals.begin(), ordinals.end());
+  std::vector<VulkanHarness::Image> textures;
+  for (u32 resource = 0; resource < 7u; ++resource) {
+    const auto layers = resource == 4u ? 6u : 1u;
+    std::vector<u32> pixels(layers * 16u, std::bit_cast<u32>(float(resource)));
+    std::vector<u32> mip(layers * 4u,
+                         std::bit_cast<u32>(resource == 0u ? 0.0f : float(resource + 10u)));
+    textures.push_back(vulkan.CreateImageMips(
+        test.name, 2, 2, vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, {pixels, mip}, 4u,
+        vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers));
+  }
+  const auto native_sampler = vulkan.CreateSampler(test.name);
+  enum class Access { Sample, Gather, GatherHomogeneous, GatherMips, Fetch, Fetch1D };
+  auto *access = &sample;
+  for (const auto mode : {Access::Sample, Access::Gather,
+                          Access::GatherHomogeneous, Access::GatherMips, Access::Fetch, Access::Fetch1D}) {
+    const bool fetch = mode == Access::Fetch || mode == Access::Fetch1D;
+    const bool gather = mode == Access::Gather || mode == Access::GatherHomogeneous || mode == Access::GatherMips;
+    const bool mixed_mips = mode == Access::GatherMips;
+    const bool homogeneous = mode == Access::GatherHomogeneous;
+    if (mode == Access::Gather) {
+      test.name = "IndirectImageGatherContiguousRuns";
+      const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
+        return &inst == access;
+      });
+      auto &read = *block->PrependNewInst(
+          position, ValueOpcode::ImageGatherRaw,
+          {Value(&image), Value(&sampler), Value(&address), Value(0u), Value(0u),
+           Value(0u), Value(0u), Value(true)}, memory_flag_bits);
+      access->ReplaceUsesWith(Value(&read), false);
+      access = &read;
+      compiled.program.info.images[4].cube = false;
+      auto &gather_memory = compiled.program.memory_info[0];
+      gather_memory.dmask = 1;
+      gather_memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLevelZero |
+          ShaderRecompiler::Decoder::ImageSampleFlagOffset;
+      // GATHER4_LZ_O places its packed signed offset before the coordinates.
+      address.SetArg(0, Value(0x3fu));
+      address.SetArg(1, Value(std::bit_cast<u32>(0.75f)));
+      address.SetArg(2, Value(std::bit_cast<u32>(0.25f)));
+      address.SetArg(3, Value(0u));
+    }
+    auto &selected_resources = compiled.program.info.images[0].indirect_resources;
+    selected_resources = homogeneous ? std::vector<u32>{0u, 2u, 3u, 5u, 6u}
+                                     : root.indirect_resources;
+    if (homogeneous) test.name = "IndirectImageGatherHomogeneous";
+    compiled.resources.flattened_srt[6] = homogeneous ? 4u : ordinals[5];
+    if (mixed_mips) {
+      test.name = "IndirectImageGatherMixedMips";
+      compiled.program.info.images[3].mip_mode = ImageMipMode::Dynamic;
+      compiled.program.info.images[3].mip_count = 2u;
+      compiled.program.memory_info[0].image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
+      address.SetArg(0, Value(std::bit_cast<u32>(0.75f)));
+      address.SetArg(1, Value(std::bit_cast<u32>(0.25f)));
+      address.SetArg(2, Value(0u));
+      address.SetArg(3, Value(std::bit_cast<u32>(1.0f)));
+      access->SetArg(5, Value(0xfffu << 12u));
+      access->SetArg(6, Value(1u << 26u));
+    }
+    if (fetch) {
+      compiled.program.info.images[3].mip_mode = ImageMipMode::None;
+      compiled.program.info.images[3].mip_count = 1u;
+      test.name = "IndirectImageFetchContiguousRuns";
+      const auto position = std::ranges::find_if(*block, [&](const Inst &inst) {
+        return &inst == access;
+      });
+      auto &read = *block->PrependNewInst(
+          position, ValueOpcode::ImageRead,
+          {Value(&image), Value(&address), Value(true)}, memory_flag_bits);
+      access->ReplaceUsesWith(Value(&read), false);
+      access = &read;
+      sampler.Invalidate();
+      compiled.program.info.samplers.clear();
+      compiled.program.info.sampled_pairs.clear();
+      compiled.program.info.images[4].cube = false;
+      compiled.program.memory_info[0].dmask = 0xf;
+      compiled.program.memory_info[0].image_sample_flags = 0;
+      compiled.program.memory_info[0].image_has_mip = true;
+      for (u32 component = 0; component < 4u; ++component)
+        address.SetArg(component, Value(0u));
+      // Native DIM=2DArray places LOD after the layer, even for a 2D candidate.
+      address.SetArg(3, Value(1u));
+      if (mode == Access::Fetch1D) {
+        test.name = "IndirectImageFetch1D2D";
+        compiled.program.memory_info[0].image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+        compiled.program.memory_info[0].image_address_components = 3;
+        address.SetArg(2, Value(1u));
+        address.SetArg(3, Value(0u));
+        for (const u32 resource : {3u, 4u}) {
+          const bool one_d = resource == 3u;
+          compiled.program.info.images[resource].dimension = one_d
+              ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
+              : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          vulkan.DestroyImage(&textures[resource]);
+          textures[resource] = vulkan.CreateImageMips(test.name, 2, 1, vk::Format::eR32G32B32A32Sfloat,
+              vk::ImageUsageFlagBits::eSampled,
+              {std::vector<u32>(8u, std::bit_cast<u32>(float(resource))),
+               std::vector<u32>(4u, std::bit_cast<u32>(float(resource + 10u)))},
+              4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+              one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
+              one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u);
+        }
+      }
+    }
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.host_subgroup_size = vulkan.SubgroupSize();
+      compute.threads_num[0] = wave_size;
+      compute.threads_num[1] = compute.threads_num[2] = 1u;
+      compiled.program.wave_size = wave_size;
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      const auto image_opcode = fetch ? "OpImageFetch" : gather ? "OpImageGather"
+                                                          : "OpImageSampleExplicitLod";
+      Require(test.name, "native array image runs", tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, image_opcode) == (homogeneous ? 1u : mixed_mips ? 4u : 2u) * halves,
+              "mixed runs expanded into per-image accesses");
+      if (homogeneous) {
+        Require(test.name, "homogeneous gather array", text.find("OpSwitch") == std::string::npos,
+                "homogeneous gather emitted a descriptor switch");
+      }
+      if (mixed_mips)
+        Require(test.name, "mixed mip emitted size", compiled.spirv.size() <= 8192u * halves,
+                "mixed mip selection exceeded its 32 KiB per-wave regression budget");
+      if (fetch || gather) {
+        std::vector<u32> decorated;
+        std::vector<u32> image_operands;
+        for (size_t offset = 5; offset < compiled.spirv.size();) {
+          const auto words = std::span<const u32>(compiled.spirv).subspan(
+              offset, compiled.spirv[offset] >> 16u);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
+            decorated.push_back(words[1]);
+          if (opcode == (fetch ? spv::OpImageFetch : spv::OpImageGather))
+            image_operands.push_back(words[3]);
+          offset += words.size();
+        }
+        Require(test.name, "nonuniform image operands",
+                std::ranges::count_if(image_operands, [&](u32 operand) {
+                  return std::ranges::find(decorated, operand) != decorated.end();
+                }) == halves,
+                "a dynamically selected image operand lacks its nonuniform decoration");
+      }
+      test.initial.assign(wave_size, 0xdeadbeefu);
+      test.expected.assign(wave_size, 0u);
+      for (u32 lane = 0; lane < ordinals.size(); ++lane) {
+        const auto resource = selected_resources[compiled.resources.flattened_srt[1u + lane]];
+        test.expected[lane] = std::bit_cast<u32>(float(resource +
+            ((fetch && resource != 0u) || (mixed_mips && resource == 3u) ? 10u : 0u)));
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr,
+                      fetch ? vk::Sampler{} : native_sampler, textures);
+      const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+      vulkan.DestroyBuffer(&buffer);
+      CompareWords(test, "root, native slots, array runs and mapping bounds", test.expected, actual);
+      if (wave_size == 32u && !homogeneous && !mixed_mips) {
+        // A single integer candidate must keep raw register bits across the
+        // same descriptor runs used by samples, gathers, and image fetches.
+        const auto coordinate_conversions = CountText(text, "OpConvertUToF");
+        auto &typed = compiled.program.info.images[3];
+        typed.numeric_class = Prospero::TextureNumericClass::Uint;
+        if (!fetch) {
+          auto integer_sampler = compiled.program.info.samplers[0];
+          integer_sampler.force_point_filtering = true;
+          integer_sampler.integer_border = true;
+          compiled.program.info.samplers.push_back(integer_sampler);
+        }
+        compiled.program.shader_info_complete = false;
+        CollectShaderInfo(compiled.program, {.compute = &compute});
+        const auto mixed_spirv = ShaderRecompiler::Spirv::EmitProgram(
+            compiled.program, {.compute = &compute});
+        ValidateSpirv("IndirectImageMixedNumeric", mixed_spirv);
+        u32 unsigned_type = 0u, raw_vector = 0u;
+        bool raw_join = false;
+        for (size_t offset = 5; offset < mixed_spirv.size();) {
+          const auto words = std::span<const u32>(mixed_spirv).subspan(
+              offset, mixed_spirv[offset] >> 16u);
+          const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+          if (opcode == spv::OpTypeInt && words[2] == 32u && words[3] == 0u)
+            unsigned_type = words[1];
+          if (opcode == spv::OpTypeVector && words[2] == unsigned_type && words[3] == 4u)
+            raw_vector = words[1];
+          if (opcode == spv::OpPhi && words[1] == raw_vector) raw_join = true;
+          offset += words.size();
+        }
+        Require(test.name, "mixed numeric image result", raw_join &&
+                    tools.Disassemble(mixed_spirv, &text) &&
+                    CountText(text, image_opcode) == (mode == Access::Fetch1D ? 2u : 3u) * halves &&
+                    CountText(text, "OpConvertUToF") == coordinate_conversions,
+                "mixed image classes lost raw result bits or expanded per image");
+        typed.numeric_class = Prospero::TextureNumericClass::Float;
+        if (!fetch) compiled.program.info.samplers.pop_back();
+        compiled.program.shader_info_complete = false;
+        CollectShaderInfo(compiled.program, {.compute = &compute});
+      }
+    }
+    std::printf("[compute] %-32s ok\n", test.name);
+  }
+  test.name = "IndirectImageQueryDimensions";
+  const auto address_position = std::ranges::find_if(*block, [&](const Inst &inst) { return &inst == &address; });
+  auto &query_lod = *block->PrependNewInst(address_position, ValueOpcode::BitwiseAnd32,
+      {Value(&key), Value(1u)});
+  address.SetArg(0, Value(&query_lod));
+  const auto access_position = std::ranges::find_if(*block, [&](const Inst &inst) { return &inst == access; });
+  auto &query = *block->PrependNewInst(access_position, ValueOpcode::ImageQueryDimensions,
+      {Value(&image), Value(&address)}, memory_flag_bits);
+  access->ReplaceUsesWith(Value(&query), false);
+  store.Invalidate();
+  auto &query_offset = block->AppendNewInst(ValueOpcode::IMul32, {Value(&key), Value(16u)});
+  auto &query_store = block->AppendNewInst(ValueOpcode::StoreBufferU32x4,
+      {Value(&output), Value(0u), Value(&query_offset), Value(0u), Value(&query), Value(true)});
+  query_store.SetFlags(MemoryFlags{1u, 0u});
+  compiled.program.memory_info[1].data_dwords = 4u;
+  compiled.program.memory_info[0].image_address_components = 1u;
+  compiled.program.memory_info[0].image_has_mip = false;
+  compiled.program.info.images[3].numeric_class = Prospero::TextureNumericClass::Uint;
+  compiled.program.info.images[4].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  constexpr std::array<std::array<u32, 4>, 7> geometry{{
+      {2, 2, 0, 2}, {2, 2, 0, 2}, {4, 2, 0, 3}, {8, 0, 0, 4},
+      {2, 2, 6, 2}, {2, 2, 0, 2}, {2, 2, 0, 2}}};
+  for (const u32 resource : {2u, 3u, 4u}) {
+    const auto &size = geometry[resource];
+    const u32 height = std::max(size[1], 1u), layers = std::max(size[2], 1u);
+    std::vector<std::vector<u32>> mips;
+    for (u32 mip = 0; mip < size[3]; ++mip)
+      mips.emplace_back(std::max(size[0] >> mip, 1u) * std::max(height >> mip, 1u) * layers * 4u);
+    vulkan.DestroyImage(&textures[resource]);
+    textures[resource] = vulkan.CreateImageMips(test.name, size[0], height,
+        resource == 3u ? vk::Format::eR32G32B32A32Uint : vk::Format::eR32G32B32A32Sfloat,
+        vk::ImageUsageFlagBits::eSampled, mips, 4u, vk::ImageLayout::eShaderReadOnlyOptimal,
+        resource == 3u ? vk::ImageType::e1D : vk::ImageType::e2D,
+        resource == 3u ? vk::ImageViewType::e1D
+                      : resource == 4u ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D, layers);
+  }
+  compiled.program.shader_info_complete = false;
+  CollectShaderInfo(compiled.program, {.compute = &compute});
+  for (const u32 wave_size : {32u, 64u}) {
+    compute.wave_size = wave_size;
+    compute.threads_num[0] = wave_size;
+    compiled.program.wave_size = wave_size;
+    compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+    compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+    ValidateSpirv(test.name, compiled.spirv);
+    const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+    Require(test.name, "typed query body count", tools.Disassemble(compiled.spirv, &text) &&
+                CountText(text, "OpImageQuerySizeLod") == 3u * halves &&
+                CountText(text, "OpImageQueryLevels") == 3u * halves &&
+                compiled.spirv.size() <= 8192u * halves,
+            "indirect geometry queries exceeded their per-type body or emitted-size budget");
+    std::vector<u32> decorated, queried;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto *words = compiled.spirv.data() + offset;
+      const auto op = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (op == spv::OpDecorate && words[2] == spv::DecorationNonUniform) decorated.push_back(words[1]);
+      if (op == spv::OpImageQuerySizeLod) queried.push_back(words[3]);
+      offset += words[0] >> 16u;
+    }
+    Require(test.name, "nonuniform query image", std::ranges::count_if(queried, [&](u32 operand) {
+              return std::ranges::find(decorated, operand) != decorated.end();
+            }) == halves, "the dynamic query image lacks its nonuniform decoration");
+    test.initial.assign(wave_size * 4u, 0xdeadbeefu);
+    test.expected.clear();
+    for (u32 lane = 0; lane < wave_size; ++lane) {
+      const auto resource = lane < ordinals.size() ? root.indirect_resources[ordinals[lane]] : 0u;
+      auto size = geometry[resource];
+      size[0] = std::max(size[0] >> (lane & 1u), 1u);
+      if (size[1] != 0u) size[1] = std::max(size[1] >> (lane & 1u), 1u);
+      test.expected.insert(test.expected.end(), size.begin(), size.end());
+    }
+    auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+    vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, {}, textures);
+    const auto actual = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+    vulkan.DestroyBuffer(&buffer);
+    CompareWords(test, "selected dimensions, mip levels and unmapped root", test.expected, actual);
+  }
+  std::printf("[compute] %-32s ok\n", test.name);
+  query_store.Invalidate();
+  compiled.program.info.images[3].numeric_class = Prospero::TextureNumericClass::Float;
+  vulkan.Device().destroySampler(native_sampler);
+  for (auto &texture : textures) vulkan.DestroyImage(&texture);
+  textures.clear();
+
+  // Reuse the GPU key map, including the separated root slot and unmapped suffix,
+  // for storage writes. Every lane has a distinct texel address.
+  for (auto &inst : *block)
+    if (inst.GetOpcode() == ValueOpcode::ReferenceU32) inst.Invalidate();
+  compiled.program.info.buffers.clear();
+  compiled.program.memory_info.resize(1);
+  auto &store_memory = compiled.program.memory_info[0];
+  store_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  store_memory.image_address_components = 2;
+  store_memory.image_has_mip = false;
+  address.SetArg(0, Value(&key));
+  address.SetArg(2, Value(0u));
+  address.SetArg(3, Value(0u));
+  for (auto &resource : compiled.program.info.images) {
+    resource.resource_class = ImageResourceClass::Storage;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.cube = false;
+    resource.read = false;
+    resource.written = true;
+  }
+  auto &written_x = block->AppendNewInst(ValueOpcode::IAdd32,
+      {Value(&key), Value(0x3f800000u)});
+  auto &texel = block->AppendNewInst(ValueOpcode::CompositeConstructU32x4,
+      {Value(&written_x), Value(0x40000000u), Value(0x40400000u), Value(0x40800000u)});
+  auto &write_exec = block->AppendNewInst(ValueOpcode::INotEqual32,
+      {Value(&key), Value(2u)});
+  block->AppendNewInst(ValueOpcode::ImageWrite,
+      {Value(&image), Value(&address), Value(&texel), Value(&write_exec)}, memory_flag_bits);
+  EliminateDeadCode(compiled.program.blocks);
+  for (const bool mixed : {false, true}) {
+    test.name = mixed ? "IndirectImageStoreMixed" : "IndirectImageStoreHomogeneous";
+    compiled.program.info.images[3].dimension = mixed
+        ? ShaderRecompiler::Decoder::ImageDimension::Dim1D
+        : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    compiled.program.info.images[5].shader_swizzle = mixed ? DstSel(5, 4, 6, 7)
+                                                         : ShaderImageIdentitySwizzle;
+    compiled.program.info.images[6].shader_swizzle = mixed ? 0u : ShaderImageIdentitySwizzle;
+    compiled.program.shader_info_complete = false;
+    CollectShaderInfo(compiled.program, {.compute = &compute});
+    for (const u32 wave_size : {32u, 64u}) {
+      compute.wave_size = wave_size;
+      compute.threads_num[0] = wave_size;
+      compiled.program.wave_size = wave_size;
+      compiled.spirv = ShaderRecompiler::Spirv::EmitProgram(compiled.program, {.compute = &compute});
+      compiled.packed_user_data.resize(compiled.program.bindings.ShaderDataDwords());
+      ValidateSpirv(test.name, compiled.spirv);
+      const auto halves = wave_size > compute.host_subgroup_size ? 2u : 1u;
+      Require(test.name, "native array writes per dimension and swizzle run",
+              tools.Disassemble(compiled.spirv, &text) &&
+                  CountText(text, "OpImageWrite") == (mixed ? 4u : 1u) * halves &&
+                  (mixed || text.find("OpSwitch") == std::string::npos) &&
+                  text.find("StorageImageArrayNonUniformIndexing") != std::string::npos,
+              "storage candidates lost their typed native array runs");
+      std::vector<std::vector<u32>> expected_images;
+      for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
+        expected_images.emplace_back((wave_size + 2u) * 4u, 0x41000000u + resource);
+        const bool one_d = compiled.program.info.images[resource].dimension ==
+            ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+        textures.push_back(vulkan.CreateImageMips(test.name, wave_size + 2u, 1,
+            vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eStorage,
+            {expected_images.back()}, 4u, vk::ImageLayout::eGeneral,
+            one_d ? vk::ImageType::e1D : vk::ImageType::e2D,
+            one_d ? vk::ImageViewType::e1D : vk::ImageViewType::e2D, 1u));
+      }
+      test.initial = {0xdeadbeefu};
+      for (u32 lane = 0; lane < wave_size; ++lane) {
+        const auto resource = root.indirect_resources[lane < ordinals.size() ? ordinals[lane] : 0u];
+        if (lane == 2u) continue;
+        std::array written{0x3f800000u + lane, 0x40000000u, 0x40400000u, 0x40800000u};
+        if (mixed && resource == 5u) std::swap(written[0], written[1]);
+        if (mixed && resource == 6u) written.fill(0u);
+        std::copy(written.begin(), written.end(), expected_images[resource].begin() + lane * 4u);
+      }
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, textures);
+      for (u32 resource = 0; resource < textures.size(); ++resource) {
+        CompareWords(test, "selected writes, inactive lane and neighboring texels",
+                     expected_images[resource], vulkan.ReadImage(test.name, &textures[resource]));
+        vulkan.DestroyImage(&textures[resource]);
+      }
+      textures.clear();
+      vulkan.DestroyBuffer(&buffer);
+      std::printf("[compute] %s wave=%u ok\n", test.name, wave_size);
+    }
   }
 }
 
@@ -33673,6 +42280,82 @@ TestCase ImageStoreR32FloatUsesFormatlessStorageImage() {
   return test;
 }
 
+void CheckSigned16ImageStore(VulkanHarness &vulkan) {
+  constexpr std::array<int32_t, 8> values{INT32_MIN, -32769, -32768, -1, 0, 32767, 32768, INT32_MAX};
+  const u32 alignment = vulkan.RuntimeContext().GetPhysicalDeviceProperties()
+                            .limits.minStorageBufferOffsetAlignment;
+  for (const u32 wave : {32u, 64u}) {
+    for (const bool d16 : {false, true}) {
+      for (const u32 component : {0u, 2u}) {
+        TestCase test;
+        test.name = "Signed16ImageAndBufferStore";
+        const u32 width = wave - 2u;
+        const u32 output = (wave * 4u + alignment - 1u) / alignment * alignment;
+        test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k16SInt);
+        test.user_data[1] |= ((width - 1u) & 3u) << 30u;
+        test.user_data[2] = ((width - 1u) >> 2u) | (1u << 14u);
+        test.has_user_data = test.has_compute_info = true;
+        test.image_descriptor_swizzle = component == 0u ? DstSel(4, 0, 0, 1) : DstSel(0, 0, 4, 1);
+        const std::array<u32, 8> descriptors{0x1000u, 4u << 16u, wave, 0x5204u,
+            0x2000u, 2u << 16u, wave, (u32(Prospero::BufferFormat::k16SInt) << 12u) | 4u};
+        std::copy(descriptors.begin(), descriptors.end(), test.user_data.begin() + 8u);
+        test.storage_buffer_ranges = {{0u, wave * 4u}, {output, wave * 2u}};
+        test.compute_info.wave_size = wave;
+        test.compute_info.threads_num[0] = wave;
+        test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+        test.compute_info.thread_ids_num = 1u;
+        test.compute_info.lds_size_dwords = 0u;
+        test.initial.assign(output / 4u + wave / 2u, 0xdeadbeefu);
+        for (u32 lane = 0; lane < wave; ++lane)
+          test.initial[lane] = d16 ? 0x7a5b0000u | (u32(values[lane % values.size()]) & 0xffffu)
+                                   : u32(values[lane % values.size()]);
+        test.expected = test.initial;
+        std::vector<u32> pixels(width, 0x13571357u), expected = pixels;
+        for (u32 lane = 0; lane < wave; ++lane) {
+          const auto input = values[lane % values.size()];
+          const auto value = d16 ? int32_t(std::bit_cast<int16_t>(uint16_t(input))) : input;
+          const u32 encoded = uint16_t(std::clamp(value, -32768, 32767));
+          const auto set_half = [&](std::vector<u32> &words, u32 index) {
+            const auto shift = (index & 1u) * 16u;
+            words[index / 2u] = (words[index / 2u] & ~(0xffffu << shift)) | (encoded << shift);
+          };
+          set_half(test.expected, output / 2u + lane);
+          if (lane < width) {
+            set_half(expected, lane);
+            if (lane & 1u) set_half(expected, width + lane);
+          }
+        }
+        auto &code = test.code;
+        code = {EncodeMubuf0(0x0c, 0, true, false), EncodeMubuf1(4, 2, 0),
+                EncodeSopp(0x0c, 0), EncodeMubuf0(d16 ? 0x84 : 0x04, 0, true, false),
+                EncodeMubuf1(4, 3, 0), EncodeVop1(0x01, 20, Vgpr(0))};
+        AppendVMovU32(&code, 21, 0u);
+        code.insert(code.end(), {EncodeMimg0(0x08, 1u << component),
+                                 EncodeMimg1(4, 20, 0, 0, false, d16)});
+        AppendVMovU32(&code, 21, 1u);
+        AppendSMovLiteral(&code, 126, 0xaaaaaaaau);
+        AppendSMovLiteral(&code, 127, wave == 64u ? 0xaaaaaaaau : 0u);
+        code.insert(code.end(), {EncodeMimg0(0x08, 1u << component),
+                                 EncodeMimg1(4, 20, 0, 0, false, d16)});
+        AppendEnd(&code);
+        test.opcodes = {ShaderOpcode::IMAGE_STORE};
+        const auto compiled = CompileCase(test, vulkan.SubgroupSize());
+        auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+        auto image = vulkan.CreateImage2D(test.name, width, 2u, vk::Format::eR16Sint,
+            vk::ImageUsageFlagBits::eStorage, pixels, 1u, vk::ImageLayout::eGeneral, vk::Format::eR16Uint);
+        vulkan.Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, &image);
+        CompareWords(test, "signed image saturation, sparse channels, masked lanes and OOB", expected,
+                     vulkan.ReadImage(test.name, &image));
+        CompareWords(test, "shared buffer conversion and adjacent halfwords", test.expected,
+                     vulkan.ReadBuffer(test.name, buffer, test.expected.size()));
+        vulkan.DestroyImage(&image);
+        vulkan.DestroyBuffer(&buffer);
+      }
+    }
+  }
+  std::printf("[compute] %-32s ok\n", "Signed16ImageAndBufferStore");
+}
+
 TestCase ImageStoreR32SintUsesRawUintView() {
   using O = ShaderOpcode;
 
@@ -33761,8 +42444,7 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         StorageUint2DImageBindingName(false), "OpULessThan",
-                         "OpSelect"};
+                         StorageUint2DImageBindingName(false), "UMin"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -33796,6 +42478,54 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
                          StorageUint2DImageBindingName(false)};
   test.forbidden_spirv = {"R32ui"};
+  return test;
+}
+
+template <bool sparse> TestCase ImageStorePackedUnorm() {
+  using O = ShaderOpcode;
+  // Float inputs and exact packed UNorm components, including ties to even.
+  constexpr float values[][3] = {
+      {-1.0f, 0.5f, 2.0f}, {0.0f, 1.0f, 0.5f},
+      {std::bit_cast<float>(0x7fc00000u), std::bit_cast<float>(0x7f800000u),
+       std::bit_cast<float>(0xff800000u)},
+      {0.25f, 0.75f, 0.25f}, {2.5f / 2047.0f, 3.5f / 2047.0f, 2.5f / 1023.0f}};
+  constexpr u32 converted[][3] = {
+      {0, 1024, 1023}, {0, 2047, 512}, {0, 2047, 0}, {512, 1535, 256}, {2, 4, 2}};
+  TestCase test;
+  test.name = sparse ? "ImageStorePackedUnormSparseDmask" : "ImageStorePackedUnormBoundaries";
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k11_11_10UNorm);
+  test.has_user_data = true;
+  test.image_descriptor_swizzle = DstSel(4, 5, 6, 0);
+  test.storage_image_r32ui.assign(16, 0xabcdef01u);
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126));
+  for (u32 i = 0; i < std::size(values); ++i) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovLiteral(&code, 0, std::bit_cast<u32>(values[i][0]));
+    if constexpr (sparse) {
+      AppendVMovLiteral(&code, 1, std::bit_cast<u32>(values[i][2]));
+    } else {
+      AppendVMovLiteral(&code, 1, std::bit_cast<u32>(values[i][1]));
+      AppendVMovLiteral(&code, 2, std::bit_cast<u32>(values[i][2]));
+    }
+    code.push_back(EncodeMimg0(0x08, sparse ? 0x5 : 0x7));
+    code.push_back(EncodeMimg1(0, 20));
+    test.expected_storage_image_r32ui[i] = converted[i][0] |
+        (sparse ? 0u : converted[i][1] << 11u) | (converted[i][2] << 22u);
+  }
+  AppendVMovU32(&code, 20, 3);
+  AppendVMovU32(&code, 21, 3);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  code.push_back(EncodeMimg0(0x08, 0x7));
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeSop1(0x04, 126, 12));
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::IMAGE_STORE, O::S_ENDPGM};
+  test.required_spirv = {"OpImageWrite", "RoundEven", "OpConvertFToU",
+                         StorageUint2DImageBindingName(false)};
+  test.forbidden_spirv = {"OpImageRead", "OpAtomic", "OpTypeSampler", "R32ui"};
   return test;
 }
 
@@ -33980,7 +42710,7 @@ TestCase ImageStoreAndAtomicUseSeparateBindings() {
   return test;
 }
 
-TestCase ImageAtomicVariants() {
+template <bool signed_format = false> TestCase ImageAtomicVariants() {
   using O = ShaderOpcode;
 
   const u32 initial[] = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
@@ -34000,7 +42730,10 @@ TestCase ImageAtomicVariants() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "ImageAtomicVariants";
+  test.name = signed_format ? "ImageAtomicSintVariants" : "ImageAtomicVariants";
+  test.user_data = MakeStorageTextureData(signed_format ? Prospero::BufferFormat::k32SInt
+                                                       : Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
   test.code = code;
   test.expected = {10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
   test.opcodes = {O::V_MOV_B32,          O::IMAGE_ATOMIC_ADD,
@@ -34148,7 +42881,7 @@ TestCase ImageAtomicIntegerGlcAndExec(const ImageAtomicIntegerCase &atomic, bool
   return test;
 }
 
-template <bool max_value> TestCase ImageAtomicSignedMinMax() {
+template <bool max_value, bool signed_format = false> TestCase ImageAtomicSignedMinMax() {
   using O = ShaderOpcode;
   // Input, old value, signed minimum, signed maximum.
   constexpr u32 values[][4] = {
@@ -34161,8 +42894,11 @@ template <bool max_value> TestCase ImageAtomicSignedMinMax() {
       {2, 8, 2, 8}, {8, 2, 2, 8},
   };
   TestCase test;
-  test.name = max_value ? "ImageAtomicSMaxGlcAndExec" : "ImageAtomicSMinGlcAndExec";
-  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  test.name = signed_format
+                  ? (max_value ? "ImageAtomicSMaxSintGlcAndExec" : "ImageAtomicSMinSintGlcAndExec")
+                  : (max_value ? "ImageAtomicSMaxGlcAndExec" : "ImageAtomicSMinGlcAndExec");
+  test.user_data = MakeStorageTextureData(signed_format ? Prospero::BufferFormat::k32SInt
+                                                       : Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
   test.storage_image_r32ui.assign(16, 0);
   test.expected_storage_image_r32ui = test.storage_image_r32ui;
@@ -34340,6 +43076,63 @@ TestCase ImageAtomicGlc0DoesNotReturnOldValue() {
   return test;
 }
 
+void AppendWave64Minimum(std::vector<u32> &code) {
+  code.insert(code.end(), {EncodeSop1(0x04, 24, 126), // Save contributing lanes.
+                          EncodeSop1(0x28, 106, 126)});
+  AppendVop3(&code, 0x101, 13, 193, Vgpr(13), 24); // Inactive lanes contribute UINT_MAX.
+  for (u32 shift : {1u, 2u, 4u, 8u}) {
+    code.push_back(EncodeVop2(0x13, 13, 250, 13));
+    code.push_back(EncodeVop2Dpp(13, 0x110u + shift));
+  }
+  // Exact RDNA2 wave64 reduction from PS 964747887d898821, PCs 0x224..0x244.
+  code.insert(code.end(), {0xd778100cu, 0x0305830du,
+      EncodeVop2(0x13, 13, Vgpr(13), 12), EncodeSop1(0x04, 126, 106),
+      0xd7600006u, 0x00013f0du, 0xd7600007u, 0x00017f0du,
+      EncodeSop2(0x07, 8, 6, 7), EncodeVop1(0x01, 0, 8)});
+}
+
+GraphicsCase GraphicsSparseWaveMinimum() {
+  GraphicsCase test;
+  test.name = "GraphicsSparseWaveMinimum";
+  auto &code = test.fragment_code;
+  code = {EncodeVintrp(0x02, 13, 0, 0, 2)};
+  AppendWave64Minimum(code);
+  code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(0, 0, 0, 0)});
+  AppendEnd(&code);
+  test.pixel_interpolator_settings = {0x00000400u};
+  test.expected_pixel = {0x3e800000u, 0x3e800000u, 0x3e800000u, 0x3e800000u};
+  test.opcodes = {ShaderOpcode::V_MIN_U32, ShaderOpcode::V_PERMLANEX16_B32,
+                  ShaderOpcode::V_READLANE_B32, ShaderOpcode::S_MIN_U32};
+  return test;
+}
+
+TestCase ComputeWave64Minimum(bool masked) {
+  TestCase test;
+  test.name = masked ? "ComputeWave64MinimumMasked" : "ComputeWave64Minimum";
+  auto &code = test.code;
+  code = {EncodeVop2(0x1a, 20, InlineU32(2), 0)};
+  AppendVMovU32(&code, 13, 100);
+  code.push_back(EncodeVop2(0x26, 13, Vgpr(13), 0)); // 100 - lane: minimum is in the upper half.
+  if (masked) {
+    AppendSMovLiteral(&code, 126, 0xfffffffeu);
+    AppendSMovLiteral(&code, 127, 0x7fffffffu);
+  }
+  AppendWave64Minimum(code);
+  AppendBufferStoreDword(&code, 0, 20);
+  AppendEnd(&code);
+  test.initial.assign(64, 0xa5a5a5a5u);
+  test.expected.assign(64, masked ? 38u : 37u);
+  if (masked) test.expected.front() = test.expected.back() = 0xa5a5a5a5u;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.opcodes = {ShaderOpcode::V_MIN_U32, ShaderOpcode::V_PERMLANEX16_B32,
+                  ShaderOpcode::V_READLANE_B32, ShaderOpcode::S_MIN_U32};
+  return test;
+}
+
 GraphicsCase GraphicsInterpolationExport() {
   using O = ShaderOpcode;
 
@@ -34404,6 +43197,26 @@ GraphicsCase GraphicsPackedHalfCentroid() {
   return test;
 }
 
+GraphicsCase GraphicsPerspectiveSample(bool multisample) {
+  GraphicsCase test;
+  test.name = multisample ? "GraphicsPerspectiveSample4x"
+                         : "GraphicsPerspectiveSample1x";
+  test.pixel_perspective_sample_vgpr = 0;
+  test.samples = multisample ? vk::SampleCountFlagBits::e4
+                            : vk::SampleCountFlagBits::e1;
+  test.fragment_code = {
+      EncodeVop2(0x08, 2, Vgpr(0), 0), // I squared
+      EncodeVop2(0x08, 3, Vgpr(1), 1), // J squared
+      EncodeExp0(0x00, 0xf), EncodeExp1(2, 3, 0, 1)};
+  AppendEnd(&test.fragment_code);
+  // The triangle gives I=x/2, J=y/2. Squaring before the 4x resolve
+  // distinguishes sample interpolation (21/256) from pixel-center (1/16).
+  const auto square = std::bit_cast<u32>(multisample ? 21.0f / 256.0f : 1.0f / 16.0f);
+  test.expected_pixel = {square, square, 0x3e800000u, 0x3e800000u};
+  test.opcodes = {ShaderOpcode::V_MUL_F32, ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 GraphicsCase GraphicsPackedHalfInputAlias(bool second_weights) {
   auto test = GraphicsPackedHalfCentroid();
   test.name = second_weights ? "GraphicsPackedHalfAliasSecondWeights"
@@ -34455,6 +43268,38 @@ GraphicsCase GraphicsSmoothRawInputAlias() {
   test.opcodes = {ShaderOpcode::V_INTERP_P1_F32, ShaderOpcode::V_INTERP_P2_F32,
                   ShaderOpcode::V_INTERP_MOV_F32, ShaderOpcode::EXP,
                   ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
+GraphicsCase GraphicsSmoothFlatInputAlias(bool flat_first, bool provoking_last = false) {
+  auto test = GraphicsSmoothRawInputAlias();
+  test.name = provoking_last
+                  ? (flat_first ? "GraphicsFlatSmoothAliasLast" : "GraphicsSmoothFlatAliasLast")
+                  : (flat_first ? "GraphicsFlatSmoothInputAlias" : "GraphicsSmoothFlatInputAlias");
+  test.pixel_custom_interpolation_mask = 0;
+  test.provoking_vtx_last = provoking_last;
+  test.pixel_interpolator_settings = flat_first ? std::vector<u32>{0x400u, 0u}
+                                                : std::vector<u32>{0u, 0x400u};
+  const u32 smooth = flat_first ? 1u : 0u;
+  const u32 flat = smooth ^ 1u;
+  // One export carries smooth values (2,4,8) and packed light IDs (5,7,11).
+  // Flat P0 preserves the ID bits; flat P1/P2 uses the same provoking vertex.
+  test.vertices[4] = 0x3f800005u;
+  test.vertices[10] = 0x3f800007u;
+  test.vertices[16] = 0x3f80000bu;
+  test.fragment_code = {EncodeVintrp(0x00, 0, smooth, 1, 0),
+                        EncodeVintrp(0x01, 0, smooth, 1, 1),
+                        EncodeVintrp(0x02, 1, flat, 2, 2),
+                        EncodeVop2(0x1b, 1, InlineU32(63), 1),
+                        EncodeVop1(0x06, 1, Vgpr(1)),
+                        EncodeVintrp(0x00, 2, flat, 1, 0),
+                        EncodeVintrp(0x01, 2, flat, 1, 1),
+                        EncodeExp0(0x00, 0xf), EncodeExp1(0, 1, 2, 0)};
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = {0x40700000u, provoking_last ? 0x41300000u : 0x40a00000u,
+                         provoking_last ? 0x41000000u : 0x40000000u, 0x40700000u};
+  test.opcodes.insert(test.opcodes.end(),
+                      {ShaderOpcode::V_AND_B32, ShaderOpcode::V_CVT_F32_U32});
   return test;
 }
 
@@ -34515,6 +43360,83 @@ GraphicsCase GraphicsAncillarySampleId() {
   // Average samples 0..3, their signed low two bits, and their second bit.
   test.expected_pixel = {0x3fc00000u, 0xbf000000u, 0x3f000000u, 0x3f800000u};
   return test;
+}
+
+// SPI_BARYC_CNTL[24] selects all-bits mode for uint/bool S_FRONT_FACE;
+// float S_FRONT_FACE and __getSpecialVgprFloat(__v_front_face) leave it clear.
+GraphicsCase GraphicsFrontFaceBits(bool reversed, bool all_bits) {
+  GraphicsCase test;
+  test.name = all_bits ? (reversed ? "GraphicsFrontFaceUintFront" : "GraphicsFrontFaceUintBack")
+                       : (reversed ? "GraphicsFrontFaceFloatFront" : "GraphicsFrontFaceFloatBack");
+  test.pixel_front_face = true;
+  test.pixel_front_face_all_bits = all_bits;
+  // Preserve every raw bit as two finite, exactly representable integer-to-float
+  // results. Directly exporting the integer front value would export a NaN.
+  AppendVop3(&test.fragment_code, 0x148, 4, Vgpr(2), InlineU32(0), InlineU32(16));
+  AppendVop3(&test.fragment_code, 0x148, 5, Vgpr(2), InlineU32(16), InlineU32(16));
+  test.fragment_code.push_back(EncodeVop1(0x06, 0, Vgpr(4)));
+  test.fragment_code.push_back(EncodeVop1(0x06, 1, Vgpr(5)));
+  // Integer inputs test raw zero; float inputs test the sign.
+  test.fragment_code.push_back(EncodeVopc(all_bits ? 0xc2 : 0x04, InlineU32(0), 2));
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 3));
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_BFE_U32, ShaderOpcode::V_CVT_F32_U32,
+                  all_bits ? ShaderOpcode::V_CMP_EQ_U32 : ShaderOpcode::V_CMP_GT_F32,
+                  ShaderOpcode::V_CNDMASK_B32, ShaderOpcode::V_MOV_B32,
+                  ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0x40400000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0xbf800000u, 0x40400000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+  if (reversed) {
+    std::swap_ranges(test.vertices.begin() + 6, test.vertices.begin() + 12,
+                    test.vertices.begin() + 12);
+  }
+  // With the harness's positive-height viewport, the default triangle faces back.
+  const u32 bits = all_bits ? (reversed ? UINT32_MAX : 0u)
+                            : (reversed ? 0x3f800000u : 0xbf800000u);
+  test.expected_pixel = {
+      std::bit_cast<u32>(static_cast<float>(bits & 0xffffu)),
+      std::bit_cast<u32>(static_cast<float>(bits >> 16u)),
+      reversed ? 0u : 0x3f800000u, 0x3f800000u};
+  return test;
+}
+
+void CheckPixelFrontFaceModes() {
+  constexpr const char *name = "PixelFrontFaceModes";
+  static const std::array<u32, 1> code = {EncodeSopp(0x01)};
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(code.data());
+  ShaderMapUserData(regs.ps_regs.data_addr,
+      {.type = Prospero::ShaderBinaryType::kPs,
+       .code_size_bytes = static_cast<u32>(sizeof(code))});
+  HW::ShaderRegisters sh{};
+  sh.ps_input_ena = sh.ps_input_addr = 0x1002u;
+  const std::array<Prospero::ColorComponentMapping, 8> export_mapping{};
+  std::vector<u32> float_key;
+  for (bool all_bits : {false, true}) {
+    for (u32 other_bits : {0u, 0x120u}) {
+      sh.baryc_cntl = (all_bits ? 0x01000000u : 0u) | other_bits;
+      ShaderPixelInputInfo pixel{};
+      (void)PrepareProgram(regs, sh, export_mapping, pixel);
+      Require(name, "register format decoding",
+              pixel.ps_front_face && pixel.ps_front_face_all_bits == all_bits &&
+                  pixel.ps_system_input_base == 2u,
+              "SPI_BARYC_CNTL[24] did not select the front-face format");
+      std::vector<u32> key;
+      BuildStageStaticKey(pixel, key);
+      if (!all_bits && other_bits == 0u) {
+        float_key = key;
+      }
+      Require(name, "format specialization",
+              (key != float_key) == all_bits,
+              "front-face formats must have distinct shader keys and ignore unrelated bits");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 GraphicsCase GraphicsFlatInterpolatorExport() {
@@ -34727,6 +43649,38 @@ GraphicsCase GraphicsBranchPathFinalVmExportDiscardsInactiveExec() {
            O::S_CBRANCH_SCC1, O::S_MOV_B32, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsObjectPrimitiveId(bool discard) {
+  auto test = discard ? GraphicsNullVmExportDiscardsInactiveExec()
+                      : GraphicsDirectSgprPushConstantExport();
+  test.name = discard ? "GraphicsObjectPrimitiveIdDiscard"
+                      : "GraphicsObjectPrimitiveId";
+  test.width = 2;
+  test.layers = 2;
+  test.object_ids = {0x0001ffffu, 0xffffffffu};
+  // Each triangle covers one pixel; the second instance renders the same pair
+  // into layer 1, making primitive progression and instance reset observable.
+  for (const auto &position : std::array<std::array<float, 2>, 6>{{
+           {-1.0f, -1.0f}, {0.0f, -1.0f}, {-0.5f, 1.0f},
+           {0.0f, -1.0f}, {1.0f, -1.0f}, {0.5f, 1.0f}}}) {
+    test.vertices.insert(test.vertices.end(),
+                         {std::bit_cast<u32>(position[0]),
+                          std::bit_cast<u32>(position[1]), 0, 0, 0, 0x3f800000u});
+  }
+  const auto color = test.expected_pixel;
+  test.expected_pixel.clear();
+  for (u32 object_id : test.object_ids) {
+    for (u32 pixel = 0; pixel < test.width * test.layers; ++pixel) {
+      test.expected_pixel.insert(test.expected_pixel.end(), color.begin(), color.end());
+    }
+    // RT7 is sparse and scalar uint, not a remapped or float PS export.
+    for (u32 layer = 0; layer < test.layers; ++layer) {
+      test.expected_pixel.push_back(discard ? 0xfeedfaceu : object_id);
+      test.expected_pixel.push_back(discard ? 0xfeedfaceu : object_id + 1u);
+    }
+  }
+  return test;
+}
+
 TestCase MultipleWorkitemsGlobalId() {
   using O = ShaderOpcode;
 
@@ -34821,14 +43775,21 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarZeroBitOps);
   AddCase(ScalarBitcmpB64DynamicOperands);
   AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
+  for (const u32 bits : {8u, 16u}) {
+    cases.push_back(ScalarSextMasks(bits, 32));
+    cases.push_back(ScalarSextMasks(bits, 64));
+  }
+  AddCase(ScalarSextConstantsAndAliases);
   cases.push_back(ScalarBrevB64OperandsAndMasks(32));
   cases.push_back(ScalarBrevB64OperandsAndMasks(64));
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(ScalarDynamic64BitOps);
   cases.push_back(ScalarAshrI64Edges(false));
   cases.push_back(ScalarAshrI64Edges(true));
   AddCase(ScalarAshrI64OperandsAndAliases);
@@ -34852,6 +43813,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMoves);
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
+  AddCase(VectorIntegerExtremaRuntimeEdges);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaBfrevSourceSelectors);
   AddCase(Vop1SdwaFfbhCapturedScalarLowWordSource);
@@ -34859,18 +43821,31 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
+  cases.push_back(Vop2SdwaBitwiseByteDestinations(32));
+  cases.push_back(Vop2SdwaBitwiseByteDestinations(64));
+  cases.push_back(Vop2SdwaLshlrevByteDestinations(32));
+  cases.push_back(Vop2SdwaLshlrevByteDestinations(64));
   AddCase(Vop1SdwaMovByteDestinations);
+  cases.push_back(Vop1SdwaMovByteSources(32));
+  cases.push_back(Vop1SdwaMovByteSources(64));
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(32));
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(32));
+  cases.push_back(Vop2SdwaMinI32CapturedByte0(64));
+  cases.push_back(Vop2SdwaMulI24Destinations(32));
+  cases.push_back(Vop2SdwaMulI24Destinations(64));
+  cases.push_back(Vop2SdwaMulU24Destinations(32));
+  cases.push_back(Vop2SdwaMulU24Destinations(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
-  AddCase(Vop2SdwaOrByteDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
+  AddCase(Vop3F32ClampFlushesNaN);
+  AddCase(Vop3Min3U16CapturedAndSelectors);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -34878,8 +43853,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
+  AddCase(VectorBfmDropsMaskBitsPastBit31);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
+  AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
@@ -34895,8 +43872,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(Vop3pIntegerNegationCapturedAndSelectedHalves);
+  AddCase(Vop3pInt16Ops);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
+  AddCase(CvtPkrtzF16F32RuntimeEdges);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
@@ -34917,9 +43896,19 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));
-  cases.push_back(VectorDpp8Captured(true));
+  for (const u32 wave_size : {32u, 64u})
+    for (const bool fi : {false, true})
+      cases.push_back(VectorDpp8Captured(true, wave_size, fi));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
+  cases.push_back(VectorDppRowShare(32));
+  cases.push_back(VectorDppRowShare(64));
+  cases.push_back(VectorDppMirrorAndRotate(32));
+  cases.push_back(VectorDppMirrorAndRotate(64));
+  cases.push_back(VectorReadFirstLaneExecMasks(32));
+  cases.push_back(VectorReadFirstLaneExecMasks(64));
+  cases.push_back(ComputeWave64Minimum(false));
+  cases.push_back(ComputeWave64Minimum(true));
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
@@ -34934,10 +43923,14 @@ std::vector<TestCase> MakeCases() {
   AddCase(MadMixF16NegHiIsAbsAndNegIsIndependent);
   AddCase(VectorVop3FmaF16UsesRdna2Opcode34b);
   AddCase(FloatInlineConstantF16UsesNumericValue);
+  AddCase(Vop3Int16Ops);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
-  AddCase(VectorMed3F32NanUsesMin3Path);
+  cases.push_back(VectorMed3F32NanUsesMin3Path(32));
+  cases.push_back(VectorMed3F32NanUsesMin3Path(64));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(32));
+  cases.push_back(VectorMinMaxF32RuntimeEdges(64));
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
@@ -34966,15 +43959,21 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
-  AddCase(VectorVop3CompareEqF64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);
   AddCase(VectorVopcCmpxNeU64CapturedExecMask);
   AddCase(VectorVop3CmpxNeI64CapturedExecMask);
   AddCase(VectorCompareClassF32);
+  cases.push_back(VectorCompareClassF32ImmediateAndDynamicMasks(32));
+  cases.push_back(VectorCompareClassF32ImmediateAndDynamicMasks(64));
   AddCase(VectorVopcSdwaCmpxClassF32CapturedExecMask);
+  cases.push_back(VectorCmpClassF16(32));
+  cases.push_back(VectorCmpClassF16(64));
+  cases.push_back(VectorCmpxClassF16(32));
+  cases.push_back(VectorCmpxClassF16(64));
   AddCase(VectorCompareF16Ops);
+  AddCase(VectorCompareI16U16Ops);
   AddCase(Wave32VccMasksPreserveOtherHalf);
   AddCase(Vop2SdwaCndmaskSourceModifier);
   AddCase(Vop2SdwaCndmaskCapturedByte3Source);
@@ -35003,12 +44002,18 @@ std::vector<TestCase> MakeCases() {
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 4); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 4); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32, true); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64, true); });
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeReadsDeviceClock);
+  AddCase(ScalarMemRealtimeCapturedPlaceholder);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
-  AddCase(ScalarLoadAlignsComponents);
+  AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
@@ -35019,8 +44024,13 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
-  AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  cases.push_back(BufferOffsetsUsePackedWords(false));
+  cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
+  for (const auto opcode : {ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI})
+    cases.push_back(BufferLoadD16Captured(opcode));
+  for (const u32 wave : {32u, 64u})
+    cases.push_back(BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
   for (const u32 component : {4u, 2u, 0u}) {
     cases.push_back(BufferSubwordLoadsAtHostOffset(2, component, false));
   }
@@ -35031,6 +44041,12 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(BufferSubwordStoresAtHostOffset(2));
   cases.push_back(BufferSubwordStoresAtHostOffset(1));
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
+  for (const u32 wave : {32u, 64u}) {
+    for (const u32 prefix : {0u, 4u})
+      cases.push_back(CoherentBufferLoadDwordx2Bounds(wave, prefix));
+    cases.push_back(CoherentBufferPairContention(wave));
+  }
+  AddCase(CoherentBufferLoadDwordx2Swizzled);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
@@ -35038,6 +44054,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
+  AddCase(BufferLoadFormatXGpuSelectedDescriptors64);
+  AddCase(BufferLoadUshortGpuSelectedDescriptors);
+  AddCase(BufferLoadUshortGpuSelectedDescriptors64);
+  AddCase(BufferLoadUbyteGpuSelectedDescriptors);
+  AddCase(BufferLoadUbyteGpuSelectedDescriptors64);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -35046,6 +44067,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadFormatXyRejectsPartialRecord);
   AddCase(BufferStoreFormatXyRejectsPartialRecord);
   AddCase(BufferStoreVariants);
+  for (bool masked : {false, true}) {
+    cases.push_back(BufferStoreD16Hi(false, masked, 64));
+    for (u32 wave_size : {32u, 64u})
+      cases.push_back(BufferStoreD16Hi(true, masked, wave_size));
+  }
   AddCase(BufferFormatVariants);
   AddCase(BufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(BufferLoadFormatXyzwResource32_32FloatAppliesXy01);
@@ -35060,6 +44086,15 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
+  for (auto &test : BufferLoadFormatD16XCases()) {
+    cases.push_back(std::move(test));
+  }
+  for (auto &test : BufferLoadFormatD16VectorCases()) {
+    cases.push_back(std::move(test));
+  }
+  for (auto &test : BufferStoreFormatD16Cases()) {
+    cases.push_back(std::move(test));
+  }
   for (auto &test : FormattedStoreConversionCases()) {
     cases.push_back(std::move(test));
   }
@@ -35102,6 +44137,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(TBufferStoreFormatXy88IntegerComponents);
   AddCase(TBufferLoadFormatXy88IntegerComponents);
   AddCase(TBufferStoreVariants);
+  cases.push_back(FlatLoadDlcCaptured(32));
+  cases.push_back(FlatLoadDlcCaptured(64));
+  AddCase(FlatStoreSlcCaptured);
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   cases.push_back(GlobalLoadShortD16Captured(32));
@@ -35121,6 +44159,9 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsReadWriteVariants);
+  for (u32 wave_size : {32u, 64u})
+    for (bool gds : {false, true})
+      cases.push_back(DsReadWriteFullRegionAddress(wave_size, gds));
   AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
   AddCase(DsWriteB8D16HiWritesByteTwo);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
@@ -35129,6 +44170,10 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(DsAppendAllocatesAcrossWaves(32));
   cases.push_back(DsAppendAllocatesAcrossWaves(64));
   AddCase(DsAppendUsesEncodedGdsSelector);
+  for (u32 wave_size : {32, 64}) {
+    cases.push_back(DsOrderedCountAddressAndExec(wave_size, false));
+    cases.push_back(DsOrderedCountAddressAndExec(wave_size, true));
+  }
   AddCase(DsAppendConsumeGdsRegionBounds);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
@@ -35144,6 +44189,8 @@ std::vector<TestCase> MakeCases() {
     cases.push_back(DsMaskedOrContention(wave_size));
   }
   AddCase(DsAtomicReturnVariants);
+  AddCase(DsAtomicReturn64);
+  AddCase(DsCompareStoreReturn32);
   for (bool add : {false, true}) {
     cases.push_back(DsAtomic64Bounds(add));
     for (u32 wave_size : {32, 64}) {
@@ -35151,8 +44198,11 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(BufferAtomicAndX2GlcAndExec);
+  AddCase(BufferAtomicAddX2GlcAndExec);
   AddCase(ImageAtomicSignedMinMax<false>);
   AddCase(ImageAtomicSignedMinMax<true>);
+  AddCase(ImageAtomicSignedMinMax<false, true>);
+  AddCase(ImageAtomicSignedMinMax<true, true>);
   for (bool decrement : {false, true}) {
     for (bool gds : {false, true}) {
       cases.push_back(DsBoundedAtomicBoundaries(decrement, gds));
@@ -35186,11 +44236,20 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
-  AddCase(ImageLoadR32SintUsesSignedSampledImage);
+  AddCase(ImageLoadSintUsesSignedSampledImage<false>);
+  AddCase(ImageLoadSintUsesSignedSampledImage<true>);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageLoadPackedUnorm<false, false>);
+  AddCase(ImageLoadPackedUnorm<false, true>);
+  AddCase(ImageLoadPackedUnorm<true, false>);
+  AddCase(ImageLoadPackedUnorm<true, true>);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
-  AddCase(ImageSampleUScaled8<false>);
-  AddCase(ImageSampleUScaled8<true>);
+  AddCase(ImageSamplePackedUnormBilinear<false>);
+  AddCase(ImageSamplePackedUnormBilinear<true>);
+  AddCase(ImageSamplePacked8<false>);
+  AddCase(ImageSamplePacked8<true>);
+  AddCase(ImageSamplePacked8<false, true>);
+  AddCase(ImageLoadDepthBits);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);
   AddCase(ImageGather2DInstructionWith1DDescriptor);
@@ -35213,10 +44272,15 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGatherLodPerLane<6>);
   AddCase(ImageGatherLodPerLane<7>);
   AddCase(ImageGatherLodPerLane<8>);
+  AddCase(ImageGatherLodPerLane<9>);
+  AddCase(ImageGatherLodPerLane<10>);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
-  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
+  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>);
+  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
+  AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
+  AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -35234,12 +44298,15 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreR32UintUsesFormatlessStorageImage);
   AddCase(ImageStorePackedUintSaturatesChannels);
   AddCase(ImageStorePackedUintHonorsSparseDmask);
+  AddCase(ImageStorePackedUnorm<false>);
+  AddCase(ImageStorePackedUnorm<true>);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
   AddCase(ImageAtomicCompareSwapGlcAndExec);
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
-  AddCase(ImageAtomicVariants);
+  AddCase(ImageAtomicVariants<>);
+  AddCase(ImageAtomicVariants<true>);
   for (const auto &atomic : ImageAtomicIntegerCases) {
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, false));
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, true));
@@ -35259,15 +44326,26 @@ std::vector<TestCase> MakeCases() {
 
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
+      GraphicsSparseWaveMinimum(),
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
       GraphicsPackedHalfCentroid(),
+      GraphicsPerspectiveSample(false),
+      GraphicsPerspectiveSample(true),
       GraphicsPackedHalfInputAlias(false),
       GraphicsPackedHalfInputAlias(true),
       GraphicsSmoothRawInputAlias(),
+      GraphicsSmoothFlatInputAlias(false),
+      GraphicsSmoothFlatInputAlias(true),
+      GraphicsSmoothFlatInputAlias(false, true),
+      GraphicsSmoothFlatInputAlias(true, true),
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
+      GraphicsFrontFaceBits(false, false),
+      GraphicsFrontFaceBits(true, false),
+      GraphicsFrontFaceBits(false, true),
+      GraphicsFrontFaceBits(true, true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),
@@ -35276,6 +44354,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsMrt0OffVmExportDiscardsInactiveExec(),
       GraphicsFinalVmExportSupersedesEarlierVmMask(),
       GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
+      GraphicsObjectPrimitiveId(false),
+      GraphicsObjectPrimitiveId(true),
   };
 }
 
@@ -35304,7 +44384,7 @@ void CheckComputeLdsLimit(VulkanHarness &vulkan) {
   regs.cs_regs.num_thread_y = 1;
   regs.cs_regs.num_thread_z = 1;
   regs.cs_regs.wave_size = 32;
-  PipelineCache cache(graphics);
+  PipelineCache cache(graphics, nullptr);
   ShaderProgram previous;
   uint16_t previous_units = 0;
   for (const auto units : {static_cast<uint16_t>(limit_units - 1u), limit_units,
@@ -35478,6 +44558,30 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "excess invocation coverage was accepted as a fill");
+  runtime_resources.uniform_fill.bounded_elements = 65;
+  runtime_resources.buffers[0].dwords[2] = 65;
+  for (u32 oob = 0; oob < 4; ++oob) {
+    runtime_resources.buffers[0].dwords[3] = 0x14204u | (oob << 28u);
+    Require("Ps5GameExampleImageClear", "bounded final workgroup and RDNA2 OOB mode",
+            ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
+                                     packed_clear, size) == (oob != 3),
+            "explicit coverage did not respect RDNA2 element bounds");
+  }
+  runtime_resources.buffers[0].dwords[3] = 0x14204u;
+  Require("Ps5GameExampleImageClear", "bounded insufficient dispatch",
+          !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a bound was mistaken for actual invocation coverage");
+  Require("Ps5GameExampleImageClear", "bounded index wrap",
+          !ResolveComputeBufferFill(compute, 0x04000001u, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a wrapped invocation index was accepted as complete coverage");
+  runtime_resources.uniform_fill.bounded_elements = 64;
+  Require("Ps5GameExampleImageClear", "bounded incomplete destination",
+          !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
+                                    packed_clear, size),
+          "a shader bound smaller than the destination was accepted as a fill");
+  runtime_resources = scalar;
   auto alias = scalar.buffers.front();
   runtime_resources.buffers.push_back(alias);
   Require("Ps5GameExampleImageClear", "aliased scalar input",
@@ -35538,6 +44642,58 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
+struct TessellationStage {
+  // Immediate byte addresses of the lowered accesses, per attribute kind.
+  std::map<ShaderRecompiler::IR::TessellationAttribute, std::set<u32>> addresses;
+  std::string assembly;
+};
+
+TessellationStage CompileTessellationStage(const char *name, const std::vector<u32> &code,
+                                           ShaderType stage,
+                                           const ShaderTessellationInputInfo &tess) {
+  using namespace ShaderRecompiler;
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = stage;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = stage;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(code, options);
+  TessellationStage result;
+  for (const auto *block : translated.program.blocks) {
+    for (const auto &inst : *block) {
+      if ((inst.GetOpcode() == IR::ValueOpcode::GetTessellationAttribute ||
+           inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute) &&
+          inst.Arg(1).IsImmediate()) {
+        result.addresses[static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())].insert(
+            inst.Arg(1).U32());
+      }
+    }
+  }
+  auto compiled = CompileProgram(std::move(translated), options, {});
+  ValidateSpirv(name, compiled.spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  Require(name, "disassembly", tools.Disassemble(compiled.spirv, &result.assembly),
+          "failed to disassemble tessellation shader");
+  return result;
+}
+
+// Whether a Patch uvec4[vectors] variable of a storage class sits at a Location.
+bool HasPatchInterface(const std::string &assembly, const std::string &storage, u32 vectors,
+                       u32 location) {
+  const auto variable = " = OpVariable %_ptr_" + storage + "__arr_v4uint_uint_" +
+                        std::to_string(vectors) + " " + storage + "\n";
+  const auto end = assembly.find(variable);
+  if (end == std::string::npos) {
+    return false;
+  }
+  const auto begin = assembly.rfind('%', end);
+  const auto id = assembly.substr(begin, end - begin);
+  return assembly.find("OpDecorate " + id + " Patch\n") != std::string::npos &&
+         assembly.find("OpDecorate " + id + " Location " + std::to_string(location) + "\n") !=
+             std::string::npos;
+}
+
 void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   using namespace ShaderRecompiler;
   const bool multiplied_stride = hs_stride == 112;
@@ -35546,8 +44702,7 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   const u32 relative_patch = multiplied_stride ? 28 : 32;
   const u32 output_address = multiplied_stride ? 31 : 35;
   const u32 input_address = multiplied_stride ? 25 : 29;
-  std::array<std::vector<u32>, 3> code;
-  auto &local = code[0];
+  std::vector<u32> local, control, evaluation;
   // The fused LS addresses one control point using its v3 ordinal.
   local.push_back(EncodeVop2(0x0b, local_address, 255u, 3));
   local.push_back(ls_stride);
@@ -35556,7 +44711,6 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   local.push_back(EncodeSop1(0x20, 0, 6));
   local.push_back(0xffffffffu); // Shader footer is not executable after LS handoff.
 
-  auto &control = code[1];
   AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
   AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
   control.push_back(EncodeSopp(0x0a));
@@ -35615,7 +44769,6 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
   }
   AppendEnd(&control);
 
-  auto &evaluation = code[2];
   AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
   evaluation.push_back(3 * hs_stride);
   evaluation.push_back(EncodeMubuf0(0x0d, 28));
@@ -35631,96 +44784,226 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          AnalyzeTessellationPrograms(local, control, tess) &&
-              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
-  constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
-                              ShaderType::TessellationEvaluation};
-  for (u32 stage = 0; stage < stages.size(); stage++) {
-    ShaderVertexInputInfo vertex;
-    vertex.logical_stage = stages[stage];
-    vertex.tess = tess;
-    CompileOptions options;
-    options.stage = stages[stage];
-    options.input_info.vertex = &vertex;
-    auto translated = TranslateProgram(code[stage], options);
-    std::set<u32> local_offsets, evaluation_offsets, factor_offsets, patch_offsets;
-    for (const auto *block : translated.program.blocks) {
-      for (const auto &inst : *block) {
-        if (inst.GetOpcode() != IR::ValueOpcode::GetTessellationAttribute &&
-            inst.GetOpcode() != IR::ValueOpcode::SetTessellationAttribute) {
-          continue;
-        }
-        if (!inst.Arg(1).IsImmediate()) {
-          continue;
-        }
-        switch (static_cast<IR::TessellationAttribute>(inst.Arg(0).U32())) {
-        case IR::TessellationAttribute::LocalOutput:
-          local_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::EvaluationInput:
-          evaluation_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::Factor:
-          factor_offsets.insert(inst.Arg(1).U32());
-          break;
-        case IR::TessellationAttribute::PatchOutput:
-          patch_offsets.insert(inst.Arg(1).U32());
-          break;
-        default:
-          break;
-        }
-      }
-    }
-    Require(name, "separate DS offsets", stage != 0 || local_offsets == std::set<u32>{4, 12},
-            "DS_WRITE2 must preserve both independently encoded offsets");
-    Require(name, "offchip component addressing",
-            stage != 2 ||
-                evaluation_offsets == std::set<u32>{28, 2 * hs_stride + 28},
-            "TES control point and component offsets must survive lowering");
-    Require(name, "triangle factor layout",
-            stage != 1 || factor_offsets == std::set<u32>{0, 4, 8, 12},
-            "the four packed guest factors must retain their order");
-    Require(name, "predicated patch addresses",
-            stage != 1 || patch_offsets == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
-            "CP0 patch stores must use the address assigned on their active predicate");
-    auto result = CompileProgram(std::move(translated), options, {});
-    ValidateSpirv(name, result.spirv);
-    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
-    std::string assembly;
-    Require(name, "disassembly", tools.Disassemble(result.spirv, &assembly),
-            "failed to disassemble tessellation shader");
-    Require(name, "native local inputs",
-            stage != 0 || (assembly.find("VertexIndex") != std::string::npos &&
-                           assembly.find("InstanceIndex") != std::string::npos),
-            "LS v2/v5 must read native vertex/instance indices");
-    Require(name, "control point lane",
-            stage != 1 || (assembly.find("InvocationId") != std::string::npos &&
-                           assembly.find("SubgroupLocalInvocationId") == std::string::npos),
-            "HS lane masks must use control point invocation IDs");
-    Require(name, "control point barrier",
-            stage != 1 || (assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
-                           assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos),
-            "HS barriers must match GLSL450 control point synchronization semantics");
-    Require(name, "factor builtins",
-            stage != 1 || (assembly.find("TessLevelOuter") != std::string::npos &&
-                           assembly.find("TessLevelInner") != std::string::npos),
-            "triangle factors require outer[4] and inner[2] Vulkan builtins");
-    Require(name, "native domain and winding",
-            stage != 2 || (assembly.find("TessCoord") != std::string::npos &&
-                           assembly.find("Triangles") != std::string::npos &&
-                           assembly.find("SpacingFractionalOdd") != std::string::npos &&
-                           assembly.find("VertexOrderCw") != std::string::npos),
-            "TES must preserve guest triangle domain, partitioning, and winding");
-  }
+  Require(name, "patch constant range", tess.patch_base == 0x7fc0u && tess.patch_size == 52u,
+          "CP0 patch stores must reflect the HS patch constant range");
+
+  using Attribute = IR::TessellationAttribute;
+  auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
+  auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  Require(name, "separate DS offsets", ls.addresses[Attribute::LocalOutput] == std::set<u32>{4, 12},
+          "DS_WRITE2 must preserve both independently encoded offsets");
+  Require(name, "offchip component addressing",
+          ds.addresses[Attribute::EvaluationInput] == std::set<u32>{28, 2 * hs_stride + 28},
+          "TES control point and component offsets must survive lowering");
+  Require(name, "triangle factor layout",
+          hs.addresses[Attribute::Factor] == std::set<u32>{0, 4, 8, 12},
+          "the four packed guest factors must retain their order");
+  Require(name, "predicated patch addresses",
+          hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7fc0, 0x7fd0, 0x7fe0, 0x7ff0},
+          "CP0 patch stores must use the address assigned on their active predicate");
+  Require(name, "native local inputs",
+          ls.assembly.find("VertexIndex") != std::string::npos &&
+              ls.assembly.find("InstanceIndex") != std::string::npos,
+          "LS v2/v5 must read native vertex/instance indices");
+  Require(name, "control point lane",
+          hs.assembly.find("InvocationId") != std::string::npos &&
+              hs.assembly.find("SubgroupLocalInvocationId") == std::string::npos,
+          "HS lane masks must use control point invocation IDs");
+  Require(name, "control point barrier",
+          hs.assembly.find("OpMemoryModel Logical GLSL450") != std::string::npos &&
+              hs.assembly.find("OpControlBarrier %uint_2 %uint_4 %uint_0") != std::string::npos,
+          "HS barriers must match GLSL450 control point synchronization semantics");
+  Require(name, "factor builtins",
+          hs.assembly.find("TessLevelOuter") != std::string::npos &&
+              hs.assembly.find("TessLevelInner") != std::string::npos,
+          "triangle factors require outer[4] and inner[2] Vulkan builtins");
+  Require(name, "native domain and winding",
+          ds.assembly.find("TessCoord") != std::string::npos &&
+              ds.assembly.find("Triangles") != std::string::npos &&
+              ds.assembly.find("SpacingFractionalOdd") != std::string::npos &&
+              ds.assembly.find("VertexOrderCw") != std::string::npos,
+          "TES must preserve guest triangle domain, partitioning, and winding");
   std::printf("[host]    %-32s ok\n", name);
+}
+
+// PPSA25468: CP0 writes patch constants below the 32 KiB offchip ring end
+// through mul24 addresses that reuse data VGPRs under nested EXEC masks, and
+// the TES reads them back. As in God of War Ragnarok, the HS reads its next LS
+// record, loops on a v_cmpx header and CP0 reads back another CP's outputs.
+void CheckTessellationPatchConstants() {
+  using namespace ShaderRecompiler;
+  using Attribute = IR::TessellationAttribute;
+  constexpr const char *name = "TessellationPatchConstants";
+  constexpr u32 ls_stride = 48, hs_stride = 80, patch_stride = 0xf0;
+  std::vector<u32> local;
+  // One 128-bit DS store writes the LS record.
+  local.push_back(EncodeVop2(0x0b, 20, 255u, 3)); // v_mul_u32_u24 v20, ls_stride, v3
+  local.push_back(ls_stride);
+  local.push_back(EncodeDs0(0xdf, 16)); // ds_write_b128 v20, v[2:5] offset:16
+  local.push_back(EncodeDs1(0, 2, 20));
+  local.push_back(EncodeSop1(0x20, 0, 6));
+
+  const auto make_control = [&](bool divergent, bool carried) {
+    std::vector<u32> control;
+    AppendVop3(&control, 0x365, 0, 193u, InlineU32(0));
+    AppendVop3(&control, 0x366, 0, 193u, Vgpr(0));
+    control.push_back(EncodeVopc(0xd1, 249u, 3));
+    control.push_back(EncodeVopcSdwa(0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0, 1));
+    const auto skip_control = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    AppendVop3(&control, 0x148, 16, Vgpr(1), InlineU32(8), InlineU32(5));
+    control.push_back(EncodeVop2(0x1b, 50, 255u, 1)); // v_and_b32 v50, 0xff, v1
+    control.push_back(0xffu);
+    control.push_back(EncodeVop2(0x0b, 0, 255u, 16)); // v_mul_u32_u24 v0, hs_stride, v16
+    control.push_back(hs_stride);
+    control.push_back(EncodeVopc(0xc4, InlineU32(2), 16));    // v_cmp_gt_u32 vcc, 2, v16
+    control.push_back(EncodeVop2(0x25, 1, InlineU32(1), 16)); // v_add_nc_u32 v1, 1, v16
+    control.push_back(EncodeVop2(0x01, 1, InlineU32(0), 1));  // v_cndmask_b32 v1, 0, v1, vcc
+    AppendVop3(&control, 0x169, 1, Vgpr(1), 255u); // v_mul_lo_u32 v1, v1, ls_stride
+    control.push_back(ls_stride);
+    AppendVop3(&control, 0x143, 17, 255u, Vgpr(50), Vgpr(0));
+    control.push_back(3 * hs_stride);
+    AppendVop3(&control, 0x143, 14, 255u, Vgpr(50), Vgpr(1));
+    control.push_back(3 * ls_stride);
+    // ds_read2_b32 v[10:11], v14 offset0:4 offset1:5
+    control.push_back(EncodeDs0(0x37, (5u << 8u) | 4u));
+    control.push_back(EncodeDs1(10, 0, 14));
+    control.push_back(EncodeMubuf0(0x1d, 16));
+    control.push_back(EncodeMubuf1(10, 2, 17, 2));
+    // v17 stays affine at the forward branch's join unless the paths diverge.
+    control.push_back(EncodeVopc(0x01, InlineU32(0), 10)); // v_cmp_lt_f32 vcc, 0, v10
+    const auto skip_scale = control.size();
+    control.push_back(0u);                                 // s_cbranch_vccz
+    control.push_back(EncodeVop1(0x01, 12, 242u));         // v_mov_b32 v12, 1.0
+    if (divergent) {
+      control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
+    }
+    control[skip_scale] = EncodeSopp(0x06, control.size() - skip_scale - 1u);
+    control.push_back(EncodeSop1(0x04, 6, 126));       // s_mov_b64 s[6:7], exec
+    control.push_back(EncodeSMovB32(5, InlineU32(0))); // s_mov_b32 s5, 0
+    const auto loop = control.size();
+    control.push_back(EncodeVopc(0xd1, 5, 16)); // v_cmpx_lt_u32 s5, v16
+    const auto exit_loop = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeMubuf0(0x1c, 24));
+    control.push_back(EncodeMubuf1(12, 2, 17, 2));
+    // Only the back edge shows a loop-carried v17 at the store above.
+    if (carried) {
+      control.push_back(EncodeVop2(0x25, 17, InlineU32(4), 17)); // v_add_nc_u32 v17, 4, v17
+    }
+    control.push_back(EncodeVop2(0x25, 13, InlineU32(1), 13)); // v_add_nc_u32 v13, 1, v13
+    control.push_back(EncodeSop2(0x00, 5, 5, InlineU32(1)));   // s_add_u32 s5, s5, 1
+    control.push_back(EncodeSopp(0x02, loop - control.size() - 1u)); // s_branch
+    control[exit_loop] = EncodeSopp(0x08, control.size() - exit_loop - 1u);
+    control.push_back(EncodeSop1(0x04, 126, 6)); // s_mov_b64 exec, s[6:7]
+    control.push_back(EncodeSopp(0x0a));         // s_barrier
+    // CP0 reuses data VGPR v10 for the ring address 0x8000 - (patch + 1) * 0xf0.
+    control.push_back(EncodeVopc(0xd4, InlineU32(1), 16)); // v_cmpx_gt_u32 1, v16
+    const auto skip_patch = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeVop2(0x0b, 11, 255u, 50)); // v_mul_u32_u24 v11, 3 * hs_stride, v50
+    control.push_back(3 * hs_stride);
+    // buffer_load_dwordx2 v[11:12], v11, s[8:11], s2 offen offset:hs_stride + 16 (CP1)
+    control.push_back(EncodeMubuf0(0x0d, hs_stride + 16));
+    control.push_back(EncodeMubuf1(11, 2, 11, 2));
+    control.push_back(EncodeVop2(0x25, 10, InlineU32(1), 50)); // v_add_nc_u32 v10, 1, v50
+    control.push_back(EncodeVop2(0x0b, 10, 255u, 10));         // v_mul_u32_u24 v10, 0xf0, v10
+    control.push_back(patch_stride);
+    control.push_back(EncodeVop2(0x26, 10, 255u, 10)); // v_sub_nc_u32 v10, 0x8000, v10
+    control.push_back(0x8000u);
+    control.push_back(EncodeVopc(0x01, InlineU32(0), 11)); // v_cmp_lt_f32 vcc, 0, v11
+    control.push_back(EncodeSop1(0x24, 0, 106));           // s_and_saveexec_b64 s[0:1], vcc
+    const auto skip_nested = control.size();
+    control.push_back(0u); // s_cbranch_execz
+    control.push_back(EncodeMubuf0(0x1c, 0)); // buffer_store_dword v11, v10, s[8:11], s2 offen
+    control.push_back(EncodeMubuf1(11, 2, 10, 2));
+    control[skip_nested] = EncodeSopp(0x08, control.size() - skip_nested - 1u);
+    control.push_back(EncodeSop1(0x04, 126, 0)); // s_mov_b64 exec, s[0:1]
+    // buffer_store_dwordx3 v[11:13], v10, s[8:11], s2 offen offset:16
+    control.push_back(EncodeMubuf0(0x1f, 16));
+    control.push_back(EncodeMubuf1(11, 2, 10, 2));
+    control[skip_control] = EncodeSopp(0x08, control.size() - skip_control - 1u);
+    control[skip_patch] = EncodeSopp(0x08, control.size() - skip_patch - 1u);
+    AppendEnd(&control);
+    return control;
+  };
+  const auto control = make_control(false, false);
+
+  std::vector<u32> evaluation;
+  AppendVop3(&evaluation, 0x169, 24, 255u, Vgpr(7));
+  evaluation.push_back(3 * hs_stride);
+  evaluation.push_back(EncodeVop2(0x25, 2, InlineU32(1), 7));
+  evaluation.push_back(EncodeVop2(0x0b, 2, 255u, 2));
+  evaluation.push_back(patch_stride);
+  evaluation.push_back(EncodeVop2(0x26, 2, 255u, 2));
+  evaluation.push_back(0x8000u);
+  evaluation.push_back(EncodeMubuf0(0x0d, hs_stride + 16)); // CP1 dwords 4-5
+  evaluation.push_back(EncodeMubuf1(10, 2, 24, 4));
+  evaluation.push_back(EncodeMubuf0(0x0d, 16)); // patch constant dwords 4-5
+  evaluation.push_back(EncodeMubuf1(12, 2, 2, 4));
+  evaluation.push_back(EncodeVop2(0x03, 10, Vgpr(12), 10)); // v_add_f32 v10, v12, v10
+  evaluation.push_back(EncodeVop2(0x03, 11, Vgpr(13), 11));
+  evaluation.push_back(EncodeExp0(0x0c, 0xf));
+  evaluation.push_back(EncodeExp1(5, 6, 10, 11));
+  AppendEnd(&evaluation);
+
+  ShaderTessellationInputInfo tess{.input_control_points = 3,
+                                  .output_control_points = 3,
+                                  .domain = 1,
+                                  .partitioning = 0,
+                                  .output_topology = 2};
+  AnalyzeTessellationPrograms(local, control, tess);
+  Require(name, "reflected interface",
+          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+              tess.patch_base == 0x7f10u && tess.patch_size == 28u,
+          "b128 LS records, selected LS reads, joined and looping HS paths and CP0 patch "
+          "stores must reflect the layout");
+
+  auto ls = CompileTessellationStage(name, local, ShaderType::Local, tess);
+  auto hs = CompileTessellationStage(name, control, ShaderType::TessellationControl, tess);
+  auto ds = CompileTessellationStage(name, evaluation, ShaderType::TessellationEvaluation, tess);
+  Require(name, "128-bit LS record",
+          ls.addresses[Attribute::LocalOutput] == std::set<u32>{16, 20, 24, 28},
+          "DS_WRITE_B128 must lower to four consecutive LS outputs");
+  Require(name, "predicated patch outputs",
+          hs.addresses[Attribute::PatchOutput] == std::set<u32>{0x7f10, 0x7f20, 0x7f24, 0x7f28},
+          "CP0 mul24 addresses under nested EXEC masks must reach patch constants");
+  Require(name, "control point read-back",
+          hs.addresses[Attribute::ControlOutput] == std::set<u32>{hs_stride + 16, hs_stride + 20} &&
+              hs.assembly.find("OpUDiv %uint %uint_96 %uint_80") != std::string::npos,
+          "CP0 must read CP1's outputs by address instead of its own invocation's");
+  Require(name, "patch inputs",
+          ds.addresses[Attribute::PatchInput] == std::set<u32>{0x7f20, 0x7f24} &&
+              ds.addresses[Attribute::EvaluationInput] ==
+                  std::set<u32>{hs_stride + 16, hs_stride + 20},
+          "TES patch constant reads must not alias control point inputs");
+  Require(name, "matching patch interface",
+          HasPatchInterface(hs.assembly, "Output", 2, 5) &&
+              HasPatchInterface(ds.assembly, "Input", 2, 5),
+          "HS and TES patch variables must share their Location and type");
+  Require(name, "integer partitioning", ds.assembly.find("SpacingEqual") != std::string::npos,
+          "integer partitioning must map to equal spacing");
+  std::printf("[host]    %-32s ok\n", name);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  for (const bool carried : {false, true}) {
+    ExpectFatal(carried ? "TessellationLoopCarriedAddress" : "TessellationDivergentJoin", [&] {
+      ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
+      AnalyzeTessellationPrograms(local, make_control(!carried, carried), info);
+    });
+  }
+#endif
 }
 
 void CheckTessellationPrograms() {
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationPatchConstants();
 }
 
 void CheckEmbeddedFetchVertexOffset() {
@@ -36424,6 +45707,26 @@ void CheckImageTransitionState(RenderContext &renderer) {
           ImageTestAccess::CopyRows(32ull << 10, 4097, copy_capacity) == 4096 &&
           ImageTestAccess::CopyRows(copy_capacity + 4, 1, copy_capacity) == 0,
       "buffered image copy does not split at the fixed scratch capacity");
+
+  // RADV rejects 3D 128-bit BC images with block-texel views plus extended usage.
+  auto volume_info = MakeInfo(vk::Format::eBc7UnormBlock, 1, 1);
+  volume_info.guest_format = Prospero::BufferFormat::kBc7UNorm;
+  volume_info.type = Prospero::ImageType::kColor3D;
+  volume_info.extent.depth = 4;
+  volume_info.bytes_per_block = 16;
+  for (const bool supported : {false, context.supports_block_texel_view}) {
+    context.supports_block_texel_view = supported;
+    Image volume(context, scheduler, volume_info);
+    const auto flags = volume.backing.flags;
+    Require(name, "block volume create flags",
+            (flags & vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) ==
+                    supported &&
+                static_cast<bool>(flags & vk::ImageCreateFlagBits::eExtendedUsage) ==
+                    static_cast<bool>(volume.backing.usage &
+                                      vk::ImageUsageFlagBits::eStorage),
+            "block volume requested extended usage without storage");
+  }
 
   Image image(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
   auto barriers =
@@ -37509,14 +46812,13 @@ void CheckStorageTextureLinearUploadLayout() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
-      TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              false, "StorageTextureLinearTest");
-  const auto regions = TextureBuildImageCopies(layout);
+      MakeTilingImage(format, width, height, 1, depth, tile, total.size, false);
+  const auto regions = layout.BufferCopies();
   Require("StorageTextureLinearUpload", "layout",
           pitch == width && total.size == 0x1fa4000 && total.align == 256 &&
-              layout.surface.description.tile_mode == tile &&
-              layout.pitch == width && layout.slice_stride == total.size &&
-              regions.size() == 1 && regions[0].bufferOffset == 0 &&
+              layout.tile_mode == tile && layout.pitch == width &&
+              layout.linear_slice_stride == total.size && regions.size() == 1 &&
+              regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == width,
@@ -37538,22 +46840,20 @@ void CheckStorageTextureDepthTileUploadLayout() {
   TileGetTextureSize(format, width, height, 1, tile, &slice, &level, &padded);
   TileGetTextureTotalSize(format, width, height, depth, 1, tile, false, total);
   const auto layout =
-      TextureCalcUploadLayout(format, width, height, 1, depth, tile, total.size,
-                              false, "StorageTextureDepthTileTest");
-  const auto regions = TextureBuildImageCopies(layout);
+      MakeTilingImage(format, width, height, 1, depth, tile, total.size, false);
+  const auto regions = layout.BufferCopies();
   Require("StorageTextureDepthTileUpload", "PPSA14053 layout",
           pitch == 256 && padded.width == 256 && padded.height == 256 &&
               slice.size == 0x10000 && slice.align == 0x10000 &&
               level.size == slice.size && level.offset == 0 &&
               total.size == slice.size && total.align == slice.align &&
-              layout.surface.description.tile_mode == tile &&
-              layout.surface.texture.block.family ==
-                  TileBlockFamily::Depth64KB &&
-              layout.pitch == pitch && layout.slice_stride == pitch &&
-              layout.source_slice_stride == total.size &&
-              layout.mips[0].size == pitch &&
-              layout.surface.mips[0].size == total.size &&
-              regions.size() == 1 && regions[0].bufferOffset == 0 &&
+              layout.tile_mode == tile &&
+              layout.tiling.block.family == TileBlockFamily::Depth64KB &&
+              layout.pitch == pitch && layout.linear_slice_stride == 0 &&
+              layout.tiled_slice_stride == total.size &&
+              layout.mip_layout[0].linear_size == pitch &&
+              layout.mip_layout[0].size == total.size && regions.size() == 1 &&
+              regions[0].bufferOffset == 0 &&
               regions[0].imageExtent.width == width &&
               regions[0].imageExtent.height == height &&
               regions[0].bufferRowLength == pitch,
@@ -37624,7 +46924,7 @@ void CheckImageSamplerSpecialization() {
               sizeof(signed_memory_flags));
   mixed_sampler_block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
-      {Value(&image_handle), Value(&sampler_handle), Value(&image_address)},
+      {Value(&image_handle), Value(&sampler_handle), Value(&image_address), Value(true)},
       signed_memory_flag_bits);
 
   ShaderRecompiler::IR::DescriptorValue native_image_descriptor{};
@@ -37679,18 +46979,16 @@ void CheckImageSamplerSpecialization() {
   ShaderRecompiler::IR::ApplyResourceSpecialization(
       mixed_sampler_program, mixed_sampler_specialization);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
-          mixed_sampler_program.info.samplers.size() == 3u &&
+          mixed_sampler_program.info.samplers.size() == 2u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
               !mixed_sampler_program.info.samplers[0].integer_border &&
-              !mixed_sampler_program.info.samplers[1].force_point_filtering &&
+              mixed_sampler_program.info.samplers[1].force_point_filtering &&
               mixed_sampler_program.info.samplers[1].integer_border &&
-              mixed_sampler_program.info.samplers[2].force_point_filtering &&
-              mixed_sampler_program.info.samplers[2].integer_border &&
               mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
-              mixed_sampler_program.info.sampled_pairs[1].sampler == 2u &&
-              mixed_sampler_program.info.sampled_pairs[2].sampler == 2u &&
+              mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
+              mixed_sampler_program.info.sampled_pairs[2].sampler == 1u &&
               mixed_sampler_program.info.sampled_pairs[3].sampler == 1u &&
-              mixed_sampler_program.memory_info[0].sampler == 2u &&
+              mixed_sampler_program.memory_info[0].sampler == 1u &&
               mixed_sampler_snapshot.samplers.size() == 1u &&
               std::ranges::all_of(mixed_sampler_program.info.samplers,
                   [](const auto& sampler) {
@@ -37804,15 +47102,6 @@ void CheckImageSamplerSpecialization() {
     options.user_data = user_data;
     options.input_info.compute = &compute;
     auto translated = ShaderRecompiler::TranslateProgram(code, options);
-    if (scalar) {
-      bool key_phi = false;
-      for (const auto *block : translated.program.blocks)
-        for (const auto &inst : *block)
-          key_phi |= inst.GetOpcode() == ValueOpcode::GetImageResource &&
-                     inst.Arg(0).Resolve().IsPhi();
-      Require(name, "descriptor key reconvergence", key_phi,
-              "native crossed exits did not retain a descriptor key Phi");
-    }
     auto plan = ExtractResourcePlan(translated.program);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
@@ -37824,56 +47113,57 @@ void CheckImageSamplerSpecialization() {
                 snapshot.images.size() == count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 key) {
-      for (u32 i = 0; i < snapshot.flattened_srt[offset]; ++i)
-        if (snapshot.flattened_srt[offset + 1u + 2u * i] == key)
-          return snapshot.flattened_srt[offset + 2u + 2u * i];
-      return UINT32_MAX;
+    const auto ordinal = [&](u32 byte_offset) {
+      const auto word = byte_offset >> 2u;
+      return word < snapshot.flattened_srt[offset]
+                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
     };
-    Require(name, "shift, wrap and whole-record read",
-            snapshot.flattened_srt[offset] == count + 2u && ordinal(1u) != UINT32_MAX &&
-                ordinal(0x08000001u) == ordinal(1u) && ordinal(count) < snapshot.images.size() &&
-                snapshot.images[ordinal(count)].dwords[0] == 0u &&
-                std::ranges::count(snapshot.specialization_reads,
-                    std::pair<uint64_t, uint64_t>{material_base, (count + 3u) * 4u}) == 1,
-            "material keys lost shift/dedup, scalar wrap/OOB, or bulk strict-read semantics");
+    Require(name, "dense table map and coherent snapshot",
+            specialization.images[0].indirect_search_iterations == 0u &&
+                snapshot.flattened_srt[offset] == (count - 1u) * 8u + 1u &&
+                ordinal(32u) != 0u &&
+                ordinal(count * 32u) == 0u && snapshot.images[0].dwords[0] == 0u &&
+                snapshot.specialization_reads ==
+                    std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
+            "image table lost its dense offsets, explicit null or single coherent read");
     const auto previous = specialization;
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[1].dwords[0] == 0x11100u,
+                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
             "descriptor addresses were frozen or entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);
     if (!scalar) {
       user_data[4] += 1u;
-      Require(name, "misaligned material rejection",
-              !MaterializeResources(plan, runtime, snapshot, specialization),
-              "unaligned raw buffer base was treated as separately aligned scalar memory");
+      Require(name, "GPU material reads remain on GPU",
+              MaterializeResources(plan, runtime, snapshot, specialization) &&
+                  specialization == previous && snapshot.specialization_reads ==
+                      std::vector<std::pair<uint64_t, uint64_t>>{{table_base, count * 32u}},
+              "GPU material addressing reentered host descriptor selection");
       user_data[4] -= 1u;
     }
     auto dirty = runtime;
     dirty.read_specialization_memory = +[](void*, uint64_t, std::span<u32>) { return false; };
-    Require(name, "dirty material rejection",
+    Require(name, "unreadable image table rejection",
             !MaterializeResources(plan, dirty, snapshot, specialization),
             "GPU-selected texture materialization bypassed strict read provenance");
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     if (scalar) {
-      ExpectFatal("ScalarImageDescriptorNumericConsumer", [&] {
-        code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
-        code.pop_back();
-        AppendBufferStoreDword(&code, 18, 0);
-        code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
-        AppendEnd(&code);
-        (void)ShaderRecompiler::TranslateProgram(code, options);
-      });
+      code.insert(code.begin() + table_read_end, EncodeVop1(0x01, 18, 12));
+      code.pop_back();
+      AppendBufferStoreDword(&code, 18, 0);
+      code[2] = EncodeSopp(0x08, static_cast<int16_t>(code.size() - 3u));
+      AppendEnd(&code);
     } else {
-      ExpectFatal("MaterialImageWithoutEntryWitness", [&] {
-        code[2] = EncodeSopp(0x00, 0); // S_NOP removes the original nonempty-EXEC witness.
-        (void)ShaderRecompiler::TranslateProgram(code, options);
-      });
+      code[2] = EncodeSopp(0x00, 0); // GPU selectors do not need a host nonempty-EXEC witness.
     }
-#endif
+    auto retained = ShaderRecompiler::TranslateProgram(code, options);
+    auto retained_plan = ExtractResourcePlan(retained.program);
+    Require(name, "retained descriptor consumers",
+            MaterializeResources(retained_plan, runtime, snapshot, specialization),
+            "retained GPU descriptor reads could not use the shared image table");
+    compiled = ShaderRecompiler::CompileProgram(std::move(retained), options, specialization);
+    ValidateSpirv(name, compiled.spirv);
   }
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
@@ -37919,19 +47209,17 @@ void CheckResourcePlanHandoff() {
     ValidateSpirv(name, compiled.spirv);
     const auto &bindings = compiled.program.bindings;
     Require(name, "GPU data requirements",
-            bindings.user_data_registers == (numeric_read ? std::vector<u32>{0, 1}
-                                                          : std::vector<u32>{}) &&
-                bindings.memory_offset_count == 1 &&
-                FindBinding(bindings, DescriptorBindingKind::FlattenedSrt) == nullptr &&
-                (FindBinding(bindings, DescriptorBindingKind::BdaPagetable) != nullptr) == numeric_read,
-            "descriptor-only shader retained SRT uploads or native scalar data lost its address");
+            compiled.program.info.user_data_registers.empty() && bindings.descriptor_counts[0] == 1 &&
+                (bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::FlattenedSrt)] != 0) ==
+                    numeric_read,
+            "descriptor-only shader retained SRT uploads or live scalar data was removed");
 
     memory[0] = 0x2000u;
     memory[4] = 13u;
     Require(name, "independent host plan",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
                 snapshot.buffers[0].dwords[0] == 0x2000u &&
-                snapshot.flattened_srt.size() == 4,
+                (!numeric_read || snapshot.flattened_srt.back() == 13u),
             "compiled shader cleanup invalidated or froze the host resource plan");
   }
   std::printf("[host]    %-32s ok\n", name);
@@ -38046,27 +47334,29 @@ void CheckStorageTextureVolumeUploadLayout() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, 1,
                           Prospero::TileMode::kRenderTarget, true, total);
-  const auto layout = TextureCalcUploadLayout(
-      format, width, height, 1, depth, Prospero::TileMode::kRenderTarget,
-      total.size, true, "StorageTextureVolumeTest");
-  const auto regions = TextureBuildImageCopies(layout);
-  Require(
-      "StorageTextureVolumeUpload", "layout",
-      pitch == 128 && total.size == 0x210000 && layout.slice_stride == 0x2208 &&
-          layout.source_slice_stride == 0 && layout.mips[0].size == 0x2208 &&
-          layout.surface.mips[0].size == 0x10000 && regions.size() == depth,
-      "3D render-target upload did not preserve its compact linear layout");
+  const auto layout =
+      MakeTilingImage(format, width, height, 1, depth,
+                      Prospero::TileMode::kRenderTarget, total.size, true);
+  const auto regions = layout.BufferCopies();
+  Require("StorageTextureVolumeUpload", "layout",
+          pitch == 128 && total.size == 0x210000 &&
+              layout.linear_slice_stride == 0 &&
+              layout.tiled_slice_stride == 0x10000 &&
+              layout.mip_layout[0].linear_size == 0x2208 &&
+              layout.mip_layout[0].size == 0x10000 && regions.size() == 1 &&
+              regions[0].imageExtent.depth == depth,
+          "3D render-target upload did not preserve its compact linear layout");
 
-  std::vector<GpuTileInfo> infos;
   Require("StorageTextureVolumeUpload", "GPU records",
-          TextureBuildGpuTileInfos(total.size, regions, layout, 1, infos) &&
-              infos.size() == depth,
-          "3D render-target GPU records were not built");
+          layout.resources.levels == 1 && layout.MipExtent(0).depth == depth,
+          "3D render-target canonical mip record lost its depth");
   for (const uint32_t z : {0u, 1u, depth - 1u}) {
+    const auto &mip = layout.mip_layout[0];
     Require("StorageTextureVolumeUpload", "slice offsets",
-            infos[z].linear_offset == static_cast<uint64_t>(z) * 0x2208 &&
-                infos[z].tiled_offset == static_cast<uint64_t>(z) * 0x10000 &&
-                infos[z].surface_z == z && infos[z].pitch == width,
+            mip.linear_offset + z * mip.linear_size == uint64_t{z} * 0x2208 &&
+                mip.offset + z * layout.tiled_slice_stride ==
+                    uint64_t{z} * 0x10000 &&
+                mip.surface_z + z == z && mip.linear_pitch == width,
             "volume slice lost its linear stride, block slice, or Z swizzle");
   }
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeUpload");
@@ -38082,30 +47372,34 @@ void CheckStorageTextureVolumeMipRegions() {
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, depth, levels, tile, true,
                           total);
-  const auto layout = TextureCalcUploadLayout(
-      format, width, height, levels, depth, tile, total.size, true,
-      "StorageTextureVolumeMipTest");
-  const auto copies = TextureBuildImageCopies(layout);
+  const auto layout = MakeTilingImage(format, width, height, levels, depth,
+                                      tile, total.size, true);
+  const auto copies = layout.BufferCopies();
 
-  bool valid = copies.size() == 8;
-  size_t index = 0;
-  for (uint32_t level = 0; level < levels && valid; level++) {
-    const uint32_t mip_depth = std::max(depth >> level, 1u);
-    const uint32_t mip_width = std::max(width >> level, 1u);
-    const uint32_t mip_height = std::max(height >> level, 1u);
-    for (uint32_t z = 0; z < mip_depth; z++, index++) {
-      const auto &copy = copies[index];
-      valid &= copy.imageSubresource.mipLevel == level &&
-               copy.imageOffset.z == static_cast<int>(z) &&
-               copy.imageExtent.width == mip_width &&
-               copy.imageExtent.height == mip_height &&
-               copy.bufferOffset ==
-                   layout.mips[level].offset + z * layout.slice_stride &&
-               copy.bufferRowLength == layout.mips[level].row_length &&
-               copy.bufferImageHeight == layout.mips[level].image_height;
-    }
+  bool valid = copies.size() == levels;
+  for (uint32_t level = 0; level < levels && valid; ++level) {
+    const auto &copy = copies[level];
+    const auto &mip = layout.mip_layout[level];
+    const auto active = layout.MipExtent(level);
+    valid &= copy.imageSubresource.mipLevel == level &&
+             copy.imageOffset.z == 0 &&
+             copy.imageExtent.width == active.width &&
+             copy.imageExtent.height == active.height &&
+             copy.imageExtent.depth == active.depth &&
+             copy.bufferOffset == mip.linear_offset &&
+             copy.bufferRowLength == mip.linear_pitch &&
+             uint64_t{copy.bufferRowLength} * copy.bufferImageHeight *
+                     sizeof(uint32_t) ==
+                 layout.linear_slice_stride;
   }
-  valid &= index == copies.size();
+  const auto saved_mips = layout.mip_layout;
+  const auto prefix = layout.BufferCopies(1024, 1);
+  const auto again = layout.BufferCopies();
+  valid &= prefix.size() == 1 &&
+           prefix[0].bufferOffset == 1024 + layout.mip_layout[0].linear_offset &&
+           copies[0].bufferOffset == 768 && copies[1].bufferOffset == 256 &&
+           copies[2].bufferOffset == 0 && again == copies &&
+           layout.mip_layout == saved_mips;
   Require("StorageTextureVolumeMipRegions", "per-mip depth", valid,
           "direction-neutral image copies did not shrink depth or preserve "
           "Vulkan Z coordinates");
@@ -38309,12 +47603,12 @@ void CheckDepthAttachmentWrites() {
 
   target.depth_test_enable = false;
   target.depth_write_enable = false;
-  target.depth_load_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DepthAttachmentWrites", "depth clear",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eDepth,
           "depth attachment clear did not claim depth");
 
-  target.depth_load_clear_enable = false;
+  target.load_clear_aspects = {};
   target.stencil_test_enable = true;
   target.stencil_front = {vk::StencilOp::eKeep, vk::StencilOp::eKeep,
                           vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0xff, 0xff, 0};
@@ -38340,7 +47634,7 @@ void CheckDepthAttachmentWrites() {
           "masked front write or KEEP-only back face claimed stencil");
 
   target.stencil_test_enable = false;
-  target.stencil_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eStencil;
   Require("DepthAttachmentWrites", "stencil clear",
           target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
           "stencil attachment clear did not claim stencil");
@@ -38414,12 +47708,11 @@ void CheckDepthFeedbackAspects() {
           feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
           "overlapping mip and layer boundaries missed depth feedback");
   target.depth_write_enable = false;
-  target.depth_load_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DepthFeedbackAspects", "depth clear only",
           feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
           "a sampled depth attachment clear missed feedback");
-  target.depth_load_clear_enable = false;
-  target.stencil_clear_enable = true;
+  target.load_clear_aspects = vk::ImageAspectFlagBits::eStencil;
   sampled.aspect = vk::ImageAspectFlagBits::eStencil;
   Require("DepthFeedbackAspects", "stencil clear only",
           feedback(sampled) == vk::ImageAspectFlagBits::eStencil,
@@ -38473,7 +47766,7 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
           "fully read-only depth/stencil used a writable layout");
-  attachment.depth_load_clear_enable = true;
+  attachment.load_clear_aspects = vk::ImageAspectFlagBits::eDepth;
   Require("DynamicRenderingState", "deferred depth clear layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
@@ -38484,9 +47777,9 @@ void CheckDynamicRenderingState() {
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
           "depth-only writes did not retain read-only stencil");
-  attachment.depth_load_clear_enable = false;
+  attachment.load_clear_aspects = {};
   attachment.depth_write_enable = false;
-  attachment.stencil_clear_enable = true;
+  attachment.load_clear_aspects = vk::ImageAspectFlagBits::eStencil;
   Require("DynamicRenderingState", "depth-read stencil-write layout",
           depth_attachment_layout(attachment) ==
               vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
@@ -38836,29 +48129,6 @@ void CheckVulkan13FeatureRequirements() {
       "production device creation did not require dynamic rendering and "
       "synchronization2 from one feature declaration");
   std::printf("[host]    %-32s ok\n", "Vulkan13FeatureRequirements");
-}
-
-void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
-  GraphicsInitJmpTables();
-  CommandProcessor processor(renderer, 0);
-  const std::array<uint32_t, 6> standard_payload{0x00400000u, 1u, 0u,
-                                                 0u,          0u, 10u};
-  const std::array<uint32_t, 7> custom_payload{
-      0xdeadbeefu, 0xffffffffu, 0x80000000u, 0x13579bdfu,
-      0x2468ace0u, 0xaaaaaaaau, 0x55555555u};
-  const auto standard_before = standard_payload;
-  const auto custom_before = custom_payload;
-  Require("Pm4AcquireMemNoOp", "recognized packets",
-          CpOpAcquireMem(processor, 0xC0055800u, standard_payload.data(), 0,
-                         0) == 6 &&
-              CpOpAcquireMem(processor, 0xc0061050u, custom_payload.data(), 0,
-                             0) == 7 &&
-              standard_payload == standard_before &&
-              custom_payload == custom_before,
-          "ACQUIRE_MEM did not consume both pinned packet forms as "
-          "side-effect-free "
-          "no-ops");
-  std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
 }
 
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
@@ -39527,7 +48797,7 @@ void CheckShaderFusion() {
         back.type = static_cast<uint8_t>(c.gs ? Prospero::ShaderBinaryType::kGsBack
                                             : Prospero::ShaderBinaryType::kHsBack);
         Shader fused{};
-        const auto fuse = older ? Gen5::AgcUnknownNApJjpKNBl4 : Gen5::AgcUnknownFuseShaderHalves;
+        const auto fuse = older ? Gen5::AgcFuseShaderHalves : Gen5::AgcFuseShaderHalves_0200;
         const auto result = fuse(&fused, &front, &back, in_place ? nullptr : scratch.data());
         const auto *regs = fused.sh_registers;
         Require("ShaderFusion", "native fused registers",
@@ -39546,6 +48816,72 @@ void CheckShaderFusion() {
   std::printf("[host]    %-32s ok\n", "ShaderFusion");
 }
 
+void CheckAgcSystemTable(RenderContext &renderer) {
+  constexpr const char *name = "AgcSystemTable";
+  constexpr uint64_t driver_base = 0x0fe0000000ull;
+  constexpr uint64_t table_address = driver_base + 0x40000;
+  constexpr std::array<uint32_t, 16> native_validator{
+      0xbeeb03ff, 0x00000021, 0xb96a1818, 0xbf06106a,
+      0xbf800000, 0x8590807e, 0xb96a0a18, 0xbf066a80,
+      0xbf800000, 0x85ea807e, 0x88ea106a, 0xbf870003,
+      0xbefc03ff, 0x8a6ca000, 0xbf920009, 0xbefd210e};
+  LibKernel::Memory::InstallGpuResources(&renderer);
+  Require(name, "driver module startup", Gen5Driver::Initialize() == 0,
+          "driver module startup failed before guest initialization");
+  const auto direct_memory_size = LibKernel::Memory::KernelGetDirectMemorySize();
+  int64_t available_offset = -1;
+  size_t available_size = 0;
+  Require(name, "remaining direct pool",
+          LibKernel::Memory::KernelAvailableDirectMemorySize(
+              0, direct_memory_size, 0, &available_offset, &available_size) == 0 &&
+              available_size == direct_memory_size - 0x200000,
+          "driver startup did not reserve its backing in the reported direct pool");
+  int64_t guest_allocation = -1;
+  Require(name, "guest consumes remaining direct pool",
+          LibKernel::Memory::KernelAllocateDirectMemory(
+              0, direct_memory_size, available_size, 0x4000, 0, &guest_allocation) == 0,
+          "guest could not allocate all remaining direct memory");
+  uint32_t state = 0xabcdef01u;
+  Require(name, "driver startup", Gen5::AgcInit(&state, 13) == 0 && state == 0xabcdef01u,
+          "Agc startup required free guest memory or changed its ignored public state pointer");
+  LibKernel::Memory::VirtualQueryInfo mapping{};
+  Require(name, "shared driver backing",
+          LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<void *>(driver_base), 0,
+                                                 &mapping, sizeof(mapping)) == 0 &&
+              mapping.start == driver_base && mapping.end == driver_base + 0x200000 &&
+              mapping.memory_type == 12 && mapping.protection == 0x33 && mapping.is_direct &&
+              std::strcmp(mapping.name, "SceAgcDriver") == 0 &&
+              renderer.IsMapped(driver_base, 0x200000),
+          "driver startup bypassed shared DMEM metadata or GPU range registration");
+  ShaderBufferResource descriptor{};
+  std::array<uint64_t, 16> functions{};
+  std::array<uint32_t, 16> code{};
+  Require(name, "ordered-count function backing",
+          LibKernel::Memory::TryReadBacking(table_address, &descriptor, sizeof(descriptor)) &&
+              descriptor.Base48() == table_address + 0x60 && descriptor.Stride() == 16 &&
+              descriptor.NumRecords() == 8 && descriptor.fields[3] == 0x5204 &&
+              LibKernel::Memory::TryReadBacking(descriptor.Base48(), functions.data(),
+                                                 sizeof(functions)) &&
+              functions[4] != 0 && (functions[4] & 0xffu) == 0 && functions[5] == 0 &&
+              LibKernel::Memory::TryReadBacking(functions[4], code.data(), sizeof(code)) &&
+              code == native_validator,
+          "system descriptor did not reach the queue validator and its user data");
+  auto *instrumentation = reinterpret_cast<uint64_t *>(table_address + 0x18);
+  Require(name, "default instrumentation", *instrumentation == 0,
+          "unused vertex validation was enabled at startup");
+  *instrumentation = 0x12340000u;
+  Require(name, "repeat startup", Gen5Driver::Initialize() == 0 &&
+              Gen5::AgcInit(nullptr, 13) == 0 &&
+              *instrumentation == 0x12340000u,
+          "repeat Agc initialization reset existing system state");
+  *instrumentation = 0;
+  Require(name, "release guest allocation",
+          LibKernel::Memory::KernelCheckedReleaseDirectMemory(guest_allocation, available_size) == 0,
+          "guest allocation release failed");
+  LibKernel::Memory::InstallGpuResources(nullptr);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 struct CommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -39560,6 +48896,64 @@ struct CommandBufferLayout {
 };
 static_assert(offsetof(CommandBufferLayout, cursor_up) == 0x10);
 static_assert(offsetof(CommandBufferLayout, reserved_dw) == 0x30);
+
+void CheckPm4AcquireMemPackets(RenderContext &renderer) {
+  constexpr const char *name = "Pm4AcquireMemPackets";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  // Byte ranges cover every touched 256-byte block, including partial first and last blocks.
+  struct Case {
+    const char *label;
+    bool async;
+    uint8_t engine;
+    uint32_t cb_db, gcr;
+    uint64_t base, size;
+    uint32_t poll;
+    std::array<uint32_t, 8> expected;
+  };
+  const Case cases[]{
+      {"captured byte range", false, 1, 0, 0x9000, 0x2036000308ull, 0x20, 400,
+       {0xc0065800, 0x80000000, 1, 0, 0x20360003, 0, 25, 0x9000}},
+      {"crossing high address", false, 0, 0x7fc0, 0x20, 0xab12345678f0ull, 0x40, 400,
+       {0xc0065800, 0x7fc0, 2, 0, 0x12345678, 0xab, 25, 0x20}},
+      {"full range", false, 0, 0x7fc0, 0x20, 0, UINT64_MAX, 400,
+       {0xc0065800, 0x7fc0, UINT32_MAX, 0xff, 0, 0, 25, 0x20}},
+      {"wide range and saturated poll", false, 1, 0, 0x380, 0, 0x10000000000ull, UINT32_MAX,
+       {0xc0065800, 0x80000000, 0, 1, 0, 0, 0xffff, 0x380}},
+      {"async byte range", true, 0, 0, 0x9000, 0x2036000308ull, 0x20, 400,
+       {0xc0065800, 0, 1, 0, 0x20360003, 0, 25, 0x9000}},
+  };
+  Require(name, "packet sizes", Gen5::AgcDcbAcquireMemGetSize() == 32 &&
+              Gen5::AgcAcbAcquireMemGetSize() == 32,
+          "native single ACQUIRE_MEM packet size changed");
+  for (const auto &test : cases) {
+    std::array<uint32_t, 8> packet{};
+    CommandBufferLayout layout{packet.data(), packet.data() + packet.size(),
+                               packet.data(), packet.data() + packet.size(),
+                               nullptr, nullptr, 0};
+    auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&layout);
+    const auto *base = reinterpret_cast<const volatile void *>(test.base);
+    auto *emitted = test.async
+        ? Gen5::AgcAcbAcquireMem(buffer, test.gcr, base, test.size, test.poll)
+        : Gen5::AgcDcbAcquireMem(buffer, test.engine, test.cb_db, test.gcr,
+                                 base, test.size, test.poll);
+    Require(name, test.label, emitted == packet.data() &&
+                layout.cursor_up == packet.data() + packet.size() && packet == test.expected,
+            "ACQUIRE_MEM differs from the pinned native packet");
+    const auto tick = renderer.GetCommandScheduler().CurrentTick();
+    Pm4Execution execution;
+    Require(name, test.label,
+            processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
+                packet == test.expected && renderer.GetCommandScheduler().CurrentTick() == tick,
+            "native ACQUIRE_MEM was not consumed without mutation or queue submission");
+  }
+  const std::array<uint32_t, 7> ps4_packet{0xc0055800, 0x00400000, 1, 0, 0, 0, 10};
+  Pm4Execution execution;
+  Require(name, "native PS4 packet",
+          processor.Process(execution, ps4_packet) == Pm4ProcessResult::Complete,
+          "seven-DWORD ACQUIRE_MEM was not consumed");
+  std::printf("[host]    %-32s ok\n", name);
+}
 
 void CheckPm4WaitPackets(RenderContext &renderer) {
   GraphicsInitJmpTables();
@@ -39739,6 +49133,135 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                   packet_mismatch &&
               !Gen5::AgcIsInternalDataPacket(0xc0017904u, invalid_payload),
           "indirect multi-draw packet differs from the expected stream");
+
+  constexpr uint32_t data_offset = 0x5c08;
+  constexpr uint32_t stride = 32;
+  std::array<uint32_t, data_offset / 4 + stride / 4 + 5> arguments{};
+  const std::array<uint32_t, 5> first{0, 1, 3, 0xfffffffeu, 9};
+  const std::array<uint32_t, 5> second{0, 2, 5, 7, 11};
+  std::copy(first.begin(), first.end(), arguments.begin() + data_offset / 4);
+  std::copy(second.begin(), second.end(), arguments.begin() + (data_offset + stride) / 4);
+  std::array<uint32_t, 8> indices{};
+  processor.BufferInit();
+  processor.SetDrawIndirectArgsBaseAddress(reinterpret_cast<uint64_t>(arguments.data()));
+  processor.SetIndexBaseAddress(reinterpret_cast<uint64_t>(indices.data()));
+  processor.SetIndexType(0);
+  std::array<uint32_t, 5> captured{0xc0032500u, data_offset, 0x94, 0x95, 0};
+  Require("Pm4DrawIndirectMulti", "captured indexed single execution",
+          execute(captured.data(), captured.size()),
+          "indexed indirect draw rejected native source-select zero");
+  // Zero primitive counts still traverse CP argument decoding and renderer entry,
+  // while avoiding unrelated shader and attachment requirements.
+  for (const bool indexed : {false, true}) {
+    for (const bool multi : {false, true}) {
+      for (const uint64_t draw_modifier : {0ull, 0x100ull, 1ull << 32u, (1ull << 32u) | 0x100ull}) {
+        packet.fill(0);
+        dcb.cursor_up = packet.data();
+        auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&dcb);
+        alignas(4) uint32_t draw_count = 3;
+        if (multi) {
+          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirectMulti(buffer, data_offset, 1, 2,
+                                  &draw_count, stride, draw_modifier)
+                            : Gen5::AgcDcbDrawIndirectMulti(buffer, data_offset, 1, 2,
+                                  &draw_count, stride, draw_modifier);
+        } else {
+          emitted = indexed ? Gen5::AgcDcbDrawIndexIndirect(buffer, data_offset, draw_modifier)
+                            : Gen5::AgcDcbDrawIndirect(buffer, data_offset, draw_modifier);
+        }
+        const uint32_t begin = multi && !indexed ? 3 : 0;
+        const uint32_t words = multi ? (indexed ? 10 : 16) : 5;
+        const uint32_t opcode = multi ? (indexed ? 0xc0083800u : 0xc0082c00u)
+                                      : (indexed ? 0xc0032500u : 0xc0032400u);
+        const uint32_t initiator = (indexed ? 0 : 2) |
+            (draw_modifier == 0x100 ? 0x20 : 0);
+        Require("Pm4DrawIndirectMulti", "indexed/auto initiator emission",
+                emitted == packet.data() && dcb.cursor_up == packet.data() + words &&
+                    packet[begin] == opcode && packet[begin + 1] == data_offset &&
+                    packet[begin + (multi ? 9 : 4)] == initiator,
+                "indirect opcode, source select, or modifier bits differ from the native packet");
+        Require("Pm4DrawIndirectMulti", "single/multi argument execution",
+                execute(packet.data(), words),
+                "indirect draw failed shared argument decoding or padded/count-limited traversal");
+        if (multi) {
+          draw_count = 0;
+          Require("Pm4DrawIndirectMulti", "zero indirect count execution",
+                  execute(packet.data(), words), "zero indirect draw count did not complete");
+        }
+      }
+    }
+  }
+  renderer.GetCommandScheduler().Finish();
+  processor.BufferInit();
+  auto &shaders = processor.GetShCtx();
+  const auto &gs = shaders.GetVs().gs_user_sgpr.value;
+  const auto &hs = shaders.GetVs().hs_user_sgpr.value;
+  const auto check_offsets = [&](auto &commands, const auto &sgprs,
+                                 std::initializer_list<uint32_t> expected_offsets,
+                                 const char *label) {
+    Require("Pm4DrawIndirectMulti", label,
+            execute(commands.data(), commands.size()) &&
+                std::equal(expected_offsets.begin(), expected_offsets.end(), sgprs + 9),
+            "indirect draw did not write the expected user SGPR offsets");
+  };
+  // These locations match the captured NGG prolog: user SGPR9/10 become s17/s18.
+  shaders.SetGsUserSgpr(9, 17821, HW::UserSgprType::Unknown);
+  shaders.SetGsUserSgpr(10, 0x898f3f24u, HW::UserSgprType::Unknown);
+  arguments = {0, 1};
+  std::array<uint32_t, 5> indexed_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 9,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 10, 0};
+  check_offsets(indexed_packet, gs, {0, 0}, "clear stale offsets");
+  arguments = {0, 1, 5, static_cast<uint32_t>(-17), 3};
+  indexed_packet[2] |= (Pm4::SPI_SHADER_USER_DATA_GS_0 + 11) << 16u;
+  // Native sceAgcDcbDrawIndexIndirect (0x5a00) emits first-index enable in word3 bit28.
+  indexed_packet[3] |= 1u << 28u;
+  check_offsets(indexed_packet, gs, {static_cast<uint32_t>(-17), 3, 5}, "indexed offsets");
+  indexed_packet[3] ^= (1u << 28u) | (1u << 27u);
+  arguments[2] = 6;
+  check_offsets(indexed_packet, gs, {static_cast<uint32_t>(-17), 3, 5},
+                "index destination disabled");
+
+  arguments = {0, 1, 31, 5};
+  std::array<uint32_t, 5> auto_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 9,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 10, 2};
+  check_offsets(auto_packet, hs, {31, 5}, "non-indexed offsets");
+  Require("Pm4DrawIndirectMulti", "shader stage", gs[9] == static_cast<uint32_t>(-17),
+          "non-indexed draw patched the wrong shader stage");
+
+  arguments = {0, 1, 6, 41, 7, 0, 1, 8, 43, 9, 0, 1, 10, 45, 11};
+  uint32_t count = 2;
+  const auto multi_count_address = reinterpret_cast<uint64_t>(&count);
+  // Native sceAgcDcbDrawIndexIndirectMulti (0x5800) puts this enable in word4 bit28.
+  std::array<uint32_t, 10> multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0), 0,
+      indexed_packet[2], Pm4::SPI_SHADER_USER_DATA_GS_0 + 10,
+      (1u << 30u) | (1u << 28u) | Pm4::SH_NOP, 3,
+      static_cast<uint32_t>(multi_count_address),
+      static_cast<uint32_t>(multi_count_address >> 32u), 20, 0};
+  check_offsets(multi_packet, gs, {43, 9, 8}, "counted multi-draw offsets");
+  count = 0;
+  check_offsets(multi_packet, gs, {43, 9, 8}, "empty multi-draw");
+  count = 3;
+  multi_packet[5] = 1;
+  multi_packet[3] |= 1u << 28u;
+  multi_packet[4] &= ~(1u << 28u);
+  check_offsets(multi_packet, gs, {41, 7, 8}, "multi-draw enable word and count clamp");
+
+  arguments = {0, 1, 51, 13, 0, 1, 53, 15};
+  std::array<uint32_t, 10> auto_multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0), 0,
+      auto_packet[2], auto_packet[3], Pm4::SH_NOP, 2, 0, 0, 16, 2};
+  check_offsets(auto_multi_packet, hs, {53, 15}, "non-indexed multi-draw offsets");
+  arguments = {0, 1, 99, 101};
+  auto_packet[2] = Pm4::SH_NOP;
+  check_offsets(auto_packet, hs, {53, 101}, "independent destinations");
+  auto_packet[3] = Pm4::SH_NOP;
+  arguments[3] = 103;
+  check_offsets(auto_packet, hs, {53, 101}, "disabled destinations");
+  processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
 
@@ -39956,6 +49479,99 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
         static_cast<uint32_t>(address(target.data())),
         static_cast<uint32_t>(address(target.data()) >> 32u), control};
   };
+  // A one-word NOP must leave the following completion write reachable.
+  std::array<uint32_t, 7> nop_commands{};
+  CommandBufferLayout nop_dcb{nop_commands.data(), nop_commands.data() + nop_commands.size(),
+      nop_commands.data(), nop_commands.data() + nop_commands.size(), nullptr, nullptr, 0};
+  auto* nop_cb = reinterpret_cast<Gen5::CommandBuffer*>(&nop_dcb);
+  Require(name, "zero-sized NOP", Gen5::AgcCbNop(nop_cb, 0) == nullptr &&
+              nop_dcb.cursor_up == nop_commands.data() && nop_commands[0] == 0,
+          "zero-sized reservation changed the command buffer");
+  Require(name, "empty command list NOP", Gen5::AgcCbNop(nop_cb, 1) == nop_commands.data() &&
+              nop_dcb.cursor_up == nop_commands.data() + 1 && nop_commands[0] == 0xffff1000u &&
+              Gen5::AgcCbNopGetSize(1) == 4 && Gen5::AgcGetPacketSize(nop_commands.data()) == 1,
+          "native NOP(1) did not reserve one DWORD");
+  const auto completion = write(&selected, 7);
+  std::copy(completion.begin(), completion.end(), nop_commands.begin() + 1);
+  nop_commands.back() = 0xffff1000u;
+  for (uint32_t predication : {1u, 0u}) {
+    Gen5::AgcSetRangePredication(nop_commands.data(), nop_commands.data() + nop_commands.size(), predication);
+    Require(name, "NOP range predication", nop_commands[0] == (0xffff1000u | predication) &&
+                nop_commands.back() == (0xffff1000u | predication) &&
+                nop_commands[1] == (completion[0] | predication) && nop_commands[5] == 7,
+            "range predication skipped a packet or modified a payload");
+    Pm4Execution execution;
+    selected = 0;
+    Require(name, "NOP and completion execution",
+            processor.Process(execution, nop_commands) == Pm4ProcessResult::Complete && selected == 7,
+            "one-DWORD NOP prevented the completion write or overread the stream end");
+  }
+  Common::File dump;
+  Require(name, "NOP dump file", dump.CreateInMem(), "could not create PM4 dump");
+  Pm4::DumpPm4PacketStream(&dump, nop_commands.data(), 0, nop_commands.size());
+  std::array<uint32_t, 3> payload{0, 0x12345678u, 0x9abcdef0u};
+  CommandBufferLayout payload_dcb{payload.data(), payload.data() + payload.size(),
+      payload.data(), payload.data() + payload.size(), nullptr, nullptr, 0};
+  Require(name, "NOP payload reservation",
+          Gen5::AgcCbNop(reinterpret_cast<Gen5::CommandBuffer*>(&payload_dcb), 3) == payload.data() &&
+              payload == std::array<uint32_t, 3>{0xc0011000u, 0x12345678u, 0x9abcdef0u},
+          "NOP emitter overwrote the caller's reserved payload");
+  for (const uint32_t value : {0x68750820u, 0x68751777u, 0x68751004u}) {
+    std::array<uint32_t, 8> commands{KYTY_PM4(3, Pm4::IT_NOP, Pm4::R_ZERO), value, 0x12345678u};
+    std::copy(completion.begin(), completion.end(), commands.begin() + 3);
+    processor.SetUserDataMarker(HW::UserSgprType::Unknown);
+    selected = 0;
+    Pm4Execution execution;
+    Require(name, "opaque NOP payload",
+            processor.Process(execution, commands) == Pm4ProcessResult::Complete && selected == 7 &&
+                processor.GetUserDataMarker() == HW::UserSgprType::Unknown && commands[1] == value,
+            "a NOP payload prefix executed a marker or blocked the following packet");
+  }
+  const std::array<uint32_t, 2> vsharp_marker{
+      KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO), 0x68750004u};
+  Pm4Execution marker_execution;
+  Require(name, "exact user-data marker",
+          processor.Process(marker_execution, vsharp_marker) == Pm4ProcessResult::Complete &&
+              processor.GetUserDataMarker() == HW::UserSgprType::Vsharp,
+          "exact marker dispatch lost the existing user-data annotation");
+  processor.SetUserDataMarker(HW::UserSgprType::Unknown);
+  alignas(8) uint64_t released = 0;
+  std::array<uint32_t, 20> disabled_commands{};
+  const auto disabled_write = write(&returned, 99);
+  std::copy(disabled_write.begin(), disabled_write.end(), disabled_commands.begin());
+  disabled_commands[5] = KYTY_PM4(2, Pm4::IT_NUM_INSTANCES, 0);
+  disabled_commands[6] = 0x68750123u;
+  CommandBufferLayout release_dcb{disabled_commands.data() + 7, disabled_commands.data() + 15,
+      disabled_commands.data() + 7, disabled_commands.data() + 15, nullptr, nullptr, 0};
+  auto* release = Gen5::AgcCbReleaseMem(
+      reinterpret_cast<Gen5::CommandBuffer*>(&release_dcb), 0x28, 0, 0, 0,
+      reinterpret_cast<const volatile Gen5::Label*>(&released), 2, 77, 0, 0, 0, 0);
+  const auto enabled_write = write(&selected, 88);
+  std::copy(enabled_write.begin(), enabled_write.end(), disabled_commands.begin() + 15);
+  const auto unpatched_commands = disabled_commands;
+  Require(name, "SetNop packets",
+          release == disabled_commands.data() + 7 &&
+              Gen5::AgcSetNop(disabled_commands.data()) == 0 &&
+              Gen5::AgcSetNop(disabled_commands.data() + 5) == 0 && Gen5::AgcSetNop(release) == 0 &&
+              disabled_commands[0] == ((disabled_write[0] & 0xffff00ffu) | (Pm4::IT_NOP << 8u)) &&
+              disabled_commands[5] == KYTY_PM4(2, Pm4::IT_NOP, Pm4::R_ZERO) &&
+              disabled_commands[6] == 0x123u &&
+              release[0] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ZERO) &&
+              unpatched_commands[7] == KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+              Gen5::AgcGetPacketSize(disabled_commands.data()) == disabled_write.size() &&
+              Gen5::AgcGetPacketSize(disabled_commands.data() + 5) == 2 &&
+              Gen5::AgcGetPacketSize(release) == 8 &&
+              std::equal(disabled_commands.begin() + 1, disabled_commands.begin() + 5,
+                         unpatched_commands.begin() + 1) &&
+              std::equal(disabled_commands.begin() + 8, disabled_commands.end(),
+                         unpatched_commands.begin() + 8),
+          "SetNop changed a packet length, kept its operation or marker, or touched its payload");
+  selected = returned = 0;
+  Pm4Execution disabled_execution;
+  Require(name, "SetNop execution",
+          processor.Process(disabled_execution, disabled_commands) == Pm4ProcessResult::Complete &&
+              returned == 0 && released == 0 && selected == 88,
+          "a disabled packet still executed or hid the packet after it");
   const auto then_commands = write(&selected, 11);
   const auto else_commands = write(&selected, 33);
   const auto branch_suffix = write(&selected, 44);
@@ -39996,6 +49612,56 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
     }
   }
 
+  std::array<uint32_t, 5> cx_packet{};
+  CommandBufferLayout cx_dcb{cx_packet.data(), cx_packet.data() + cx_packet.size(),
+                            cx_packet.data(), cx_packet.data() + cx_packet.size(),
+                            nullptr, nullptr, 0};
+  const ShaderRegister cx_register{Pm4::CB_TARGET_MASK, 0x76543210u};
+  Require(name, "indirect context packet size",
+          Gen5::AgcDcbSetCxRegistersIndirectGetSize() == sizeof(cx_packet) &&
+              Gen5::AgcDcbSetCxRegistersIndirect(
+                  reinterpret_cast<Gen5::CommandBuffer *>(&cx_dcb), &cx_register, 1) ==
+                  cx_packet.data() && cx_dcb.cursor_up == cx_dcb.top,
+          "indirect Cx size did not match the emitted command buffer");
+
+  std::array<uint32_t, 14> patched_branch{};
+  CommandBufferLayout branch_dcb{
+      patched_branch.data(), patched_branch.data() + patched_branch.size(),
+      patched_branch.data(), patched_branch.data() + patched_branch.size(),
+      nullptr, nullptr, 0};
+  Require(name, "branch packet size",
+          Gen5::AgcCbBranchGetSize() == sizeof(patched_branch) &&
+              Gen5::AgcCbBranch(reinterpret_cast<Gen5::CommandBuffer *>(&branch_dcb),
+                                1, 0, &condition, 0, 0, 0, nullptr, 0,
+                                3, else_commands.data(), else_commands.size()) ==
+                  patched_branch.data() && branch_dcb.cursor_up == branch_dcb.top,
+          "branch size did not match the emitted command buffer");
+  patched_branch[8] = 3;
+  patched_branch[10] = 0xc5a00000u;
+  const auto unpatched = patched_branch;
+  Require(name, "patched indirect context branch",
+          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 2,
+                                            cx_packet.data(), cx_packet.size()) == 0 &&
+              (patched_branch[8] & 3u) == 3u &&
+              patched_branch[10] == 0xe5a00005u &&
+              std::equal(patched_branch.begin(), patched_branch.begin() + 8,
+                         unpatched.begin()) &&
+              std::equal(patched_branch.begin() + 11, patched_branch.end(),
+                         unpatched.begin() + 11),
+          "branch target patch lost reserved fields or changed the condition/else target");
+  Pm4Execution patched_execution;
+  Require(name, "patched branch execution",
+          processor.Process(patched_execution, patched_branch) == Pm4ProcessResult::Complete &&
+              processor.GetCtx().GetRenderTargetMask() == cx_register.value,
+          "patched branch did not fetch and apply its indirect context registers");
+  patched_branch[0] = KYTY_PM4(14, Pm4::IT_NOP, 0);
+  const auto mismatched = patched_branch;
+  Require(name, "branch packet mismatch",
+          Gen5::AgcBranchPatchSetThenTarget(patched_branch.data(), 0,
+                                            then_commands.data(), then_commands.size()) ==
+                  static_cast<int>(0x8a6c000cu) && patched_branch == mismatched,
+          "branch patch accepted or changed a different packet type");
+
   // This stream exceeds native recursion capacity, while chains need one fetcher cursor.
   std::vector<std::array<uint32_t, 4>> links(65536);
   std::span<const uint32_t> target = then_commands;
@@ -40011,6 +49677,94 @@ void CheckPm4IndirectControlFlow(RenderContext &renderer) {
           processor.Process(execution, caller) == Pm4ProcessResult::Complete &&
               selected == 11 && returned == 22,
           "long chain did not complete and return to the original caller");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
+// waitUntilSafeForRendering stalls only its own command processor, and a display buffer
+// stays busy while its flip is pending or while it is on screen.
+void CheckWaitUntilSafeForRendering() {
+  constexpr const char *name = "WaitUntilSafeForRendering";
+  Require(name, "video", SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video init failed");
+  WindowContext window;
+  window.graphic_ctx.screen_width = 64;
+  window.graphic_ctx.screen_height = 64;
+  window.window = SDL_CreateWindow(name, 64, 64, SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
+  Require(name, "window", window.window != nullptr, "hidden Vulkan window failed");
+  window.CreateVulkan();
+  auto &video_out = VideoOut::VideoOutInit(64, 64, *window.presenter);
+  auto &renderer = *window.render_context;
+  renderer.InitializeGpu(&video_out);
+  auto &gpu = renderer.GetGpu();
+
+  constexpr int user_system = 255;
+  constexpr int bus_main = 0;
+  constexpr int flip_mode_vsync = 1;
+  // Special buffer indices flip without a registered surface.
+  constexpr int index_blank = -1;
+  constexpr int index_black = -2;
+  const int handle = VideoOut::VideoOutOpen(user_system, bus_main, 0, nullptr);
+  Require(name, "open", handle > 0, "video-out open failed");
+  const auto wait_until = [](const auto &done) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return done();
+  };
+  const auto address = [](const void *value) { return reinterpret_cast<uint64_t>(value); };
+
+  // Hold the graphics queue so the CPU flip of BLACK, prepared behind it, stays pending.
+  std::atomic_uint32_t gate{0};
+  std::array<uint32_t, 7> hold{};
+  hold[0] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+  hold[1] = 0x10u | 3u;
+  hold[2] = static_cast<uint32_t>(address(&gate));
+  hold[3] = static_cast<uint32_t>(address(&gate) >> 32u);
+  hold[4] = 1;
+  hold[5] = UINT32_MAX;
+  gpu.Submit(hold, {});
+  Require(name, "flip black",
+          VideoOut::VideoOutSubmitFlip(handle, index_black, flip_mode_vsync, 0) == 0,
+          "CPU flip failed");
+
+  std::atomic_uint32_t rendered{0};
+  std::array<uint32_t, 12> render{};
+  render[0] = KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE);
+  render[1] = static_cast<uint32_t>(handle);
+  render[2] = static_cast<uint32_t>(index_black);
+  render[7] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
+  render[9] = static_cast<uint32_t>(address(&rendered));
+  render[10] = static_cast<uint32_t>(address(&rendered) >> 32u);
+  render[11] = 1;
+  gpu.SubmitCompute(0x20, render);
+
+  std::binary_semaphore lane{0};
+  std::jthread command_lane([&] {
+    gpu.SendCommandSync([] {});
+    lane.release();
+  });
+  Require(name, "command lane", lane.try_acquire_for(std::chrono::seconds(2)),
+          "a busy display buffer blocked the GPU thread");
+  Require(name, "pending", rendered.load() == 0,
+          "rendering started while its display buffer had a pending flip");
+
+  gate.store(1);
+  Require(name, "flip shown", wait_until([handle] { return VideoOut::VideoOutIsFlipPending(handle) == 0; }),
+          "the BLACK flip was not presented");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  Require(name, "displayed", rendered.load() == 0,
+          "rendering started while its display buffer was on screen");
+
+  Require(name, "flip blank",
+          VideoOut::VideoOutSubmitFlip(handle, index_blank, flip_mode_vsync, 0) == 0,
+          "CPU flip failed");
+  Require(name, "resume", wait_until([&] { return rendered.load() == 1; }),
+          "rendering did not resume once its display buffer left the screen");
+
+  gpu.WaitForIdle();
+  Require(name, "close", VideoOut::VideoOutClose(handle) == 0, "video-out close failed");
+  renderer.ShutdownGpu();
+  VideoOut::VideoOutShutdown();
   std::printf("[host]    %-32s ok\n", name);
 }
 
@@ -40082,35 +49836,97 @@ void CheckPm4WaitResume(RenderContext &renderer) {
 }
 
 void CheckPm4RewindResume(RenderContext &renderer) {
+  constexpr const char *name = "Pm4RewindResume";
+  Loader::SymbolDatabase symbols;
+  Libs::InitAgcDriver_1(&symbols);
+  const auto *emit_symbol = symbols.FindByNid("DwICrVxerkY", Loader::SymbolType::Func);
+  const auto *patch_symbol = symbols.FindByNid("eWaWyFegzgQ", Loader::SymbolType::Func);
+  Require(name, "async exports",
+          emit_symbol != nullptr && patch_symbol != nullptr &&
+              emit_symbol->vaddr == reinterpret_cast<uint64_t>(&Gen5::AgcAcbRewind) &&
+              patch_symbol->vaddr ==
+                  reinterpret_cast<uint64_t>(&Gen5::AgcRewindPatchSetRewindState),
+          "async rewind imports did not resolve to the emitter and state patch");
+  const auto async_patch = reinterpret_cast<decltype(&Gen5::AgcRewindPatchSetRewindState)>(
+      patch_symbol->vaddr);
+
+  constexpr uint32_t sentinel = 0x12345678u;
+  std::array<uint32_t, 4> packet{sentinel, sentinel, sentinel, sentinel};
+  CommandBufferLayout acb{packet.data(), packet.data() + packet.size(),
+                          packet.data() + 1, packet.data() + 3, nullptr, nullptr, 0};
+  auto *buffer = reinterpret_cast<Gen5::CommandBuffer *>(&acb);
+  for (const uint8_t state : {0, 1}) {
+    for (const uint8_t offload : {0, 1}) {
+      acb.cursor_up = packet.data() + 1;
+      Require(name, "async packet",
+              Gen5::AgcAcbRewind(buffer, state, offload) == packet.data() + 1 &&
+                  acb.cursor_up == packet.data() + 3 &&
+                  packet[0] == sentinel && packet[3] == sentinel &&
+                  packet[1] == 0xc0005900u &&
+                  packet[2] == ((uint32_t{state} << 31u) | (uint32_t{offload} << 24u)),
+              "async rewind packet or two-DWORD allocation differs from the native command");
+    }
+  }
+  const auto before = packet;
+  acb.cursor_up = packet.data() + 1;
+  acb.reserved_dw = 1;
+  Require(name, "bounded allocation",
+          Gen5::AgcAcbRewind(buffer, 1, 1) == nullptr &&
+              Gen5::AgcAcbRewind(nullptr, 1, 1) == nullptr &&
+              acb.cursor_up == packet.data() + 1 && packet == before,
+          "failed rewind allocation changed the cursor or command storage");
+
+  // Native patchers inspect only the opcode, preserving the header and low 31 bits.
+  std::array<uint32_t, 2> command{0xa5ff591fu, 0x0155aa55u};
+  Require(name, "patch preserves fields",
+          async_patch(command.data(), 1) == 0 && command[0] == 0xa5ff591fu &&
+              command[1] == 0x8155aa55u && async_patch(command.data(), 0) == 0 &&
+              command[0] == 0xa5ff591fu && command[1] == 0x0155aa55u,
+          "rewind patch changed the offload bit, header, or unrelated payload bits");
+  command[0] = 0xc0001000u;
+  const auto invalid = command;
+  Require(name, "wrong opcode",
+          async_patch(command.data(), 1) == static_cast<int>(0x8a6c000cu) &&
+              command == invalid,
+          "rewind patch accepted or modified a packet with the wrong opcode");
+
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-
-  uint32_t suffix = 0;
-  const auto address = reinterpret_cast<uint64_t>(&suffix);
-  std::array<uint32_t, 7> commands{};
-  commands[0] = KYTY_PM4(2, Pm4::IT_REWIND, 0);
-  commands[1] = 0;
-  commands[2] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0);
-  commands[3] = 0;
-  commands[4] = static_cast<uint32_t>(address);
-  commands[5] = static_cast<uint32_t>(address >> 32u);
-  commands[6] = 33;
-
-  Pm4Execution execution;
-  Require("Pm4RewindResume", "pending",
-          processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
-              suffix == 0,
-          "pending rewind did not preserve its command position");
-  Require("Pm4RewindResume", "patch valid",
-          Gen5::AgcRewindPatchSetRewindState(commands.data(), 1) == 0 &&
-              commands[1] == 0x80000000u,
-          "rewind state patch did not set the valid bit");
-  Require("Pm4RewindResume", "resume",
-          processor.Process(execution, commands) ==
-                  Pm4ProcessResult::Complete &&
-              suffix == 33,
-          "valid rewind did not resume at the following packet");
-  std::printf("[host]    %-32s ok\n", "Pm4RewindResume");
+  for (const bool async : {false, true}) {
+    for (const uint8_t offload : {0, 1}) {
+      if (!async && offload != 0) {
+        continue;
+      }
+      uint32_t suffix = 0;
+      const auto address = reinterpret_cast<uint64_t>(&suffix);
+      std::array<uint32_t, 7> commands{
+          0, 0, KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+          static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u), 33};
+      CommandBufferLayout cb{commands.data(), commands.data() + 2,
+                             commands.data(), commands.data() + 2, nullptr, nullptr, 0};
+      auto *command_buffer = reinterpret_cast<Gen5::CommandBuffer *>(&cb);
+      const auto *emitted = async ? Gen5::AgcAcbRewind(command_buffer, 0, offload)
+                                 : Gen5::AgcDcbRewind(command_buffer, 0);
+      const auto patch = async ? async_patch : &Gen5::AgcRewindPatchSetRewindState;
+      Pm4Execution execution;
+      Require(name, "pending",
+              emitted == commands.data() &&
+                  processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
+                  suffix == 0,
+              "pending rewind did not preserve its command position");
+      Require(name, "still pending",
+              processor.Process(execution, commands) == Pm4ProcessResult::Blocked &&
+                  !execution.MadeProgress() && suffix == 0,
+              "pending rewind advanced before its state was patched");
+      Require(name, "patch and resume",
+              patch(commands.data(), 1) == 0 &&
+                  commands[1] == (0x80000000u | (uint32_t{offload} << 24u)) &&
+                  processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
+                  suffix == 33,
+              "patched rewind lost the offload bit or failed to resume");
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 void CheckPm4CeCompletion(RenderContext &renderer) {
@@ -40174,6 +49990,33 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, CvtPkrtzF16F32SubnormalRoundsTowardZero());
+    RunCase(&vulkan, CvtPkrtzF16F32RuntimeEdges());
+    RunCase(&vulkan, CvtPkrtzF16F32SdwaAndOutputModifiers());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
+    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
+    // compile it.
+    static constexpr ShaderProfile native_profile{.maintenance8 = true,
+                                                  .native_float_min_max = true};
+    VulkanHarness vulkan;
+    const bool supported = vulkan.SupportsNativeFloatMinMax();
+    for (bool native : {false, true}) {
+      for (auto test :
+           {VectorMinMaxF32NanAndSignedZeroEdges(),
+            VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
+        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+        spirv = {" NMin ", " NMax "};
+        test.profile = native ? &native_profile : &Maintenance8Profile;
+        test.compile_only = native && !supported;
+        RunCase(&vulkan, test);
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
@@ -40182,10 +50025,14 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);
+    for (u32 wave_size : {32u, 64u})
+      for (bool gds : {false, true})
+        RunCase(&vulkan, DsReadWriteFullRegionAddress(wave_size, gds));
     RunCase(&vulkan, DsWideLdsPartialBounds());
     RunCase(&vulkan, DsAtomic64Bounds(false));
     RunCase(&vulkan, DsAtomic64Bounds(true));
-    for (auto test : {DsWideLdsPartialBounds(), DsAtomic64Bounds(false), DsAtomic64Bounds(true)}) {
+    for (auto test : {DsWideLdsPartialBounds(), DsAtomic64Bounds(false), DsAtomic64Bounds(true), DsAtomicReturn64(),
+                      DsCompareStoreReturn32()}) {
       test.compute_info.lds_storage = true;
       std::erase(test.required_spirv, "WorkgroupMemoryExplicitLayoutKHR");
       test.required_spirv.push_back("StorageBuffer");
@@ -40194,11 +50041,19 @@ int main(int argc, char **argv) {
     vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--integer64-compare-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--integer64-compare-only") == 0 ||
+                    std::strcmp(argv[1], "--cmp-i64-only") == 0)) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());
     RunCase(&vulkan, VectorCompareExecWaveMasks(32));
     RunCase(&vulkan, VectorCompareExecWaveMasks(64));
+    RunCase(&vulkan, VectorCompare64WaveMasks(32, true));
+    RunCase(&vulkan, VectorCompare64WaveMasks(64, true));
+    RunCase(&vulkan, VectorVop3CompareEqI64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareEqU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareGtU64OnGpu());
+    RunCase(&vulkan, VectorVopcCompareLtU64OnGpu());
+    RunCase(&vulkan, VectorVop3CompareNeU64OnGpu());
     RunCase(&vulkan, VectorVopcCmpxNeU64CapturedExecMask());
     RunCase(&vulkan, VectorVop3CmpxNeI64CapturedExecMask());
     return 0;
@@ -40221,17 +50076,18 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, DsAtomic64Contention(add, wave_size));
       }
     }
+    RunCase(&vulkan, DsAtomicReturn64());
     RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
+    RunCase(&vulkan, BufferAtomicAddX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
+    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
     return 0;
   }
-  CheckShaderFunctionExpansionCache();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
@@ -40239,10 +50095,21 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
     VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsSparseWaveMinimum());
+    RunCase(&vulkan, ComputeWave64Minimum(false));
+    RunCase(&vulkan, ComputeWave64Minimum(true));
     RunCase(&vulkan, VectorDpp8Captured(false));
-    RunCase(&vulkan, VectorDpp8Captured(true));
+    for (const u32 wave_size : {32u, 64u})
+      for (const bool fi : {false, true})
+        RunCase(&vulkan, VectorDpp8Captured(true, wave_size, fi));
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppRowShare(32));
+    RunCase(&vulkan, VectorDppRowShare(64));
+    RunCase(&vulkan, VectorDppMirrorAndRotate(32));
+    RunCase(&vulkan, VectorDppMirrorAndRotate(64));
+    RunCase(&vulkan, VectorReadFirstLaneExecMasks(32));
+    RunCase(&vulkan, VectorReadFirstLaneExecMasks(64));
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
     return 0;
@@ -40259,7 +50126,24 @@ int main(int argc, char **argv) {
       RunCase(&vulkan, VectorCompareF32DenormalModes(mode));
     }
     RunCase(&vulkan, VectorCompareClassF32());
+    for (const u32 wave : {32u, 64u}) {
+      RunCase(&vulkan, VectorCompareClassF32ImmediateAndDynamicMasks(wave));
+      RunCase(&vulkan, VectorMed3F32NanUsesMin3Path(wave));
+    }
     RunCase(&vulkan, VectorCompareF16Ops());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--int16-alu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorCompareI16U16Ops());
+    RunCase(&vulkan, Vop3Int16Ops());
+    RunCase(&vulkan, Vop3pInt16Ops());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-zero-bit-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarZeroBitOps());
+    RunCase(&vulkan, ScalarBitfieldPack());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {
@@ -40269,6 +50153,15 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    for (const auto &test : BufferLoadFormatD16XCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferLoadFormatD16VectorCases()) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : BufferStoreFormatD16Cases()) {
+      RunCase(&vulkan, test);
+    }
     for (const auto &test : FormattedStoreConversionCases()) {
       RunCase(&vulkan, test);
     }
@@ -40279,6 +50172,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
+    RunCase(&vulkan, TBufferStoreFormatXSintWritesSubDword());
+    for (bool masked : {false, true}) {
+      RunCase(&vulkan, BufferStoreD16Hi(false, masked, 64));
+      for (u32 wave_size : {32u, 64u})
+        RunCase(&vulkan, BufferStoreD16Hi(true, masked, wave_size));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
@@ -40326,6 +50225,25 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcSdwaCmpxClassF32CapturedExecMask());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--class-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorCmpClassF16(32));
+    RunCase(&vulkan, VectorCmpClassF16(64));
+    RunCase(&vulkan, VectorCmpxClassF16(32));
+    RunCase(&vulkan, VectorCmpxClassF16(64));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-class-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorCmpxClassF16(32));
+    RunCase(&vulkan, VectorCmpxClassF16(64));
+    RunCase(&vulkan, VectorCompareClassF32());
+    RunCase(&vulkan, VectorVopcSdwaCmpxClassF32CapturedExecMask());
+    RunCase(&vulkan, FloatInlineConstantF16UsesNumericValue());
+    RunCase(&vulkan, VectorCompareF16Ops());
+    RunCase(&vulkan, VectorMinMaxF16Ops());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmp-eq-f64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareF64Edges());
@@ -40367,16 +50285,41 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ImageSampleUScaled8<false>());
-    RunCase(&vulkan, ImageSampleUScaled8<true>());
+    RunCase(&vulkan, ImageSamplePacked8<false>());
+    RunCase(&vulkan, ImageSamplePacked8<true>());
+    RunCase(&vulkan, ImageSamplePacked8<false, true>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--msaa-storage-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMsaaStorageClear();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-bits-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthBitsCopy();
+    RunCase(&vulkan, ImageLoadDepthBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<false>());
+    RunCase(&vulkan, ImageLoadSintUsesSignedSampledImage<true>());
     vulkan.CheckPackedTextureComponents();
+    CheckSigned16ImageStore(vulkan);
     vulkan.CheckBgra16Readback();
     RunCase(&vulkan, ImageLoadPackedUintUnpacksAndSwizzles());
+    RunCase(&vulkan, ImageLoadPackedUnorm<false, false>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<false, true>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<true, false>());
+    RunCase(&vulkan, ImageLoadPackedUnorm<true, true>());
     RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
+    RunCase(&vulkan, ImageSamplePackedUnormBilinear<false>());
+    RunCase(&vulkan, ImageSamplePackedUnormBilinear<true>());
+    RunCase(&vulkan, ImageStorePackedUintSaturatesChannels());
+    RunCase(&vulkan, ImageStorePackedUintHonorsSparseDmask());
+    RunCase(&vulkan, ImageStorePackedUnorm<false>());
+    RunCase(&vulkan, ImageStorePackedUnorm<true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--system-dialog-only") == 0) {
@@ -40409,8 +50352,24 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-sext-only") == 0) {
+    VulkanHarness vulkan;
+    for (const u32 bits : {8u, 16u}) {
+      RunCase(&vulkan, ScalarSextMasks(bits, 32));
+      RunCase(&vulkan, ScalarSextMasks(bits, 64));
+    }
+    RunCase(&vulkan, ScalarSextConstantsAndAliases());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
     VulkanHarness vulkan;
+    for (const auto opcode : {ShaderOpcode::BUFFER_LOAD_SHORT_D16, ShaderOpcode::BUFFER_LOAD_SHORT_D16_HI})
+      RunCase(&vulkan, BufferLoadD16Captured(opcode));
+    for (const u32 wave : {32u, 64u})
+      RunCase(&vulkan, BufferLoadD16Captured(ShaderOpcode::BUFFER_LOAD_UBYTE_D16, wave));
+    RunCase(&vulkan, FlatStoreSlcCaptured());
+    RunCase(&vulkan, FlatLoadDlcCaptured(32));
+    RunCase(&vulkan, FlatLoadDlcCaptured(64));
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
@@ -40425,12 +50384,17 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(64));
+    CheckBoundedFormattedBufferCopy(vulkan);
+    CheckFiniteBufferSelection(vulkan);
     CheckIndirectBufferStore(vulkan);
+    CheckBoundedRecordBufferAccess(vulkan);
+    CheckGpuSelectedRecordBufferAccess(vulkan);
+    CheckGuardedWaterfallBufferRecords(vulkan);
+    CheckGpuSelectedFormattedRecordStore(vulkan);
     CheckRuntimeBufferRecords(vulkan);
-    RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
-    RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
-    RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
+    CheckSharedIndirectBufferLoads(vulkan);
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors64());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
@@ -40440,8 +50404,21 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-sample-offset-only") == 0) {
+    VulkanHarness vulkan;
+    CheckDynamicSampleOffsets(vulkan, 32u);
+    CheckDynamicSampleOffsets(vulkan, 64u);
+    RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<32>());
+    RunCase(&vulkan, ImageSampleOffsetsReadFourNeighbors<64>());
+    RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>());
+    RunCase(&vulkan, ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>());
+    RunCase(&vulkan, ImageSampleAndGather());
+    RunCase(nullptr, ImageGatherCompareOpcodes());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-lod-only") == 0) {
     VulkanHarness vulkan;
+    vulkan.CheckComparisonDepthTexture();
     RunCase(&vulkan, ImageGatherExplicitLod());
     RunCase(&vulkan, ImageGatherLodPerLane<0>());
     RunCase(&vulkan, ImageGatherLodPerLane<1>());
@@ -40452,6 +50429,8 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageGatherLodPerLane<6>());
     RunCase(&vulkan, ImageGatherLodPerLane<7>());
     RunCase(&vulkan, ImageGatherLodPerLane<8>());
+    RunCase(&vulkan, ImageGatherLodPerLane<9>());
+    RunCase(&vulkan, ImageGatherLodPerLane<10>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<0>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<1>());
     RunCase(&vulkan, ImageStoreSingleMipBounds<2>());
@@ -40493,6 +50472,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 4));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 4));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32, true));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64, true));
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherExplicitLod());
@@ -40500,14 +50485,33 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--front-face-only") == 0) {
+    CheckPixelFrontFaceModes();
+    VulkanHarness vulkan;
+    for (bool all_bits : {false, true}) {
+      for (bool reversed : {false, true}) {
+        RunGraphicsCase(&vulkan, GraphicsFrontFaceBits(reversed, all_bits));
+      }
+    }
+    RunGraphicsCase(&vulkan, GraphicsAncillaryLayer(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--object-primitive-id-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(false));
+    RunGraphicsCase(&vulkan, GraphicsObjectPrimitiveId(true));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(false));
+    RunGraphicsCase(&vulkan, GraphicsPerspectiveSample(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {
@@ -40518,6 +50522,11 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(false));
     RunGraphicsCase(&vulkan, GraphicsPackedHalfInputAlias(true));
     RunGraphicsCase(&vulkan, GraphicsSmoothRawInputAlias());
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(false));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(false, true));
+    RunGraphicsCase(&vulkan, GraphicsSmoothFlatInputAlias(true, true));
+    RunGraphicsCase(&vulkan, GraphicsFlatInterpolatorExport());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
@@ -40561,11 +50570,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     CheckResourcePlanHandoff();
     VulkanHarness vulkan;
-    RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    RunCase(&vulkan, BufferOffsetsUsePackedWords(false));
+    RunCase(&vulkan, BufferOffsetsUsePackedWords(true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
     VulkanHarness vulkan;
+    for (const u32 wave : {32u, 64u}) {
+      for (const u32 prefix : {0u, 4u})
+        RunCase(&vulkan, CoherentBufferLoadDwordx2Bounds(wave, prefix));
+      RunCase(&vulkan, CoherentBufferPairContention(wave));
+    }
+    RunCase(&vulkan, CoherentBufferLoadDwordx2Swizzled());
     RunCase(&vulkan, BufferWorkgroupPublication(32));
     RunCase(&vulkan, BufferWorkgroupPublication(64));
     RunCase(&vulkan, BufferWorkgroupPublication(32, true));
@@ -40584,6 +50600,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageAtomicCompareSwapGlcAndExec());
     RunCase(&vulkan, ImageAtomicSwapReturnsPreviousTexel());
     RunCase(&vulkan, ImageAtomicVariants());
+    RunCase(&vulkan, ImageAtomicVariants<true>());
+    RunCase(&vulkan, ImageAtomicSignedMinMax<false, true>());
+    RunCase(&vulkan, ImageAtomicSignedMinMax<true, true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-atomic64-only") == 0) {
@@ -40591,6 +50610,14 @@ int main(int argc, char **argv) {
     for (const auto &atomic : ImageAtomicIntegerCases) {
       RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, false));
       RunCase(&vulkan, ImageAtomicIntegerGlcAndExec(atomic, true));
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-ordered-count-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 wave_size : {32, 64}) {
+      RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, false));
+      RunCase(&vulkan, DsOrderedCountAddressAndExec(wave_size, true));
     }
     return 0;
   }
@@ -40614,14 +50641,32 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--image-layout-only") == 0) {
+    CheckStorageTextureLinearUploadLayout();
+    CheckStorageTextureDepthTileUploadLayout();
+    CheckStorageTextureVolumeUploadLayout();
+    CheckStorageTextureVolumeMipRegions();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-leaf-call-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckScalarLeafCall();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wait-until-safe-for-rendering-only") == 0) {
+    CheckWaitUntilSafeForRendering();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    vulkan.CheckScalarLeafCall();
+    CheckAgcSystemTable(vulkan.RuntimeRenderer());
     CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
@@ -40631,6 +50676,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuSuspendPoint();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarDynamic64BitOps());
+    RunCase(&vulkan, VectorDynamicU64ShiftEdges());
+    RunCase(&vulkan, ScalarAshrI64Edges(false));
+    RunCase(&vulkan, ScalarAshrI64Edges(true));
+    RunCase(&vulkan, VectorCompareInteger64Edges());
+    RunCase(&vulkan, VectorMadU64U32UnsignedCarryOut());
+    RunCase(&vulkan, ScalarWqmB64SelectsSccDomain());
+    RunCase(&vulkan, ScalarWqmB64PreservesPartialMasks());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -40652,9 +50709,20 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarZeroShiftWithRuntimeCount());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-bitwise-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(32));
+    RunCase(&vulkan, Vop2SdwaBitwiseByteDestinations(64));
+    RunCase(&vulkan, Vop2SdwaLshlrevByteDestinations(32));
+    RunCase(&vulkan, Vop2SdwaLshlrevByteDestinations(64));
+    RunCase(&vulkan, Vop1SdwaNotPartialSourcesAndDestinations());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteDestinations());
+    RunCase(&vulkan, Vop1SdwaMovByteSources(32));
+    RunCase(&vulkan, Vop1SdwaMovByteSources(64));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ffbh-only") == 0) {
@@ -40697,6 +50765,22 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-mul-i24-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
+    RunCase(&vulkan, Vop2SdwaMulI24Destinations(64));
+    RunCase(&vulkan, VectorIntegerOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-mul-u24-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaMulU24Destinations(32));
+    RunCase(&vulkan, Vop2SdwaMulU24Destinations(64));
+    RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
+    RunCase(&vulkan, Vop2SdwaMulI24Destinations(64));
+    RunCase(&vulkan, VectorIntegerOps());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
@@ -40704,12 +50788,18 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
     VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
     RunCase(&vulkan, Vop3Med3I16Captured());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mul-lo-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3MulLoU16CapturedAndSelectors());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--clamp-nan-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3F32ClampFlushesNaN());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-i16-only") == 0) {
@@ -40742,6 +50832,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--pm4-wait-only") == 0) {
     VulkanHarness vulkan;
+    CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     return 0;
@@ -40754,6 +50845,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--rewind-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLargeSparseImageUpload();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
@@ -40802,6 +50898,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--compute-meta-clear-only") == 0) {
     CheckDynamicRenderingState();
+    CheckPs5GameExampleImageClearRuntimeShape();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
     vulkan.CheckNativeIndirectDispatch();
@@ -40814,6 +50911,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeIndirectDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ordered-dispatch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckOrderedDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-stride-binding-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckZeroStrideBufferBinding();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
@@ -40834,6 +50941,12 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
     CheckDepthTargetFootprints();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-page-table-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaPageTableUploads();
+    vulkan.CheckBdaSyncUploads();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-range-only") == 0) {
@@ -40863,8 +50976,16 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
-    CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
+    vulkan.CheckNullTextureDescriptors();
+    CheckCountedRowImageSelector(vulkan);
+    CheckPointerImageTable(vulkan);
+    CheckNestedPointerImageTable(vulkan);
+    CheckGuardedRecordImageTable(vulkan);
+    CheckIndirectImageKeySwitch(vulkan);
+    vulkan.CheckResidentImageHeap();
+    CheckFiniteFirstLaneImageChoice(vulkan);
+    CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
@@ -40997,7 +51118,7 @@ int main(int argc, char **argv) {
   CheckErrorDialogLifecycle();
   CheckSigninDialogLifecycle();
   CheckVulkan13FeatureRequirements();
-  CheckPm4AcquireMemNoOp(vulkan.RuntimeRenderer());
+  CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
   CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
   CheckPm4Predication(vulkan.RuntimeRenderer());
   CheckPm4StencilInfoValueLane(vulkan.RuntimeRenderer());
@@ -41011,6 +51132,7 @@ int main(int argc, char **argv) {
   CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckPm4DepthRenderOverride(vulkan.RuntimeRenderer());
   CheckShaderFusion();
+  CheckAgcSystemTable(vulkan.RuntimeRenderer());
   CheckPm4WaitPackets(vulkan.RuntimeRenderer());
   CheckPm4DrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
@@ -41022,11 +51144,29 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();
+  CheckPixelFrontFaceModes();
   CheckRectListShaders();
+  CheckSigned16ImageStore(vulkan);
+  CheckBoundedFormattedBufferCopy(vulkan);
   CheckIndirectBufferStore(vulkan);
+  CheckBoundedRecordBufferAccess(vulkan);
+  CheckGpuSelectedRecordBufferAccess(vulkan);
+  CheckGuardedWaterfallBufferRecords(vulkan);
+  CheckGpuSelectedFormattedRecordStore(vulkan);
+  CheckFiniteBufferSelection(vulkan);
   CheckRuntimeBufferRecords(vulkan);
+  CheckSharedIndirectBufferLoads(vulkan);
   CheckComputeThreadDimensions(vulkan);
-  CheckIndirectImageKeySwitch();
+  CheckCountedRowImageSelector(vulkan);
+  CheckPointerImageTable(vulkan);
+  CheckNestedPointerImageTable(vulkan);
+  CheckGuardedRecordImageTable(vulkan);
+  CheckIndirectImageKeySwitch(vulkan);
+  vulkan.CheckResidentImageHeap();
+  CheckDynamicSampleOffsets(vulkan, 32u);
+  CheckDynamicSampleOffsets(vulkan, 64u);
+  CheckFiniteFirstLaneImageChoice(vulkan);
+  CheckFiniteInlineSamplerPhi(vulkan);
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
@@ -41037,18 +51177,25 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  vulkan.CheckOrderedDispatch();
+  vulkan.CheckZeroStrideBufferBinding();
+  vulkan.CheckNullTextureDescriptors();
+  vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckBdaSyncUploads();
+  vulkan.CheckLargeSparseImageUpload();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
+    vulkan.CheckDepthBitsCopy();
+    vulkan.CheckMsaaStorageClear();
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
@@ -41057,7 +51204,6 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
-#endif
   } else {
     skipped_device_checks = true;
   }
@@ -41072,6 +51218,9 @@ int main(int argc, char **argv) {
   }
   vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
+  vulkan.CheckScalarLeafCall();
+  // Last: its window installs global GPU resources.
+  CheckWaitUntilSafeForRendering();
   if (skipped_device_checks) {
     std::printf(
         "ShaderRecompilerComputeTests: device rasterization checks skipped, this "

@@ -1,7 +1,5 @@
 #include "graphics/shader/recompiler/ir/Value.h"
 
-#include "common/config.h"
-
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -27,6 +25,22 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
+bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
 Type Value::GetType() const {
 	if (IsPhi()) {
 		return inst->Flags<Type>();
@@ -40,6 +54,19 @@ Type Value::GetType() const {
 Inst* Value::Instruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return inst;
+}
+
+Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -67,6 +94,11 @@ uint16_t Value::U16() const {
 	return imm_u16;
 }
 
+uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
 uint64_t Value::U64() const {
 	EXIT_IF(type != Type::U64);
 	return imm_u64;
@@ -80,44 +112,6 @@ uint16_t Value::F16Bits() const {
 float Value::F32Value() const {
 	EXIT_IF(type != Type::F32);
 	return std::bit_cast<float>(imm_u32);
-}
-
-uint64_t Value::ImmediateBits() const {
-	switch (type) {
-		case Type::Void: return 0;
-		case Type::ScalarReg: return static_cast<uint16_t>(scalar_reg);
-		case Type::VectorReg: return static_cast<uint16_t>(vector_reg);
-		case Type::U1: return imm_u1 ? 1u : 0u;
-		case Type::U8: return imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32;
-		case Type::U64: return imm_u64;
-		default: EXIT("Value::ImmediateBits: not an immediate (type %u)\n", static_cast<uint32_t>(type));
-	}
-	return 0;
-}
-
-bool Value::FromImmediateBits(Type type, uint64_t bits, Value& result) {
-	const auto fits = [bits](uint64_t max) { return bits <= max; };
-	switch (type) {
-		case Type::Void: result = Value(); return bits == 0;
-		case Type::ScalarReg:
-			result = Value(static_cast<ScalarReg>(static_cast<uint16_t>(bits)));
-			return fits(UINT16_MAX);
-		case Type::VectorReg:
-			result = Value(static_cast<VectorReg>(static_cast<uint16_t>(bits)));
-			return fits(UINT16_MAX);
-		case Type::U1: result = Value(bits != 0); return fits(1);
-		case Type::U8: result = Value(static_cast<uint8_t>(bits)); return fits(UINT8_MAX);
-		case Type::U16: result = Value(static_cast<uint16_t>(bits)); return fits(UINT16_MAX);
-		case Type::F16: result = F16(static_cast<uint16_t>(bits)); return fits(UINT16_MAX);
-		case Type::U32: result = Value(static_cast<uint32_t>(bits)); return fits(UINT32_MAX);
-		case Type::F32: result = Value(Type::F32, bits); return fits(UINT32_MAX);
-		case Type::U64: result = Value(bits); return true;
-		default: return false;
-	}
 }
 
 bool Value::operator==(const Value& other) const {
@@ -156,6 +150,10 @@ Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
 
 Inst::~Inst() {
 	ClearArgs();
+}
+
+ValueOpcode Inst::GetOpcode() const {
+	return opcode;
 }
 
 Type Inst::GetType() const {
@@ -240,25 +238,9 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	// Every use goes, so the list is taken over at once: rewriting each user's slot and appending
-	// it to the replacement's uses, in the same order as SetArg would, without searching and
-	// erasing this instruction's list once per use (quadratic for widely used values; the SSA
-	// rewrite and identity removal spent most of a big shader's IR passes there).
-	// Leave the argument lists first, while this list is intact (a phi can use itself; Invalidate
-	// below then finds nothing to remove): when the replacement is one of this instruction's own
-	// arguments, as for every identity, removing this instruction from its list before the moved
-	// uses are appended shifts only the older entries, and the list ends up in the same order.
-	ClearArgs();
-	auto  old_uses         = std::move(uses);
-	auto* replacement_inst = replacement.TryInstruction();
-	uses.clear();
+	const auto old_uses = uses;
 	for (const auto& use: old_uses) {
-		EXIT_IF(use.operand >= use.user->NumArgs() || use.user->Arg(use.operand).TryInstruction() != this);
-		use.user->ArgSlot(use.operand) = replacement;
-		if (replacement_inst != nullptr) {
-			// That slot held this instruction until now, so the replacement cannot list it yet.
-			replacement_inst->uses.push_back({use.user, use.operand});
-		}
+		use.user->SetArg(use.operand, replacement);
 	}
 	Invalidate();
 	if (preserve) {
@@ -274,90 +256,17 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-#if KYTY_BUILD == KYTY_BUILD_DEBUG
-	// A linear search of every use: quadratic for widely used values, so debug builds only.
 	const auto found = std::ranges::find_if(
 	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
 	EXIT_IF(found != used->uses.end());
-#endif
 	used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
-	// Uses are unique, and the one removed is usually among the most recent: search from the end.
-	auto&      list  = used->uses;
-	const auto found = std::find_if(list.rbegin(), list.rend(), [&](const Use& use) {
-		return use.user == this && use.operand == operand;
-	});
-	EXIT_IF(found == list.rend());
-	list.erase(std::next(found).base());
-}
-
-void Inst::ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
-                                 std::vector<Inst*>& touched) {
-	auto  old_uses         = std::move(uses);
-	auto* replacement_inst = replacement.TryInstruction();
-	uses.clear();
-	for (const auto& use: old_uses) {
-		if (use.user == this || removed.contains(use.user)) {
-			continue;
-		}
-		EXIT_IF(use.operand >= use.user->NumArgs() ||
-		        use.user->Arg(use.operand).TryInstruction() != this);
-		use.user->ArgSlot(use.operand) = replacement;
-		if (replacement_inst != nullptr) {
-			replacement_inst->uses.push_back({use.user, use.operand});
-		}
-	}
-	for (size_t index = 0; index < NumArgs(); index++) {
-		if (auto* target = Arg(index).TryInstruction(); target != nullptr && target != this) {
-			touched.push_back(target);
-		}
-	}
-	ResetArgStorage();
-	opcode = ValueOpcode::Void;
-}
-
-void Inst::DropRemovedUses(std::span<Inst* const>              touched,
-                           const std::unordered_set<const Inst*>& removed) {
-	// Each target once: a value many identities folded into would be filtered once per identity.
-	std::vector<Inst*> targets(touched.begin(), touched.end());
-	std::ranges::sort(targets);
-	targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-	for (auto* target: targets) {
-		// A removed target is erased already; the others drop their removed users in one pass.
-		if (!removed.contains(target)) {
-			std::erase_if(target->uses, [&](const Use& use) { return removed.contains(use.user); });
-		}
-	}
-}
-
-void Inst::DropForDestruction() {
-	// Every instruction that could refer to this one is being destroyed with it.
-	ResetArgStorage();
-	uses.clear();
-	opcode = ValueOpcode::Void;
-}
-
-Value& Inst::ArgSlot(size_t index) {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
-}
-
-void Inst::ResetArgStorage() {
-	if (num_args == PhiArity) {
-		std::destroy_at(&phi_args);
-		std::construct_at(&fixed_args);
-	} else if (num_args > InlineArity) {
-		std::destroy_at(&large_args);
-		std::construct_at(&fixed_args);
-	} else {
-		fixed_args.fill(Value {});
-	}
-	num_args = 0;
+	const auto found = std::ranges::find_if(
+	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
+	EXIT_IF(found == used->uses.end());
+	used->uses.erase(found);
 }
 
 void Inst::ClearArgs() {

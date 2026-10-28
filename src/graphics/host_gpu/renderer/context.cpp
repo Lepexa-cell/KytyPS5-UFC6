@@ -4,13 +4,11 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -19,29 +17,15 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()), m_scheduler(scheduler) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
 bool CommandBuffer::IsInvalid() const {
-	return !m_open;
+	return m_buffer == nullptr;
 }
 
 vk::CommandBuffer CommandBuffer::Handle() const {
 	EXIT_IF(IsInvalid());
-	if (m_scheduler.Threaded()) {
-		// Recording directly: the recording thread must have run everything queued first.
-		return m_scheduler.DrainRecording();
-	}
 	return m_buffer;
-}
-
-CommandRecorder CommandBuffer::Recorder() const {
-	EXIT_IF(IsInvalid());
-	if (m_scheduler.Threaded()) {
-		return CommandRecorder(m_scheduler, nullptr);
-	}
-	CommandRecorder recorder(m_buffer);
-	recorder.BindScheduler(m_scheduler);
-	return recorder;
 }
 
 void CommandBuffer::Begin() {
@@ -58,10 +42,6 @@ void CommandBuffer::Begin() {
 
 void CommandBuffer::End() const {
 	EndRendering();
-	if (m_scheduler.Threaded()) {
-		// The recording thread ends it before submitting (CommandScheduler::Submit).
-		return;
-	}
 	auto buffer = Handle();
 
 	auto result = buffer.end();
@@ -78,18 +58,6 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg2      = arg2;
 	m_debug_arg3      = arg3;
 	m_debug_arg4      = arg4;
-	if (m_graphics.diagnostic_checkpoints_enabled && !IsInvalid()) {
-		const auto* marker = RecordDiagnosticCheckpoint({.op        = op,
-		                                                 .submit_id = submit_id,
-		                                                 .arg0      = arg0,
-		                                                 .arg1      = arg1,
-		                                                 .arg2      = arg2,
-		                                                 .arg3      = arg3,
-		                                                 .arg4      = arg4});
-		if (marker != nullptr) {
-			Recorder().setCheckpointNV(marker);
-		}
-	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
@@ -135,20 +103,24 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Recorder().beginRendering(rendering);
+	Handle().beginRendering(rendering);
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
-	m_rendering    = true;
+	for (auto& color: m_render_state.color_attachments) {
+		color.is_clear = false;
+	}
+	m_render_state.depth_stencil_attachment.depth_clear   = false;
+	m_render_state.depth_stencil_attachment.stencil_clear = false;
+	m_rendering                                           = true;
 }
 
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Recorder().endRendering();
+	Handle().endRendering();
 	m_rendering    = false;
 	m_render_state = {};
-	// Draw-state L1 scope: never leak across render passes.
-	InvalidateDrawStateCache();
 }
 
 } // namespace Libs::Graphics

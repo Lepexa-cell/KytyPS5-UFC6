@@ -6,10 +6,9 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
-#include <atomic>
-#include <cstdlib>
 #include <map>
 #include <mutex>
+#include <span>
 #include <tuple>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -20,79 +19,35 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
-struct DiagnosticCheckpoint {
-	uint32_t op        = 0;
-	uint64_t submit_id = 0;
-	uint32_t arg0      = 0;
-	uint32_t arg1      = 0;
-	uint32_t arg2      = 0;
-	uint32_t arg3      = 0;
-	uint64_t arg4      = 0;
-	uint64_t sequence  = 0;
-};
-
-struct GraphicContext;
-
-// Returns a stable marker for vkCmdSetCheckpointNV.
-[[nodiscard]] const DiagnosticCheckpoint*
-RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
-// After a device loss: VK_EXT_device_fault info, the NVIDIA crash dump written to
-// _device_fault.nv-gpudmp, and the queue's last diagnostic checkpoints.
-void DumpDeviceLossDiagnostics(GraphicContext& graphics);
-
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
-	// KYTY_ADDRESS_BINDING_REPORT=1: logs every GPU address range bound or unbound, so a
-	// device-fault address can be matched to the object that owned it.
-	vk::DebugUtilsMessengerEXT         address_binding_messenger             = nullptr;
-	bool                               address_binding_report_enabled        = false;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
-	bool                               diagnostic_checkpoints_enabled        = false;
-	// With --profile, for the host GPU timeline (renderer/gpuProfiler).
-	bool                               host_query_reset_enabled              = false;
-	bool                               calibrated_timestamps_enabled         = false;
-	bool                               device_fault_enabled                  = false;
-	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
-	// subgroupSizeControl is enabled: the device has more than one subgroup size.
-	bool                               subgroup_size_control_enabled         = false;
-	// NVIDIA Ada (RTX 4070, vendor 0x10DE): Warp32 native, robustBufferAccess
-	// выключен (уже в дереве), subgroup форсируется в 32. KYTY_NVIDIA_WARP32=0
-	// отключает форсирование (is_nvidia_gpu остаётся для диагностики).
-	bool                               is_nvidia_gpu                         = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
-	// Step 3: VK_EXT_conditional_rendering for the color-clear predicate.
-	bool                               conditional_rendering_enabled         = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               maintenance8_enabled                  = false;
+	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
-	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
-	// bound and updated after bind.
-	bool                               bindless_enabled                      = false;
-	uint32_t                           bindless_max_sampled_images           = 0;
-	uint32_t                           bindless_max_samplers                 = 0;
-	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
-	vk::DescriptorSet                  bindless_set                          = nullptr;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
+	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
-	// Frames presented so far: the clock the caches age their entries by.
-	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -136,38 +91,6 @@ struct GraphicContext {
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
 	}
 
-	// The subgroup size a graphics stage must require so that one host subgroup is one guest
-	// wave, or 0 when the default already is or the device cannot require it for the stage. On
-	// AMD the default is 64; a wave32 pixel or mesh shader would otherwise share a subgroup with
-	// another wave, and its ballots, lane reads and reductions would mix the two.
-	// NVIDIA Ada (RTX 4070): SM исполняет варпы строго по 32 потока (Warp32).
-	// Для wave64 жёстко форсируем 32 через VK_EXT_subgroup_size_control, чтобы
-	// убрать эмуляцию 64-поточных кросс-варповых операций через Shared Memory.
-	// Выключается флагом KYTY_NVIDIA_WARP32=0; 2D UI не задет (размер сабгруппы
-	// не меняет пиксельную логику, только мэппинг волн на варпы).
-	[[nodiscard]] uint32_t GraphicsSubgroupSize(vk::ShaderStageFlagBits stage,
-	                                            uint32_t                wave_size) const noexcept {
-		// KYTY_NVIDIA_WARP32=0: форсирование выкл (диагностика is_nvidia_gpu остаётся).
-		static const bool nvidia_warp32 = [] {
-			const char* v = std::getenv("KYTY_NVIDIA_WARP32");
-			return v == nullptr || v[0] != '0';
-		}();
-		// NVIDIA Warp32: wave64 никогда не отдаём как есть, только 32 — и в штатной
-		// ветке, и когда дефолт устройства уже совпал (иначе 64-поточный кросс-варп
-		// эмулируется через Shared Memory).
-		if (is_nvidia_gpu && nvidia_warp32 && wave_size == 64u &&
-		    (required_subgroup_size_stages & stage) != vk::ShaderStageFlags {} &&
-		    32u >= min_subgroup_size && 32u <= max_subgroup_size) {
-			return 32u;
-		}
-		if (!subgroup_size_control_enabled || wave_size == subgroup_size ||
-		    !(required_subgroup_size_stages & stage) || wave_size < min_subgroup_size ||
-		    wave_size > max_subgroup_size) {
-			return 0;
-		}
-		return wave_size;
-	}
-
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
 		const auto alignment = physical_device_properties.limits.minStorageBufferOffsetAlignment;
 		return alignment != 0 ? alignment : 1;
@@ -179,6 +102,14 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+
+	struct HeapUsage {
+		uint64_t usage        = 0; // Whole process, as reported by VK_EXT_memory_budget.
+		uint64_t budget       = 0;
+		uint32_t allocations  = 0;
+		bool     device_local = false;
+	};
+	[[nodiscard]] uint32_t GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 

@@ -5,7 +5,6 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <cstring>
 #include <numeric>
@@ -68,11 +67,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.usage       = flags;
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
 	VmaAllocationCreateInfo allocation_info {};
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -178,7 +175,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	if (static_cast<bool>((source_before | destination_before) & host_access)) {
 		before_stage |= vk::PipelineStageFlagBits::eHost;
 	}
-	const auto native = command.Recorder();
+	const auto native = command.Handle();
 	native.pipelineBarrier(before_stage, vk::PipelineStageFlagBits::eTransfer,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, before, 0, nullptr);
 	const vk::BufferCopy copy {source_offset, destination_offset, size};
@@ -204,7 +201,7 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
 	            vk::AccessFlagBits::eTransferWrite);
-	const auto native = command.Recorder();
+	const auto native = command.Handle();
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
@@ -323,16 +320,9 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		// Profiling-only zone: a stream-buffer ring wrap forcing the CPU to wait for the GPU to
-		// finish with the memory it's about to reclaim. Scheduler().IsFree() above is the fast,
-		// non-blocking path -- only reaching Wait() itself means the GPU genuinely hasn't caught
-		// up yet.
-		{
-			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
-			Scheduler().Wait(watch.tick);
-			if (Usage() == MemoryUsage::Download) {
-				Scheduler().WaitPriorityOperations(watch.tick);
-			}
+		Scheduler().Wait(watch.tick);
+		if (Usage() == MemoryUsage::Download) {
+			Scheduler().WaitPriorityOperations(watch.tick);
 		}
 		wait_bound = watch.upper_bound;
 		++wait_cursor;

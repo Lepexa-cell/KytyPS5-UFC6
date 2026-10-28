@@ -15,6 +15,23 @@ namespace Libs::LibKernel::Memory {
 void Initialize();
 void Shutdown();
 
+// Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
+// waits on the GPU; call it only while the memory subsystem is initialized.
+struct DebugStats {
+	uint64_t direct_total        = 0;
+	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t automatic_allocated = 0; // Extended memory.
+	uint64_t direct_mapped       = 0;
+	uint64_t flexible_total      = 0;
+	uint64_t flexible_used       = 0;
+	uint64_t pool_committed      = 0;
+	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries    = 0;
+	uint64_t page_entries_total  = 0; // Per side.
+};
+[[nodiscard]] DebugStats GetDebugStats();
+
 struct Lifecycle {
 	static constexpr const char* name       = "Memory";
 	static constexpr auto        initialize = Libs::LibKernel::Memory::Initialize;
@@ -112,27 +129,13 @@ void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
+int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-// GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
-// GPU holds it and a host read would wait for the GPU.
-[[nodiscard]] bool     IsGpuBufferWritten(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
-// GPU thread: the backing bytes of [vaddr, vaddr + size) when one mapping holds them and no GPU
-// work has written any of them, else nullptr. Current until the GPU thread marks them
-// GPU-written or the guest remaps them.
-[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
-// Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
-// it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
-bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
+bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-// Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
-[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
-// Whether every byte of the range is committed guest memory, by the kernel's own table of guest
-// mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
-// so is every range before the kernel's memory is set up (unit tests).
-[[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
@@ -207,7 +210,9 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
+void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);

@@ -9,6 +9,12 @@
 #include <mutex>
 #include <utility>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -32,7 +38,13 @@ public:
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
@@ -48,7 +60,9 @@ private:
 		return GetCurrentThreadId();
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
-		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+		static thread_local const uint32_t tid =
+		    static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+		return tid;
 #elif defined(__linux__)
 		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
 		return tid;
@@ -62,14 +76,6 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
-
-// Bumped whenever pages become CPU-dirty anywhere (a write fault, an untrack, an
-// invalidation). A consumer that must see every CPU write, such as the pre-dispatch sync of
-// all buffers for global-memory shaders, can skip its walk while this has not moved.
-inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
-
-// Bumped by the GPU thread when it starts a guest submission (its first slice).
-inline std::atomic<uint64_t> g_guest_submission_seq {1};
 
 class RegionManager final {
 public:
@@ -86,14 +92,6 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
-
-	// Lock-free "any page in this region may be dirty" summaries. A binding that spans a
-	// whole heap covers hundreds of regions; without these every draw locks and walks each
-	// one. False is exact (set only after a walk saw no bits); true is conservative.
-	template <DirtySource source>
-	[[nodiscard]] bool MaybeModified() const noexcept {
-		return GetSummary<source>().load(std::memory_order_acquire);
-	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -116,15 +114,8 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
-			StoreSummary<source>(true);
-			if constexpr (source == DirtySource::Cpu) {
-				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
-			}
 		} else {
 			bits.UnsetRange(start, end);
-			if (bits.None()) {
-				StoreSummary<source>(false);
-			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -143,9 +134,6 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
-			if (bits.None()) {
-				StoreSummary<source>(false);
-			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -157,32 +145,9 @@ public:
 		}
 	}
 
-	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
-	// Set before the region is published.
-	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
-		m_cpu_summary_word = word;
-		m_cpu_summary_bit  = bit;
-	}
-
 	TrackingSpinLock lock;
 
 private:
-	// Every summary change goes through here; the CPU one is mirrored in the tracker's bitmap at
-	// the same point, before any page protection changes.
-	template <DirtySource source>
-	void StoreSummary(bool value) {
-		GetSummary<source>().store(value, std::memory_order_release);
-		if constexpr (source == DirtySource::Cpu) {
-			if (m_cpu_summary_word != nullptr) {
-				if (value) {
-					m_cpu_summary_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
-				} else {
-					m_cpu_summary_word->fetch_and(~m_cpu_summary_bit, std::memory_order_acq_rel);
-				}
-			}
-		}
-	}
-
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -213,24 +178,6 @@ private:
 		}
 	}
 
-	template <DirtySource source>
-	std::atomic<bool>& GetSummary() {
-		if constexpr (source == DirtySource::Cpu) {
-			return m_cpu_maybe_dirty;
-		} else {
-			return m_gpu_maybe_dirty;
-		}
-	}
-
-	template <DirtySource source>
-	const std::atomic<bool>& GetSummary() const {
-		if constexpr (source == DirtySource::Cpu) {
-			return m_cpu_maybe_dirty;
-		} else {
-			return m_gpu_maybe_dirty;
-		}
-	}
-
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
 		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
@@ -245,11 +192,6 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
-	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
-	std::atomic<bool> m_cpu_maybe_dirty {true};
-	std::atomic<bool> m_gpu_maybe_dirty {false};
-	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
-	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

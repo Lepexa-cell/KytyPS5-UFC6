@@ -143,6 +143,7 @@ std::string FormatMimg(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
 		case Opcode::IMAGE_GATHER4_C_LZ:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
@@ -259,8 +260,6 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 235u: operand.kind = OperandKind::SharedBase; return;
 		case 237u: operand.kind = OperandKind::PrivateBase; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
-		case 236u: operand.kind = OperandKind::SharedLimit; return;
-		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
@@ -269,10 +268,7 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default:
-			operand.kind  = OperandKind::Unsupported;
-			operand.value = code;
-			return;
+		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
@@ -292,10 +288,7 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default:
-			operand.kind  = OperandKind::Unsupported;
-			operand.value = code;
-			return;
+		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
 	}
 }
 
@@ -370,36 +363,26 @@ Family GetInstructionFamily(uint32_t word) {
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
 	switch (GetInstructionFamily(code[word_index])) {
-		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); break;
-		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); break;
-		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); break;
-		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); break;
-		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); break;
-		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); break;
-		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); break;
-		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); break;
-		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); break;
-		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); break;
-		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); break;
-		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); break;
-		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); break;
-		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); break;
-		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); break;
-		case Family::DS: DecodeDs(pc, code, word_index, inst); break;
-		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); break;
-		case Family::EXP: DecodeExp(pc, code, word_index, inst); break;
+		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
+		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
+		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
+		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); return;
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return;
+		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); return;
+		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); return;
+		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); return;
+		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); return;
+		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); return;
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); return;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
 			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
-	}
-	if (inst.opcode == Opcode::UNSUPPORTED) {
-		return;
-	}
-	for (const Operand* operand:
-	     {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
-		if (operand->kind == OperandKind::Unsupported) {
-			SetUnsupported(inst, inst.family, inst.opcode_id, "scalar operand is not implemented");
-			return;
-		}
 	}
 }
 
@@ -409,6 +392,7 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	while (front_words < front.size()) {
 		auto& inst = result.instructions.emplace_back();
 		DecodeInstruction(front, front_words, inst);
+		result.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		front_words += inst.word_count;
 		if (inst.opcode == Opcode::S_SETPC_B64) {
 			EXIT_NOT_IMPLEMENTED(inst.src0.kind != OperandKind::Sgpr || inst.src0.reg != 6u);
@@ -426,6 +410,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
+	program.has_swap_pc = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -433,6 +418,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		DecodeInstruction(code, word_index, program.instructions.back());
 
 		const auto& inst = program.instructions.back();
+		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -473,9 +459,7 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::M0: text = "m0"; break;
 		case OperandKind::PopsExitingWaveId: text = "pops_exiting_wave_id"; break;
 		case OperandKind::SharedBase: text = "shared_base"; break;
-		case OperandKind::SharedLimit: text = "shared_limit"; break;
 		case OperandKind::PrivateBase: text = "private_base"; break;
-		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;
 	}
@@ -525,8 +509,14 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.dst).c_str(),
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_ABS_I32:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
 		case Opcode::S_BREV_B32:
 		case Opcode::S_BREV_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
 		case Opcode::S_BCNT1_I32_B32:
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
@@ -576,6 +566,9 @@ std::string InstructionToString(const Instruction& inst) {
 			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_BARRIER:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
+		case Opcode::BUFFER_GL0_INV:
+		case Opcode::BUFFER_GL1_INV:
+			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
 		case Opcode::V_NOP:
 			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
 		case Opcode::S_ENDPGM:
@@ -622,6 +615,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:
 		case Opcode::IMAGE_GATHER4_C:
+		case Opcode::IMAGE_GATHER4_C_L:
 		case Opcode::IMAGE_GATHER4_C_LZ:
 		case Opcode::IMAGE_GATHER4_LZ_O:
 		case Opcode::IMAGE_GATHER4_C_O:
@@ -641,18 +635,32 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
 		case Opcode::BUFFER_LOAD_USHORT:
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:
 		case Opcode::BUFFER_LOAD_DWORDX2:
 		case Opcode::BUFFER_LOAD_DWORDX3:
 		case Opcode::BUFFER_LOAD_DWORDX4:
 		case Opcode::BUFFER_STORE_BYTE:
+		case Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Opcode::BUFFER_STORE_SHORT:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Opcode::BUFFER_STORE_DWORD:
 		case Opcode::BUFFER_STORE_DWORDX2:
 		case Opcode::BUFFER_STORE_DWORDX3:
@@ -669,6 +677,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
+		case Opcode::BUFFER_ATOMIC_ADD_X2:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
 		case Opcode::BUFFER_ATOMIC_UMIN:
@@ -715,6 +724,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B32:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:

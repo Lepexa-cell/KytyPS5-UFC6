@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -12,7 +13,6 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
-#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -301,15 +301,23 @@ static std::string memory_dir_name(uint32_t slot_id) {
 	return "sce_sdmemory" + (slot_id == 0 ? std::string() : std::to_string(slot_id));
 }
 
+static std::filesystem::path save_user_directory(std::string_view title_id, int32_t user_id) {
+	auto directory = std::filesystem::path(SAVE_DATA_DIR);
+	if (Config::IsGuestUserId(user_id)) {
+		directory /= std::filesystem::path("[users]") / std::to_string(user_id);
+	}
+	return directory / title_id;
+}
+
 static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
                                             int32_t user_id) {
-	const auto directory = std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name;
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		if (dir_name == memory_dir_name(slot)) {
-			return directory / std::to_string(user_id);
+			return std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name /
+			       std::to_string(user_id);
 		}
 	}
-	return directory;
+	return save_user_directory(title_id, user_id) / dir_name;
 }
 
 static std::filesystem::path memory_directory(int32_t user_id, uint32_t slot_id) {
@@ -385,11 +393,6 @@ static std::filesystem::path save_param_path(const std::filesystem::path& direct
 	return directory / "sce_sys" / "param.bin";
 }
 
-static bool is_legacy_save(const std::filesystem::path& directory) {
-	std::error_code error;
-	return !std::filesystem::exists(directory / "sce_sys", error) && !error;
-}
-
 static int64_t newest_save_time(const std::filesystem::path& directory) {
 	int64_t mtime = 0;
 	std::error_code error;
@@ -414,10 +417,7 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 
 static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
 	*param = {};
-	int status = read_save_param(save_param_path(directory), param);
-	if (status == SAVE_DATA_ERROR_NOT_FOUND && is_legacy_save(directory)) {
-		status = OK;
-	}
+	const int status = read_save_param(save_param_path(directory), param);
 	if (status == OK) {
 		param->mtime = newest_save_time(directory);
 	}
@@ -599,15 +599,14 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
-	const auto        root     = std::filesystem::path(SAVE_DATA_DIR) / title_id;
+	const auto        root     = save_user_directory(title_id, cond->user_id);
 	std::vector<std::string> dir_list;
 
 	if (Common::File::IsDirectoryExisting(root)) {
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
 			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
-			    (Common::File::IsFileExisting(save_param_path(root / entry.name)) ||
-			     is_legacy_save(root / entry.name))) {
+			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {
@@ -1152,24 +1151,20 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 }
 
 int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
+	PRINT_NAME();
+
+	LOGF("\t event_param = 0x%016" PRIx64 "\n"
+	     "\t event       = 0x%016" PRIx64 "\n",
+	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
+
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (g_save_data_events.empty()) {
-		// Titles poll this in a tight loop from a worker thread; logging every empty poll wrote
-		// tens of gigabytes and slowed the whole emulator.
-		static std::atomic<uint32_t> empty_polls = 0;
-		if (empty_polls.fetch_add(1) < 4) {
-			PRINT_NAME();
-			LOGF("\t event_param = 0x%016" PRIx64 " (no event queued; later empty polls are not "
-			     "logged)\n",
-			     reinterpret_cast<uint64_t>(event_param));
-		}
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
-	PRINT_NAME();
 
 	*event = g_save_data_events.front();
 	g_save_data_events.pop_front();
@@ -1298,47 +1293,6 @@ int KYTY_SYSV_ABI SaveDataSaveIcon(const SaveDataMountPoint* mount_point,
 	return OK;
 }
 
-struct SaveDataConvertParam {
-	int32_t                   user_id;
-	int32_t                   reserved0;
-	const SceSaveDataDirName* src_dir_name;
-	const SceSaveDataDirName* dst_dir_name; // may be null
-	uint64_t                  dst_blocks;   // 0 keeps the source size
-	uint8_t                   reserved[24];
-};
-
-static_assert(sizeof(SaveDataConvertParam) == 56);
-
-// Converts save data to the current format. A result >= 0 starts an asynchronous conversion that
-// the caller polls with GetConvertProgress; the caller seen treats NOT_FOUND and NO_NEED_CONVERT
-// as "nothing to convert" and goes on to mount or create its save. Kyty only ever writes save data
-// in the current format, so an existing directory needs no conversion.
-int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
-	PRINT_NAME();
-
-	if (convert == nullptr || convert->src_dir_name == nullptr ||
-	    !valid_path_component(convert->src_dir_name->data)) {
-		return SAVE_DATA_ERROR_PARAMETER;
-	}
-	if (convert->user_id < 0) {
-		return SAVE_DATA_ERROR_INVALID_LOGIN_USER;
-	}
-
-	LOGF("\t user_id    = %" PRId32 "\n"
-	     "\t src        = %s\n"
-	     "\t dst        = %s\n"
-	     "\t dst_blocks = %" PRIu64 "\n",
-	     convert->user_id, convert->src_dir_name->data,
-	     convert->dst_dir_name != nullptr ? convert->dst_dir_name->data : "<null>",
-	     convert->dst_blocks);
-
-	std::error_code error;
-	const auto      dir = save_directory(get_title_id(), convert->src_dir_name->data,
-	                                     convert->user_id);
-	return std::filesystem::exists(dir, error) ? SAVE_DATA_ERROR_NO_NEED_CONVERT
-	                                           : SAVE_DATA_ERROR_NOT_FOUND;
-}
-
 } // namespace SaveData
 
 namespace LibSaveDataNative {
@@ -1372,7 +1326,6 @@ LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("cGjO3wM3V28", ::Libs::SaveData::SaveDataLoadIcon);
 	LIB_FUNC("X4MYzukPc3g", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("yKDy8S5yLA0", ::Libs::SaveData::SaveDataTerminate);
-	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
 }
 
 } // namespace LibSaveDataNative

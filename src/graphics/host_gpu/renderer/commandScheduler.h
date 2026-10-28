@@ -3,192 +3,17 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
+#include "graphics/host_gpu/renderer/dynamicState.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
-#include <array>
-#include <chrono>
 #include <condition_variable>
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
-#include <deque>
-#include <atomic>
-#include <memory>
 #include <mutex>
-#include <new>
-#include <type_traits>
-
 #include <queue>
-
 #include <thread>
 #include <vector>
 
 namespace Libs::Graphics {
-
-uint32_t DrawFlushInterval();
-void     LogDrawFlushInterval();
-
-// Shadow of the Vulkan state already recorded into the command buffer being written.
-// Owned by CommandScheduler (one instance, reset at every BeginCommand), compared and
-// updated on the GPU thread only: CommandRecorder methods run there in both direct and
-// threaded modes (threaded only queues lambdas; the recording thread executes them later
-// and never touches this struct). Never stored on CommandRecorder: recorder temporaries
-// are created per call site and would leak state across command buffers.
-struct RecordedStateCache {
-	// Graphics and compute pipeline binds are independent Vulkan state: tracked
-	// separately, so a compute bind never suppresses a graphics bind and vice versa.
-	vk::Pipeline graphics_pipeline       = nullptr;
-	bool          graphics_pipeline_known = false;
-	vk::Pipeline compute_pipeline       = nullptr;
-	bool          compute_pipeline_known = false;
-
-	// Viewport/scissor pairs: draws write them via WithCount, the blit helper via the
-	// firstViewport/firstScissor form. These are distinct Vulkan dynamic states
-	// (eViewportWithCount vs eViewport), so each form has its own entry. The WithCount
-	// viewport and scissor are also independent dynamic states: each compares only its
-	// own values, so a repeated viewport is skipped even when the scissor changes.
-	static constexpr uint32_t kMaxViewports = 16;
-	std::array<vk::Viewport, kMaxViewports> wc_viewports {};
-	uint32_t wc_viewport_count = 0;
-	bool     wc_viewport_known = false;
-	std::array<vk::Rect2D, kMaxViewports> wc_scissors {};
-	uint32_t wc_scissor_count = 0;
-	bool     wc_scissor_known = false;
-	uint32_t vp_first          = 0;
-	uint32_t vp_count          = 0;
-	std::array<vk::Viewport, kMaxViewports> vp_viewports {};
-	bool vp_viewport_known = false;
-	uint32_t vp_scissor_first = 0;
-	uint32_t vp_scissor_count = 0;
-	std::array<vk::Rect2D, kMaxViewports> vp_scissors {};
-	bool vp_scissor_known = false;
-
-	float line_width       = 0.0f;
-	bool  line_width_known = false;
-	std::array<float, 4> blend_constants {};
-	bool                 blend_constants_known = false;
-	vk::CullModeFlags cull_mode       = {};
-	bool              cull_mode_known = false;
-	vk::FrontFace front_face       = {};
-	bool          front_face_known = false;
-	vk::Bool32 depth_bounds_test_enable       = VK_FALSE;
-	bool       depth_bounds_test_enable_known = false;
-	float depth_min_bounds       = 0.0f;
-	float depth_max_bounds       = 0.0f;
-	bool  depth_bounds_known     = false;
-	vk::Bool32 depth_test_enable       = VK_FALSE;
-	bool       depth_test_enable_known = false;
-	vk::Bool32 depth_write_enable       = VK_FALSE;
-	bool       depth_write_enable_known = false;
-	vk::CompareOp depth_compare_op       = {};
-	bool          depth_compare_op_known = false;
-	vk::Bool32 depth_bias_enable       = VK_FALSE;
-	bool       depth_bias_enable_known = false;
-	float depth_bias_constant = 0.0f;
-	float depth_bias_clamp    = 0.0f;
-	float depth_bias_slope    = 0.0f;
-	bool  depth_bias_known    = false;
-	vk::Bool32 stencil_test_enable       = VK_FALSE;
-	bool       stencil_test_enable_known = false;
-	// Stencil ops/masks/references are per-face Vulkan state; front and back tracked
-	// separately so an update to one face never suppresses the other.
-	struct StencilFaceState {
-		vk::StencilOp op_fail       = {};
-		vk::StencilOp op_pass       = {};
-		vk::StencilOp op_depth_fail = {};
-		vk::CompareOp op_compare    = {};
-		bool          op_known      = false;
-		uint32_t compare_mask       = 0;
-		bool     compare_mask_known = false;
-		uint32_t write_mask         = 0;
-		bool     write_mask_known   = false;
-		uint32_t reference          = 0;
-		bool     reference_known    = false;
-	};
-	StencilFaceState stencil_front {};
-	StencilFaceState stencil_back {};
-	// Color-write enables are per-attachment state with a dynamic count: the count is
-	// part of the comparison, and only the first `count` entries are compared.
-	static constexpr uint32_t kMaxColorAttachments = 8;
-	std::array<vk::Bool32, kMaxColorAttachments> color_write_enables {};
-	uint32_t color_write_count = 0;
-	bool     color_write_known = false;
-
-	void Reset() { *this = RecordedStateCache {}; }
-	// A raw graphics bind outside the recorder changes bound-pipeline state without
-	// touching dynamic values: drop only the graphics entry, keep dynamic comparisons.
-	// A raw dynamic write is unknown: drop the matching dynamic entry so the next
-	// compared write records unconditionally.
-	void NoteRawGraphicsPipeline() { graphics_pipeline_known = false; }
-	void NoteRawComputePipeline() { compute_pipeline_known = false; }
-	void NoteRawViewportScissor() {
-		wc_viewport_known = false;
-		wc_scissor_known  = false;
-		vp_viewport_known = false;
-		vp_scissor_known  = false;
-	}
-	void NoteRawDynamicState() {
-		line_width_known                   = false;
-		blend_constants_known              = false;
-		cull_mode_known                    = false;
-		front_face_known                   = false;
-		depth_bounds_test_enable_known     = false;
-		depth_bounds_known                 = false;
-		depth_test_enable_known            = false;
-		depth_write_enable_known           = false;
-		depth_compare_op_known             = false;
-		depth_bias_enable_known            = false;
-		depth_bias_known                   = false;
-		stencil_test_enable_known          = false;
-		stencil_front.op_known             = false;
-		stencil_front.compare_mask_known   = false;
-		stencil_front.write_mask_known     = false;
-		stencil_front.reference_known      = false;
-		stencil_back.op_known              = false;
-		stencil_back.compare_mask_known    = false;
-		stencil_back.write_mask_known      = false;
-		stencil_back.reference_known       = false;
-		color_write_known                  = false;
-		wc_viewport_known                  = false;
-		wc_scissor_known                   = false;
-		vp_viewport_known                  = false;
-		vp_scissor_known                   = false;
-	}
-};
-
-// KYTY_OPT_RECORD_STATE_CACHE (default on): skip redundant vkCmdBindPipeline and
-// dynamic-state commands when the shadow above already holds the same values.
-// =0 records everything unconditionally, as before.
-[[nodiscard]] inline bool RecordStateCacheEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_OPT_RECORD_STATE_CACHE");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
-
-// KYTY_OPT_RECORD_PIPELINE_CACHE (default on): independent kill switch for the pipeline-bind
-// half of the shadow above. =0 keeps dynamic-state dedup while binding every pipeline.
-// The master KYTY_OPT_RECORD_STATE_CACHE=0 disables both halves.
-[[nodiscard]] inline bool RecordPipelineCacheEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_OPT_RECORD_PIPELINE_CACHE");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled && RecordStateCacheEnabled();
-}
-
-// KYTY_OPT_RECORD_DYNAMIC_CACHE (default on): independent kill switch for the dynamic-state
-// half of the shadow above. =0 keeps pipeline-bind dedup while recording every state value.
-// The master KYTY_OPT_RECORD_STATE_CACHE=0 disables both halves.
-[[nodiscard]] inline bool RecordDynamicCacheEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_OPT_RECORD_DYNAMIC_CACHE");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled && RecordStateCacheEnabled();
-}
 
 class CommandScheduler {
 public:
@@ -199,117 +24,24 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
-	void           Flush(SubmitCause cause = SubmitCause::Flush);
-	void           Flush(SubmitInfo& submit, SubmitCause cause = SubmitCause::Flush);
+	void           Flush();
+	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
-	// Bounds how many no-interrupt RELEASE_MEM fence writes accumulate in one command buffer
-	// before it is submitted, so consecutive fence updates that nothing is blocked waiting on
-	// don't each pay a host vkQueueSubmit. Only safe for a RELEASE_MEM whose guest-visible write
-	// already happened synchronously and that scheduled no interrupt callback -- see the call
-	// site in pm4Handlers.cpp CpOpReleaseMem for the exact condition. Never waits itself.
-	void           CompleteReleaseMemWrite();
-	// Same idea, but for a RELEASE_MEM that DOES request a guest interrupt/event (a guest thread
-	// may be waiting on it via an event queue) -- deferring the flush delays real event delivery,
-	// so this uses a much smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
-	// some of the possible win for less added latency. Never waits itself.
-	// merged=true marks submits that folded a legacy immediate BufferFlush into this window
-	// (telemetry cause ReleaseFlush); =0 restores the full original path for that branch.
-	void           CompleteReleaseMemInterrupt(bool merged = false);
-	// Called after every DrawIndex/DrawAuto. Long chains of draws with no intervening
-	// RELEASE_MEM/wait can otherwise sit fully recorded but unsubmitted for a long time, leaving
-	// the GPU idle until something else finally forces a flush -- this periodically calls Flush()
-	// (non-blocking: Submit() + BeginNext(), same as CompleteReleaseMemWrite) every
-	// KYTY_DRAW_FLUSH_INTERVAL draws to keep the queue fed instead. Submitting while the GPU is
-	// still executing earlier work is always legal (vkQueueSubmit never waits on prior submissions
-	// completing), so this never blocks the CPU. Defaults to 16, validated against real gameplay --
-	// override via KYTY_DRAW_FLUSH_INTERVAL (0 disables) if a different workload needs retuning:
-	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
-	// exists to remove.
-	void           CompleteDraw();
-	// Frame reset for the per-submit batch bases: draws/dispatches totals are zeroed every
-	// 60 frames in TelemetryEndFrame, so a carry-over base would clamp the next frame's
-	// first batch to zero. Called there through CommandProcessor::GetScheduler().
-	// Public only for that GPU-thread call; the bases themselves stay private below.
-	void ResetSubmitBatchBase() {
-		m_submit_base_draws      = 0;
-		m_submit_base_dispatches = 0;
-	}
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	// KYTY_OPT_SYNC_DOWNLOAD_DIAG split of one sync-download wait: submit+BeginNext CPU
-	// time and host-side tick wait. Returns whether the tick was the current one
-	// (forced submit-then-wait) or already submitted. Diagnostic only: the plain Wait()
-	// path is untouched when the breakdown is not requested. The caller times
-	// WaitPriorityOperations itself, the same call the legacy path makes.
-	[[nodiscard]] bool WaitWithBreakdown(uint64_t tick, uint64_t& submit_us,
-	                                     uint64_t& master_wait_us);
-	// Fast-path gate for the per-draw PopPendingOperations() calls: DeferRelease sets it when
-	// an operation is queued, PopPendingOperations clears it when the queue drains. Draws read
-	// it lock-free first so the 99.9% empty-queue case skips the semaphore refresh, mutex and
-	// condition-variable traffic entirely.
-	[[nodiscard]] bool        HasPendingOperations() const noexcept {
-		return m_pending_operations_count.load(std::memory_order_acquire) != 0;
-	}
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	// As DeferOperation, also between guest command buffers (no active command buffer): runs
-	// once the GPU has finished the current tick, so work submitted earlier, still running, can
-	// keep using what the operation releases.
-	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
-	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
-	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
-	// Submit() then returns once the tick is allocated; host waits on a timeline value may precede
-	// its signal operation. Enable before the first Submit().
-	void EnableAsyncSubmit();
-	[[nodiscard]] bool AsyncSubmit() const noexcept { return m_async_submit; }
-	// A Vulkan recording thread (KYTY_RECORD_THREAD=0 turns it off; the pattern and the
-	// CommandRecorder are IDXTRI's, d9958e28). The GPU thread queues the current command
-	// buffer's Vulkan commands (CommandBuffer::Recorder(), Record()); the recording thread begins,
-	// records, ends and submits the command buffers in order, so the driver's recording cost
-	// leaves the GPU thread. Ticks are still allocated here, in order, at Submit(). Code that
-	// records through the raw CommandBuffer::Handle() first waits for the thread to catch up
-	// (DrainRecording), so it stays correct. Replaces the queue thread (EnableAsyncSubmit).
-	// Enable before the first command buffer.
-	void EnableRecordingThread();
-	// The current command buffer's commands go through the recording thread.
-	[[nodiscard]] bool Threaded() const noexcept { return m_threaded; }
-	// Queues fn(vk::CommandBuffer) for the recording thread (threaded only). Captures must be
-	// values; arrays go through Stash().
-	template <typename F>
-	void Record(F&& fn) {
-		using Command = TypedCommand<std::decay_t<F>>;
-		void* memory  = Allocate(sizeof(Command), alignof(Command));
-		auto* command = new (memory) Command(std::forward<F>(fn));
-		if (m_chunk->last != nullptr) {
-			m_chunk->last->next = command;
-		} else {
-			m_chunk->first = command;
-		}
-		m_chunk->last = command;
-	}
-	// Copies count elements into memory that stays valid until the recording thread has run the
-	// next command recorded after this call (threaded only).
-	template <typename T>
-	[[nodiscard]] const T* Stash(const T* data, size_t count) {
-		if (data == nullptr || count == 0) {
-			return nullptr;
-		}
-		auto* copy = static_cast<T*>(Allocate(sizeof(T) * count, alignof(T)));
-		std::memcpy(static_cast<void*>(copy), data, sizeof(T) * count);
-		return copy;
-	}
-	// Waits until the recording thread has run every queued command, and returns the command
-	// buffer it records into, for code that records directly.
-	vk::CommandBuffer DrainRecording();
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -317,24 +49,9 @@ public:
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
+	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
-	// Shadow of the Vulkan state recorded into the command buffer being written.
-	// Compared and updated on the GPU thread only (see RecordedStateCache); reset at
-	// every BeginCommand, so reuse of the same VkCommandBuffer handle starts clean.
-	[[nodiscard]] RecordedStateCache& RecordCache() noexcept { return m_record_cache; }
-	// A raw vk::CommandBuffer write outside CommandRecorder changed state behind the
-	// shadow's back: drop the matching entries so the next compared write records.
-	// GPU thread only, same ownership as the shadow itself.
-	void NoteRawPipeline(vk::PipelineBindPoint bind_point) {
-		if (bind_point == vk::PipelineBindPoint::eCompute) {
-			m_record_cache.NoteRawComputePipeline();
-		} else {
-			m_record_cache.NoteRawGraphicsPipeline();
-		}
-	}
-	void NoteRawViewportScissor() { m_record_cache.NoteRawViewportScissor(); }
-	void NoteRawDynamicState() { m_record_cache.NoteRawDynamicState(); }
 
 private:
 	class CommandPool {
@@ -343,8 +60,7 @@ private:
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
-		// tick: the tick the command buffer will be submitted with.
-		vk::CommandBuffer Commit(uint64_t tick);
+		vk::CommandBuffer Commit();
 
 	private:
 		static constexpr size_t GrowStep = 4;
@@ -366,104 +82,25 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	// A finished command buffer and everything its vkQueueSubmit needs, including the recording
-	// state that a fatal submit report prints.
-	struct SubmitJob {
-		vk::CommandBuffer buffer = nullptr;
-		SubmitInfo        submit;
-		uint64_t          tick         = 0;
-		uint32_t          debug_op     = 0;
-		uint64_t          debug_submit = 0;
-		uint32_t          debug_arg0   = 0;
-		uint32_t          debug_arg1   = 0;
-		uint32_t          debug_arg2   = 0;
-		uint32_t          debug_arg3   = 0;
-		uint64_t          debug_arg4   = 0;
-	};
-
-	struct RecordedCommand {
-		virtual ~RecordedCommand()                  = default;
-		virtual void     Execute(vk::CommandBuffer) = 0;
-		RecordedCommand* next                       = nullptr;
-	};
-	template <typename F>
-	struct TypedCommand final: RecordedCommand {
-		explicit TypedCommand(F&& function): fn(std::move(function)) {}
-		explicit TypedCommand(const F& function): fn(function) {}
-		void Execute(vk::CommandBuffer command) override { fn(command); }
-		F    fn;
-	};
-	struct Chunk {
-		static constexpr size_t Size = 256 * 1024;
-		alignas(64) std::byte storage[Size];
-		size_t           used  = 0;
-		RecordedCommand* first = nullptr;
-		RecordedCommand* last  = nullptr;
-	};
-	void* Allocate(size_t size, size_t alignment);
-	void  DispatchChunk();
-	void  RecordingThread(std::stop_token stop);
-	void  StopRecordingThread();
-	void  ReportRecording();
-
 	void BeginNext();
-	void QueueSubmit(SubmitJob& job);
-	void SubmitThread(std::stop_token stop);
-	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
-	// Submit telemetry: wraps one Submit()+BeginNext() span with its cause, so each
-	// real vkQueueSubmit records count, CPU time and batch volume. GPU thread only.
-	// cpu_us covers Submit()+BeginNext() only (never the m_master.Wait between them);
-	// batch volume is the draws+dispatches delta since the previous counted submit.
-	void CountSubmit(SubmitCause cause, uint64_t cpu_us);
-
-	uint32_t m_submit_base_draws      = 0;
-	uint32_t m_submit_base_dispatches = 0;
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
-	// See RecordCache(): written state of the command buffer being recorded.
-	RecordedStateCache           m_record_cache;
-	uint32_t                     m_recorded_release_mem_writes     = 0;
-	uint32_t                     m_recorded_release_mem_interrupts = 0;
-	uint32_t                     m_recorded_draws                  = 0;
+	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
-	std::atomic<uint32_t>        m_pending_operations_count {0};
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
-	bool                         m_async_submit         = false;
-	std::deque<SubmitJob>        m_submit_jobs;
-	std::mutex                   m_submit_mutex;
-	std::condition_variable_any  m_submit_available;
-	std::jthread                 m_submit_thread;
-	// Recording thread. m_threaded and m_chunk belong to the producer (the GPU thread); the queue,
-	// free list and counters to m_record_mutex; m_worker_buffer to the recording thread (read by
-	// the producer only after a drain).
-	bool                                m_threaded = false;
-	std::unique_ptr<Chunk>              m_chunk;
-	std::mutex                          m_record_mutex;
-	std::condition_variable_any         m_record_available;
-	std::condition_variable             m_record_executed;
-	std::deque<std::unique_ptr<Chunk>>  m_record_queue;
-	std::vector<std::unique_ptr<Chunk>> m_free_chunks;
-	uint64_t                            m_chunks_dispatched = 0;
-	uint64_t                            m_chunks_executed   = 0;
-	uint64_t                            m_drains            = 0;
-	vk::CommandBuffer                   m_worker_buffer     = nullptr;
-	uint64_t                            m_record_report_buffers = 0;
-	uint64_t                            m_record_report_chunks  = 0;
-	uint64_t                            m_record_report_drains  = 0;
-	std::chrono::steady_clock::time_point m_record_report_time {};
-	std::jthread                        m_record_thread;
 };
 
 } // namespace Libs::Graphics

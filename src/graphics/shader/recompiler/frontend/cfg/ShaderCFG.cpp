@@ -1,7 +1,6 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
-#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -9,6 +8,7 @@
 #include <deque>
 #include <list>
 #include <map>
+#include <optional>
 #include <set>
 #include <span>
 
@@ -36,12 +36,9 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
 	graph.unsupported_reason = message;
 }
 
-void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
-                      const std::string& message) {
+[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
+                                   const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
-	if (Frontend::TranslationNonFatal()) {
-		return;
-	}
 	EXIT("shader CFG build failed: %s", message.c_str());
 	std::abort();
 }
@@ -473,8 +470,10 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
 		return false;
 	}
+	// Code-table loads are not translated, so a selector that is also the load destination
+	// keeps its scaled index at the branch.
 	uint32_t selector_code = UINT32_MAX;
-	if (!ScalarOperandCode(load.src1, selector_code) || selector_code == offset_code ||
+	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
 		return false;
 	}
@@ -572,9 +571,8 @@ bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
 	return false;
 }
 
-bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, uint32_t first_pc,
-                   uint32_t end_pc) {
-	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
+bool IsValidTarget(uint32_t target, std::span<const Instruction> instructions, uint32_t end_pc) {
+	return target == end_pc || std::ranges::binary_search(instructions, target, {}, &Instruction::pc);
 }
 
 std::vector<uint32_t> AllBlockIds(uint32_t count) {
@@ -690,51 +688,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 	RebuildPredecessors(graph);
 }
 
-// The sets below are sorted and unique; this keeps them so.
-void InsertSorted(std::vector<uint32_t>& values, uint32_t value) {
-	const auto at = std::lower_bound(values.begin(), values.end(), value);
-	if (at == values.end() || *at != value) {
-		values.insert(at, value);
-	}
-}
-
-// Visiting order for the iterative dominator solver: a depth-first reverse postorder over the
-// successor edges from the entry, then the blocks the walk does not reach, in index order. The
-// fixed point does not depend on the order, but in index order a shader with thousands of blocks
-// (inlined function calls) took one pass per block to converge, tens of seconds per shader.
-std::vector<uint32_t> SolverOrder(const Graph& graph) {
-	const auto            count = static_cast<uint32_t>(graph.blocks.size());
-	std::vector<uint32_t> order;
-	order.reserve(count);
-	std::vector<uint8_t>                       visited(count, 0);
-	std::vector<std::pair<uint32_t, uint32_t>> stack; // (block, next successor)
-	if (graph.entry_block < count) {
-		visited[graph.entry_block] = 1;
-		stack.emplace_back(graph.entry_block, 0u);
-	}
-	while (!stack.empty()) {
-		const auto  block      = stack.back().first;
-		const auto& successors = graph.blocks[block].successors;
-		if (stack.back().second < successors.size()) {
-			const auto succ = successors[stack.back().second++];
-			if (succ < count && visited[succ] == 0) {
-				visited[succ] = 1;
-				stack.emplace_back(succ, 0u);
-			}
-			continue;
-		}
-		order.push_back(block);
-		stack.pop_back();
-	}
-	std::reverse(order.begin(), order.end());
-	for (uint32_t id = 0; id < count; id++) {
-		if (visited[id] == 0) {
-			order.push_back(id);
-		}
-	}
-	return order;
-}
-
 void ComputeDominators(Graph& graph) {
 	const auto count = static_cast<uint32_t>(graph.blocks.size());
 	const auto all   = AllBlockIds(count);
@@ -743,13 +696,10 @@ void ComputeDominators(Graph& graph) {
 		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
 	}
 
-	// Predecessors before successors (back edges aside).
-	const auto order   = SolverOrder(graph);
-	bool       changed = true;
+	bool changed = true;
 	while (changed) {
 		changed = false;
-		for (const auto id: order) {
-			auto& block = graph.blocks[id];
+		for (auto& block: graph.blocks) {
 			if (block.id == graph.entry_block) {
 				continue;
 			}
@@ -761,7 +711,8 @@ void ComputeDominators(Graph& graph) {
 				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
 					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
 				}
-				InsertSorted(next, block.id);
+				AddUnique(next, block.id);
+				SortUnique(next);
 			}
 			if (next != block.dominators) {
 				block.dominators = std::move(next);
@@ -1001,8 +952,7 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
-	return target != nullptr &&
-	       std::binary_search(target->dominators.begin(), target->dominators.end(), dominator);
+	return target != nullptr && Contains(target->dominators, dominator);
 }
 
 namespace {
@@ -1502,42 +1452,36 @@ Graph BuildGraph(const Decoder::Program& program) {
 	if (program.instructions.empty()) {
 		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
 		                 "cannot build CFG for empty shader");
-		return graph;
 	}
 
 	const auto first_pc = program.instructions.front().pc;
 	const auto end_pc   = ProgramEndPc(program);
 
-	std::set<uint32_t> instruction_pcs;
 	for (const auto& inst: program.instructions) {
-		instruction_pcs.insert(inst.pc);
 		if (inst.opcode == Opcode::UNSUPPORTED) {
 			ExitBuildFailure(
 			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
 			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
 			                Decoder::InstructionToString(inst).c_str()));
-			return graph;
 		}
 	}
 
-	std::set<uint32_t> labels;
-	labels.insert(first_pc);
-	labels.insert(end_pc);
+	std::vector<uint32_t> labels {first_pc, end_pc};
 
 	std::map<uint32_t, SetpcTargetInfo> setpc_targets;
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
 		const auto  next_pc = InstructionEndPc(inst);
-		if (Decoder::IsDirectBranch(inst.opcode)) {
-			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
+		if (Decoder::IsDirectBranch(inst.opcode) ||
+		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
+			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
 				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
 				                             inst.pc, inst.branch_target));
-				return graph;
 			}
-			labels.insert(inst.branch_target);
+			labels.push_back(inst.branch_target);
 			if (next_pc <= end_pc) {
-				labels.insert(next_pc);
+				labels.push_back(next_pc);
 			}
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
@@ -1545,51 +1489,47 @@ Graph BuildGraph(const Decoder::Program& program) {
 				ExitBuildFailure(
 				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
-				return graph;
 			}
 			const auto target_pcs = target_info.indirect
 			                            ? std::span<const uint32_t>(target_info.target_pcs)
 			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
-				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
+				if (!IsValidTarget(target, program.instructions, end_pc)) {
 					ExitBuildFailure(
 					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
 					                inst.pc, target));
-					return graph;
 				}
-				labels.insert(target);
+				labels.push_back(target);
 			}
 			setpc_targets.emplace(inst.pc, std::move(target_info));
 			if (next_pc <= end_pc) {
-				labels.insert(next_pc);
+				labels.push_back(next_pc);
 			}
-		} else if (inst.opcode == Opcode::S_ENDPGM) {
-			labels.insert(next_pc);
+		} else if (inst.opcode == Opcode::S_ENDPGM || inst.opcode == Opcode::S_SWAPPC_B64) {
+			labels.push_back(next_pc);
 		}
 	}
 
-	std::vector<uint32_t> sorted_labels(labels.begin(), labels.end());
-	for (uint32_t i = 0; i < sorted_labels.size(); i++) {
-		const auto start = sorted_labels[i];
+	SortUnique(labels);
+	graph.blocks.reserve(labels.size());
+	for (uint32_t i = 0; i < labels.size(); i++) {
+		const auto start = labels[i];
 		if (start > end_pc) {
 			continue;
 		}
-		if (start != end_pc && !instruction_pcs.contains(start)) {
+		const auto begin = std::ranges::lower_bound(program.instructions, start, {}, &Instruction::pc);
+		if (start != end_pc && (begin == program.instructions.end() || begin->pc != start)) {
 			ExitBuildFailure(
 			    graph, FailureKind::InvalidLabel, UINT32_MAX,
 			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
-			return graph;
 		}
 
 		BasicBlock block;
 		block.id         = static_cast<uint32_t>(graph.blocks.size());
 		block.start_pc   = start;
-		block.end_pc     = i + 1u < sorted_labels.size() ? sorted_labels[i + 1u] : end_pc;
-		block.inst_begin = static_cast<uint32_t>(
-		    std::lower_bound(program.instructions.begin(), program.instructions.end(), start,
-		                     [](const Instruction& inst, uint32_t pc) { return inst.pc < pc; }) -
-		    program.instructions.begin());
+		block.end_pc     = i + 1u < labels.size() ? labels[i + 1u] : end_pc;
+		block.inst_begin = static_cast<uint32_t>(begin - program.instructions.begin());
 		block.inst_end = static_cast<uint32_t>(
 		    std::lower_bound(program.instructions.begin(), program.instructions.end(), block.end_pc,
 		                     [](const Instruction& inst, uint32_t pc) { return inst.pc < pc; }) -
@@ -1599,10 +1539,10 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	graph.entry_block = 0;
 
-	std::map<uint32_t, uint32_t> pc_to_block;
-	for (const auto& block: graph.blocks) {
-		pc_to_block.emplace(block.start_pc, block.id);
-	}
+	const auto block_at_pc = [&](uint32_t pc) {
+		const auto found = std::ranges::lower_bound(graph.blocks, pc, {}, &BasicBlock::start_pc);
+		return found != graph.blocks.end() && found->start_pc == pc ? found->id : UINT32_MAX;
+	};
 
 	for (auto& block: graph.blocks) {
 		block.terminator = {};
@@ -1615,6 +1555,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(last);
 		if (last.opcode == Opcode::S_ENDPGM) {
 			block.terminator.kind = TerminatorKind::Return;
+		} else if (last.opcode == Opcode::S_SWAPPC_B64 && last.branch_target != UINT32_MAX) {
+			block.terminator.kind = TerminatorKind::Branch;
+			block.terminator.true_block = block_at_pc(last.branch_target);
 		} else if (last.opcode == Opcode::S_SETPC_B64) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
@@ -1624,7 +1567,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 				block.terminator.indirect_selector_code = target_info.selector_code;
 				for (const auto target_pc: target_info.target_pcs) {
 					block.terminator.indirect_target_pcs.push_back(target_pc);
-					block.terminator.indirect_targets.push_back(pc_to_block.at(target_pc));
+					block.terminator.indirect_targets.push_back(block_at_pc(target_pc));
 				}
 				const auto selector_count = std::min(target_info.selector_values.size(),
 				                                     target_info.selector_target_pcs.size());
@@ -1632,36 +1575,35 @@ Graph BuildGraph(const Decoder::Program& program) {
 					block.terminator.indirect_selector_values.push_back(
 					    target_info.selector_values[i]);
 					block.terminator.indirect_selector_targets.push_back(
-					    pc_to_block.at(target_info.selector_target_pcs[i]));
+					    block_at_pc(target_info.selector_target_pcs[i]));
 				}
 			} else {
 				block.terminator.kind       = TerminatorKind::Branch;
 				block.terminator.condition  = BranchCondition::Always;
-				block.terminator.true_block = pc_to_block.at(target_info.target);
+				block.terminator.true_block = block_at_pc(target_info.target);
 			}
 		} else if (last.opcode == Opcode::S_BRANCH) {
 			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.condition  = BranchCondition::Always;
-			block.terminator.true_block = pc_to_block.at(last.branch_target);
+			block.terminator.true_block = block_at_pc(last.branch_target);
 		} else if (Decoder::IsConditionalBranch(last.opcode)) {
 			block.terminator.kind       = TerminatorKind::ConditionalBranch;
 			block.terminator.condition  = ConditionForOpcode(last.opcode);
-			block.terminator.true_block = pc_to_block.at(last.branch_target);
-			const auto fallthrough      = pc_to_block.find(next_pc);
-			if (fallthrough == pc_to_block.end()) {
+			block.terminator.true_block = block_at_pc(last.branch_target);
+			const auto fallthrough      = block_at_pc(next_pc);
+			if (fallthrough == UINT32_MAX) {
 				ExitBuildFailure(
 				    graph, FailureKind::MissingFallthrough, block.id,
 				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
 				                last.pc));
-				return graph;
 			}
-			block.terminator.false_block = fallthrough->second;
+			block.terminator.false_block = fallthrough;
 		} else {
-			auto next = pc_to_block.find(block.end_pc);
-			if (next != pc_to_block.end() && block.end_pc != block.start_pc) {
+			const auto next = block_at_pc(block.end_pc);
+			if (next != UINT32_MAX && block.end_pc != block.start_pc) {
 				block.terminator.kind       = TerminatorKind::Branch;
 				block.terminator.condition  = BranchCondition::Always;
-				block.terminator.true_block = next->second;
+				block.terminator.true_block = next;
 			} else {
 				block.terminator.kind = TerminatorKind::Return;
 			}
@@ -1712,6 +1654,32 @@ Graph BuildGraph(const Decoder::Program& program) {
 	}
 	SortUnique(graph.code_table_load_pcs);
 
+	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
+		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
+		})) {
+		// Linked leaf bodies follow the caller in native PC order. Visit them in
+		// execution order so returning to the caller does not manufacture goto loops.
+		std::vector<bool> visited(graph.blocks.size(), false);
+		std::vector<std::pair<uint32_t, bool>> pending {{graph.entry_block, false}};
+		std::vector<BasicBlock> ordered;
+		ordered.reserve(graph.blocks.size());
+		while (!pending.empty()) {
+			const auto [id, finished] = pending.back();
+			pending.pop_back();
+			if (finished) {
+				ordered.push_back(std::move(graph.blocks[id]));
+				continue;
+			}
+			if (visited[id]) continue;
+			visited[id] = true;
+			pending.emplace_back(id, true);
+			for (const auto successor: graph.blocks[id].successors)
+				pending.emplace_back(successor, false);
+		}
+		std::ranges::reverse(ordered);
+		ApplyBlockOrder(graph, std::move(ordered));
+	}
+
 	RecomputeAnalyses(graph);
 
 	if (indirect_setpc) {
@@ -1740,6 +1708,59 @@ Graph Structurize(const Graph& graph) {
 		return failed;
 	}
 	return GotoStructurizer(graph).Run();
+}
+
+bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code) {
+	// Vector comparisons and carry results can write a scalar pair in wave64.
+	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
+	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
+	    inst.family == Decoder::Family::VOP3P) {
+		uint32_t destination = 0;
+		for (const auto* operand: {&inst.dst, &inst.dst2})
+			if (ScalarOperandCode(*operand, destination) && code >= destination && code <= destination + 1u)
+				return true;
+	}
+	return InstructionWritesScalarCode(inst, code);
+}
+
+uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                              uint32_t before, uint32_t code, std::vector<uint32_t>& crossed_calls) {
+	EXIT_IF(before >= program.instructions.size());
+	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
+		return block.inst_begin <= before && before < block.inst_end;
+	});
+	EXIT_IF(found == graph.blocks.end());
+	std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
+	std::set<std::pair<uint32_t, uint32_t>> visited;
+	std::optional<uint32_t> definition;
+	while (!pending.empty()) {
+		const auto point = pending.back();
+		pending.pop_back();
+		if (!visited.insert(point).second) continue;
+		const auto* block = graph.FindBlock(point.first);
+		EXIT_IF(block == nullptr);
+		uint32_t index = UINT32_MAX;
+		for (uint32_t i = point.second; i > block->inst_begin;) {
+			const auto& inst = program.instructions[--i];
+			if (inst.opcode == Opcode::S_SWAPPC_B64) {
+				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code));
+				crossed_calls.push_back(i);
+				continue;
+			}
+			if (MayWriteScalarRegister(inst, code)) { index = i; break; }
+		}
+		if (index != UINT32_MAX || block->id == graph.entry_block) {
+			EXIT_IF(definition && *definition != index);
+			definition = index;
+			continue;
+		}
+		EXIT_IF(block->predecessors.empty());
+		for (const auto predecessor: block->predecessors) {
+			pending.emplace_back(predecessor, graph.blocks[predecessor].inst_end);
+		}
+	}
+	EXIT_IF(!definition);
+	return *definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

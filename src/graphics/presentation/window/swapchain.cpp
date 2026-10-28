@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -7,32 +8,21 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/gpuTiming.h"
-#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
-
-// A private copy for the frame dump (libPngEnc.cpp has its own, without file output).
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_STATIC
-#include "stb_image_write.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
-#include <cinttypes>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
+#include <atomic>
 #include <limits>
 #include <memory>
-#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -45,6 +35,8 @@ struct Presenter::Frame {
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
+	bool          hdr          = false;
+	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -266,184 +258,6 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
 }
 
-// KYTY_FRAME_DUMP=<folder> writes the presented frame to <folder>/frame_<seconds>.bmp every
-// KYTY_FRAME_DUMP_EVERY seconds (default 15), counted from the presenter's creation. The frame is
-// read back from the GPU, so this works for runs nobody watches: with the monitor off, the window
-// covered or the session locked, where window captures come back black.
-class FrameDump final {
-public:
-	static std::unique_ptr<FrameDump> FromEnvironment(GraphicContext& graphics) {
-		const char* folder = std::getenv("KYTY_FRAME_DUMP");
-		if (folder == nullptr || *folder == '\0') {
-			return nullptr;
-		}
-		const char* every    = std::getenv("KYTY_FRAME_DUMP_EVERY");
-		const int   parsed   = every != nullptr ? std::atoi(every) : 0;
-		const int   interval = parsed > 0 ? parsed : 15;
-		std::error_code error;
-		std::filesystem::create_directories(folder, error);
-		LOGF("Frame dump: every %d s into %s\n", interval, folder);
-		return std::make_unique<FrameDump>(graphics, folder, interval);
-	}
-
-	FrameDump(GraphicContext& graphics, std::string folder, int interval)
-	    : m_graphics(graphics), m_folder(std::move(folder)), m_interval(interval),
-	      m_start(std::chrono::steady_clock::now()) {}
-	~FrameDump() {
-		// Every dump waits for its submission, so nothing here is still in use by the GPU.
-		if (m_image.image != nullptr) {
-			m_graphics.DeleteImage(m_image);
-		}
-		if (m_buffer != VK_NULL_HANDLE) {
-			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
-		}
-	}
-	KYTY_CLASS_NO_COPY(FrameDump);
-
-	// True when this presentation should be dumped; then Record and, after the submission
-	// finished, Write follow.
-	bool Due() {
-		const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-		                         std::chrono::steady_clock::now() - m_start)
-		                         .count();
-		if (elapsed < static_cast<int64_t>(m_next) * m_interval) {
-			return false;
-		}
-		m_seconds = static_cast<uint32_t>(elapsed);
-		m_next    = static_cast<uint32_t>(elapsed / m_interval) + 1u;
-		return true;
-	}
-
-	// The source is in TRANSFER_SRC_OPTIMAL (RecordPresentCommands leaves it there). A blit
-	// converts any presentable format to RGBA8.
-	void Record(vk::CommandBuffer command, Presenter::Frame& source) {
-		const vk::Extent2D extent {source.image.extent.width, source.image.extent.height};
-		Configure(extent);
-		vk::ImageMemoryBarrier to_transfer {};
-		to_transfer.sType               = vk::StructureType::eImageMemoryBarrier;
-		to_transfer.srcAccessMask       = vk::AccessFlagBits::eTransferRead;
-		to_transfer.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		to_transfer.oldLayout           = vk::ImageLayout::eUndefined;
-		to_transfer.newLayout           = vk::ImageLayout::eTransferDstOptimal;
-		to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_transfer.image               = m_image.image;
-		to_transfer.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
-		                        nullptr, 0, nullptr, 1, &to_transfer);
-		vk::ImageBlit region {};
-		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(extent.width),
-                                             static_cast<int>(extent.height), 1};
-		region.dstSubresource = region.srcSubresource;
-		region.dstOffsets[1]  = region.srcOffsets[1];
-		command.blitImage(source.image.image, vk::ImageLayout::eTransferSrcOptimal, m_image.image,
-		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eNearest);
-		auto to_source          = to_transfer;
-		to_source.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		to_source.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-		to_source.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
-		to_source.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
-		                        nullptr, 0, nullptr, 1, &to_source);
-		vk::BufferImageCopy copy {};
-		copy.imageSubresource = region.srcSubresource;
-		copy.imageExtent      = vk::Extent3D {extent.width, extent.height, 1};
-		command.copyImageToBuffer(m_image.image, vk::ImageLayout::eTransferSrcOptimal,
-		                          vk::Buffer(m_buffer), 1, &copy);
-		vk::BufferMemoryBarrier to_host {};
-		to_host.sType               = vk::StructureType::eBufferMemoryBarrier;
-		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
-		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		to_host.buffer              = vk::Buffer(m_buffer);
-		to_host.size                = VK_WHOLE_SIZE;
-		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0, nullptr,
-		                        1, &to_host, 0, nullptr);
-	}
-
-	void Write(uint64_t presented) {
-		RequireVulkanSuccess(static_cast<vk::Result>(vmaInvalidateAllocation(
-		                         m_graphics.allocator, m_buffer_allocation, 0, VK_WHOLE_SIZE)),
-		                     "invalidate frame dump buffer");
-		char name[32];
-		std::snprintf(name, sizeof(name), "frame_%04u.bmp", m_seconds);
-		const auto path = (std::filesystem::path(m_folder) / name).string();
-		// RGB only: the frame's alpha is whatever the game left there.
-		const auto*          rgba = static_cast<const uint8_t*>(m_mapped);
-		std::vector<uint8_t> rgb(static_cast<size_t>(m_extent.width) * m_extent.height * 3u);
-		for (size_t pixel = 0; pixel < rgb.size() / 3u; pixel++) {
-			rgb[pixel * 3u + 0u] = rgba[pixel * 4u + 0u];
-			rgb[pixel * 3u + 1u] = rgba[pixel * 4u + 1u];
-			rgb[pixel * 3u + 2u] = rgba[pixel * 4u + 2u];
-		}
-		const bool ok = stbi_write_bmp(path.c_str(), static_cast<int>(m_extent.width),
-		                               static_cast<int>(m_extent.height), 3, rgb.data()) != 0;
-		LOGF("Frame dump: %s %s (%ux%u, presented frame %" PRIu64 ")\n",
-		     ok ? "wrote" : "failed to write", path.c_str(), m_extent.width, m_extent.height,
-		     presented);
-	}
-
-private:
-	void Configure(vk::Extent2D extent) {
-		if (m_image.image != nullptr && m_extent == extent) {
-			return;
-		}
-		if (m_image.image != nullptr) {
-			m_graphics.DeleteImage(m_image);
-			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
-			m_buffer = VK_NULL_HANDLE;
-		}
-		m_extent = extent;
-		vk::ImageCreateInfo create {};
-		create.sType         = vk::StructureType::eImageCreateInfo;
-		create.imageType     = vk::ImageType::e2D;
-		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
-		create.mipLevels     = 1;
-		create.arrayLayers   = 1;
-		create.format        = vk::Format::eR8G8B8A8Unorm;
-		create.tiling        = vk::ImageTiling::eOptimal;
-		create.initialLayout = vk::ImageLayout::eUndefined;
-		create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
-		create.sharingMode = vk::SharingMode::eExclusive;
-		create.samples     = vk::SampleCountFlagBits::e1;
-		if (!m_graphics.CreateImage(create, m_image)) {
-			EXIT("failed to allocate the frame dump image, extent=%ux%u\n", extent.width,
-			     extent.height);
-		}
-		vk::BufferCreateInfo buffer {};
-		buffer.size  = static_cast<vk::DeviceSize>(extent.width) * extent.height * 4u;
-		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
-		VmaAllocationCreateInfo allocate {};
-		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-		allocate.flags =
-		    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-		VmaAllocationInfo info {};
-		const auto        raw = static_cast<VkBufferCreateInfo>(buffer);
-		RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(m_graphics.allocator, &raw,
-		                                                             &allocate, &m_buffer,
-		                                                             &m_buffer_allocation, &info)),
-		                     "allocate frame dump buffer");
-		m_mapped = info.pMappedData;
-	}
-
-	GraphicContext&                       m_graphics;
-	std::string                           m_folder;
-	int                                   m_interval = 15;
-	std::chrono::steady_clock::time_point m_start;
-	uint32_t                              m_next    = 1;
-	uint32_t                              m_seconds = 0;
-	vk::Extent2D                          m_extent {};
-	VulkanImage                           m_image;
-	VkBuffer                              m_buffer            = VK_NULL_HANDLE;
-	VmaAllocation                         m_buffer_allocation = nullptr;
-	void*                                 m_mapped            = nullptr;
-};
-
 class Swapchain final {
 public:
 	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
@@ -455,7 +269,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] bool   NeedsResize() const;
-	[[nodiscard]] Status AcquireNextImage();
+	[[nodiscard]] Status AcquireNextImage(CommandScheduler& scheduler);
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
@@ -466,20 +280,31 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(); }
+	bool SetHdr(bool hdr) {
+		const bool changed = m_hdr_active != (hdr && IsHdrSupported());
+		m_hdr_requested = hdr;
+		return changed;
+	}
 
 private:
+	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
 	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
 	vk::Format       m_format = vk::Format::eUndefined;
+	std::atomic_bool m_hdr_supported {false};
+	bool             m_hdr_requested = false;
+	bool             m_hdr_active    = false;
 	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
 	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
@@ -497,12 +322,12 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
-		frame_dump = FrameDump::FromEnvironment(owner.graphic_ctx);
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -537,9 +362,41 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
-	// Declared last: destroyed first, while the device is still alive.
-	std::unique_ptr<FrameDump> frame_dump;
 };
+
+vk::SurfaceFormatKHR Swapchain::SelectFormat() {
+	const auto& formats    = m_window.surface_capabilities.formats;
+	auto&       graphics   = m_window.graphic_ctx;
+	const auto  hdr_format = std::ranges::find_if(formats, [&](const auto& candidate) {
+		return candidate.colorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT &&
+		       IsHdrSwapchainFormat(candidate.format) &&
+		       static_cast<bool>(
+		           graphics.GetFormatProperties(candidate.format).optimalTilingFeatures &
+		           vk::FormatFeatureFlagBits::eBlitDst);
+	});
+	m_hdr_supported        = Config::HdrEnabled() && hdr_format != formats.end();
+	m_hdr_active           = m_hdr_requested && IsHdrSupported();
+	if (m_hdr_active) {
+		return *hdr_format;
+	}
+	if (Config::HdrEnabled() && !IsHdrSupported()) {
+		LOGF("HDR10 surface unavailable; using SDR output\n");
+	}
+	if (formats.size() == 1 && formats.front().format == vk::Format::eUndefined) {
+		return {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	}
+	for (const auto& candidate: formats) {
+		if (candidate.colorSpace != vk::ColorSpaceKHR::eSrgbNonlinear) {
+			continue;
+		}
+		switch (candidate.format) {
+			case vk::Format::eB8G8R8A8Unorm:
+			case vk::Format::eR8G8B8A8Unorm: return candidate;
+			default: break;
+		}
+	}
+	EXIT("no supported UNORM swapchain format\n");
+}
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
@@ -580,18 +437,7 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
-		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
-		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
-		                             });
-		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
-		}
-		format = *it;
-	}
+	const auto format = SelectFormat();
 	m_format                      = format.format;
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
@@ -631,6 +477,7 @@ void Swapchain::Create() {
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
+	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -659,6 +506,7 @@ void Swapchain::Create() {
 	vk::SemaphoreCreateInfo semaphore_info {};
 	semaphore_info.sType = vk::StructureType::eSemaphoreCreateInfo;
 	m_image_acquired.resize(m_images.size());
+	m_image_acquired_ticks.assign(m_images.size(), 0);
 	m_render_complete.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
@@ -727,6 +575,7 @@ void Swapchain::Destroy() {
 	m_images.clear();
 	m_image_views.clear();
 	m_image_acquired.clear();
+	m_image_acquired_ticks.clear();
 	m_render_complete.clear();
 }
 
@@ -752,8 +601,11 @@ bool Swapchain::NeedsResize() const {
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
-Swapchain::Status Swapchain::AcquireNextImage() {
+Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
+	// Wait for the submission that consumed this slot before signaling it again.
+	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -887,9 +739,11 @@ void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& l
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	const uint32_t premultiplied = layer.premultiplied_alpha;
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
+	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(premultiplied), &premultiplied);
+	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = m_image_views[m_image_index];
@@ -1023,7 +877,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
-	return scheduler.Submit(submit);
+	const auto tick                       = scheduler.Submit(submit);
+	m_image_acquired_ticks[m_frame_index] = tick;
+	return tick;
 }
 
 Swapchain::Status Swapchain::Present() {
@@ -1063,7 +919,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
+                                          bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -1073,6 +930,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	frame->hdr   = hdr;
+	frame->blank = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1081,6 +940,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (headset) {
+		// The frame holds the raw display-encoded pixels the headset needs.
+		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		               vk::AccessFlagBits2::eTransferRead);
+		Vr::OpenXrQueueEyeSource(buffer, frame->image);
+	}
 	return *frame;
 }
 
@@ -1089,7 +954,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	frame->hdr   = false;
+	frame->blank = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1097,6 +963,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1115,6 +982,10 @@ bool Presenter::PresentLastFrame() {
 
 bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
+}
+
+bool Presenter::IsHdrSupported() const noexcept {
+	return m_impl->swapchain.IsHdrSupported();
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
@@ -1143,10 +1014,6 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
-	const auto presented =
-	    m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
-	Timeline::Present(presented);
-	GpuTiming::Present(presented);
 	m_impl->Present();
 }
 
@@ -1166,40 +1033,32 @@ void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
+	const auto* main_frame = layers[0].frame;
+	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
+	                         swapchain.SetHdr(main_frame->hdr);
 	// Some window systems keep presenting an old swapchain after a resize.
-	if (swapchain.NeedsResize()) {
+	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = swapchain.AcquireNextImage();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		bool     dumped    = false;
-		uint64_t dump_tick = 0;
-		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
-			if (frame_dump != nullptr && layers[0].frame != nullptr && frame_dump->Due()) {
-				frame_dump->Record(command.Handle(), *layers[0].frame);
-				dumped = true;
+		// present_mutex owns the prepared frames and this scheduler. Only queue submission
+		// is shared with rendering, and it has its own queue_mutex.
+		auto&      command = present_scheduler.BeginCommand();
+		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
+		                                 swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		                                draw_system_overlay);
+		const auto tick = swapchain.Submit(present_scheduler);
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) {
+				layer.frame->present_tick = tick;
 			}
-			const auto tick = swapchain.Submit(present_scheduler);
-			for (const auto& layer: layers) {
-				if (layer.frame != nullptr) {
-					layer.frame->present_tick = tick;
-				}
-			}
-			dump_tick = tick;
-		}
-		if (dumped) {
-			present_scheduler.Wait(dump_tick);
-			frame_dump->Write(window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
@@ -1208,10 +1067,11 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master, wolverine ]
+    branches: [ main, master ]
   pull_request:
 
 concurrency:
@@ -113,7 +113,7 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
@@ -121,7 +121,7 @@ jobs:
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -135,11 +135,8 @@ jobs:
           path: _Build/windows/install/**
           if-no-files-found: error
 
-  # Windows-only CI: macOS build disabled (was: Build KytyPS5 (macOS)).
-  # The job is kept as a stub so the diff stays reviewable; it never runs.
   macos:
-    name: Build KytyPS5 (macOS - disabled, Windows-only CI)
-    if: false
+    name: Build KytyPS5 (macOS)
     needs: metadata
     runs-on: macos-15
 
@@ -205,7 +202,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
@@ -215,7 +212,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -260,6 +257,7 @@ jobs:
             "$install_dir/libMoltenVK.dylib" \
             "$app_dir/Contents/MacOS/KytyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             file "$binary"
             lipo "$binary" -verify_arch x86_64
@@ -269,6 +267,7 @@ jobs:
             "$install_dir/libMoltenVK.dylib" \
             "$app_dir/Contents/MacOS/KytyPS5" \
             "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/MacOS/kyty_updater" \
             "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             codesign --verify --strict "$binary"
           done
@@ -292,11 +291,8 @@ jobs:
           path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
           if-no-files-found: error
 
-  # Windows-only CI: Linux build disabled (was: Build KytyPS5 (Linux)).
-  # The job is kept as a stub so the diff stays reviewable; it never runs.
   linux:
-    name: Build KytyPS5 (Linux - disabled, Windows-only CI)
-    if: false
+    name: Build KytyPS5 (Linux)
     needs: metadata
     runs-on: ubuntu-24.04
 
@@ -392,7 +388,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
@@ -401,7 +397,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -411,11 +407,12 @@ jobs:
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/linux/install/launcher
+          file _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
+          test -x _Build/linux/install/kyty_updater
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/launcher | grep -q 'RPATH.*\$ORIGIN/lib'
+          readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
           while IFS= read -r -d '' binary; do
             while read -r dependency; do
               test -e "_Build/linux/install/lib/$dependency"
@@ -424,8 +421,8 @@ jobs:
                 sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
             )
           done < <(
-            find _Build/linux/install/launcher _Build/linux/install/plugins \
-              -type f \( -name launcher -o -name '*.so' \) -print0
+            find _Build/linux/install/kyty_launcher _Build/linux/install/plugins \
+              -type f \( -name kyty_launcher -o -name '*.so' \) -print0
           )
           _Build/linux/install/kyty_emulator --help > /dev/null
 
@@ -438,15 +435,14 @@ jobs:
 
   release:
     name: Release KytyPS5
-    # Windows-only CI: the release is gated on the Windows build alone. The
-    # macOS/Linux jobs are disabled stubs, so their results must not gate this.
     if: >-
       always() &&
       github.event_name == 'push' &&
-      (github.repository == 'KytyPS5/KytyPS5' ||
-       (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine')) &&
-      needs.windows.result == 'success'
-    needs: [metadata, windows]
+      github.repository == 'KytyPS5/KytyPS5' &&
+      (needs.windows.result == 'success' ||
+       needs.macos.result == 'success' ||
+       needs.linux.result == 'success')
+    needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -461,7 +457,19 @@ jobs:
           name: KytyPS5-Windows-x64
           path: artifacts/KytyPS5-Windows-x64
 
-      # Windows-only CI: no macOS/Linux artifacts are produced or downloaded.
+      - name: Download macOS build
+        if: needs.macos.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-macOS-x86_64
+          path: artifacts/KytyPS5-macOS-x86_64
+
+      - name: Download Linux build
+        if: needs.linux.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Linux-x86_64
+          path: artifacts/KytyPS5-Linux-x86_64
 
       - name: Package Windows build
         if: needs.windows.result == 'success'
@@ -474,17 +482,37 @@ jobs:
             zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Windows-x64.zip" .
           )
 
-      # Windows-only CI: no macOS/Linux packages are produced.
+      - name: Package macOS build
+        if: needs.macos.result == 'success'
+        shell: bash
+        run: |
+          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
+          test -f "$macos_archive"
+          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
+
+      - name: Package Linux build
+        if: needs.linux.result == 'success'
+        shell: bash
+        run: |
+          linux_dir="artifacts/KytyPS5-Linux-x86_64"
+          test -d "$linux_dir"
+          chmod a+x \
+            "$linux_dir/kyty_launcher" \
+            "$linux_dir/kyty_emulator" \
+            "$linux_dir/kyty_updater"
+          tar -C "$linux_dir" -czf \
+            "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
 
       - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Windows-only CI: the Windows zip is the only release asset.
           assets=()
           for artifact in \
-            "$RELEASE_NAME-Windows-x64.zip"; do
+            "$RELEASE_NAME-Windows-x64.zip" \
+            "$RELEASE_NAME-macOS-x86_64.zip" \
+            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
             if [[ -f "$artifact" ]]; then
               assets+=("$artifact")
             fi

@@ -15,6 +15,12 @@
 #include <mutex>
 #include <vector>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -62,7 +68,13 @@ class SpinGuard final {
 public:
 	explicit SpinGuard(std::atomic_flag& lock): m_lock(lock) {
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+#if defined(__x86_64__) || defined(_M_X64)
+			_mm_pause();
+#elif defined(_M_ARM64)
+			__yield();
+#elif defined(__aarch64__)
+			asm volatile("yield");
+#endif
 		}
 	}
 	~SpinGuard() { m_lock.clear(std::memory_order_release); }
@@ -289,15 +301,6 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
-
-bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {
-	const auto* region = m_impl->FindRegion(vaddr);
-	if (region == nullptr) {
-		return false;
-	}
-	const auto index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
-	return region->pages[index].access_watchers != 0;
-}
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {

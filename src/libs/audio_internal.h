@@ -19,8 +19,9 @@ enum class Format {
 };
 
 struct OutputParam {
-	int         handle = 0;
-	const void* data   = nullptr;
+	int          handle = 0;
+	const void*  data   = nullptr;
+	const float* gains  = nullptr;
 };
 
 static constexpr int OUT_PORTS_MAX = 32;
@@ -28,8 +29,6 @@ static constexpr int OUT_PORTS_MAX = 32;
 int      AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format);
 void     AudioOutClose(int handle);
 bool     AudioOutHasDevice(int handle);
-// Microseconds of audio the port's device stream still has to play; -1 without a device.
-int64_t  AudioOutQueuedUs(int handle);
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking = true);
 
 } // namespace Libs::Audio::AudioInternal

@@ -14,11 +14,8 @@ namespace IR {
 struct Program;
 }
 
-// Both return false for a program shape the analysis does not model; the caller
-// decides whether that is fatal.
-[[nodiscard]] bool AnalyzeTessellationPrograms(std::span<const uint32_t> local,
-                                               std::span<const uint32_t> control,
-                                               ShaderTessellationInputInfo& info);
-[[nodiscard]] bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options);
+void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+                                 ShaderTessellationInputInfo& info);
+void LowerTessellationMemory(IR::Program& program, const CompileOptions& options);
 
 } // namespace Libs::Graphics::ShaderRecompiler

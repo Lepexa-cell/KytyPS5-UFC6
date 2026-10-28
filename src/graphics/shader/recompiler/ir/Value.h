@@ -10,8 +10,6 @@
 #include <cstring>
 #include <type_traits>
 #include <utility>
-#include <span>
-#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -23,6 +21,7 @@ class Value {
 public:
 	Value() = default;
 	explicit Value(Inst* value);
+	explicit Value(const Inst* value) = delete;
 	explicit Value(ScalarReg value);
 	explicit Value(VectorReg value);
 	explicit Value(bool value);
@@ -54,17 +53,7 @@ public:
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
 
-	// The shader disk cache (shaderDiskCache.cpp): an immediate's bits, zero-extended from its
-	// type's width (0 for an empty value), and the immediate of a type made from them again.
-	// FromImmediateBits fails on a type no immediate has, or bits wider than the type.
-	[[nodiscard]] uint64_t ImmediateBits() const;
-	[[nodiscard]] static bool FromImmediateBits(Type type, uint64_t bits, Value& result);
-
 	bool operator==(const Value& other) const;
-	// Both name the same instruction (without resolving identities); inline, for hot paths.
-	[[nodiscard]] bool SameInstruction(const Value& other) const noexcept {
-		return type == Type::Opaque && other.type == Type::Opaque && inst == other.inst;
-	}
 
 private:
 	Type type = Type::Void;
@@ -141,23 +130,18 @@ public:
 		}
 		return evaluation_index;
 	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
+	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
+	void SetDefinition(uint32_t half, uint32_t definition) const {
+		definitions[half] = definition;
+	}
+	void ResetDefinitions() const { definitions = {}; }
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void Invalidate();
-	// Detaches without maintaining other instructions' use lists: only when every instruction
-	// that refers to this one is destroyed with it (Program::~Program).
-	void DropForDestruction();
-	// RemoveIdentities: ReplaceUsesWith(replacement, false) for an instruction about to be erased,
-	// leaving its own entries in its arguments' use lists; the caller drops those for every
-	// removed instruction at once (DropRemovedUses), which keeps every list in the same order.
-	// Uses by instructions already in `removed` (erased) are skipped. Arguments go to `touched`.
-	void ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
-	                           std::vector<Inst*>& touched);
-	static void DropRemovedUses(std::span<Inst* const>              touched,
-	                            const std::unordered_set<const Inst*>& removed);
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)
@@ -180,10 +164,6 @@ private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
-	// The operand slot itself, whatever storage the arity uses; no use-list bookkeeping.
-	Value& ArgSlot(size_t index);
-	// Back to empty inline storage without touching any use list.
-	void ResetArgStorage();
 
 	static constexpr uint8_t InlineArity = 4;
 	static constexpr uint8_t PhiArity = UINT8_MAX;
@@ -192,6 +172,7 @@ private:
 	uint8_t             num_args;
 	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
+	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	union {
@@ -202,46 +183,6 @@ private:
 	std::vector<Use>    uses;
 };
 
-static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
-
-// The accessors the IR passes and the resource walker call for every operand, inline: out of
-// line they were a fifth of the GPU thread's resource walk (calls, no LTO).
-inline bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-inline bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-inline bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-inline bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
-inline Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
-inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
-}
-
-inline uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
-inline ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
+static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

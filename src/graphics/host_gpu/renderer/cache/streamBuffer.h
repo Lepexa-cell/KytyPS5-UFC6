@@ -49,7 +49,6 @@ public:
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
-	[[nodiscard]] bool HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
@@ -71,8 +70,6 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
-	// The last scheduler tick a draw or dispatch bound the buffer in (the buffer cache's).
-	uint64_t last_use_tick = 0;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
 

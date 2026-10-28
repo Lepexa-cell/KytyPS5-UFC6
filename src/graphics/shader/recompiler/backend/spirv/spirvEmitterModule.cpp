@@ -1,46 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
-#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
 #include <bit>
-#include <cstdlib>
-#include <string>
-#include <string_view>
-#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
-
-// KYTY_NO_FLOAT_CONTROLS="all" or "hash,hash,...": leave out SignedZeroInfNanPreserve for these
-// shaders. A diagnostic only: on the RTX 5090 (driver 616.92) NVIDIA's code for c7c9148c7b0fa86c is
-// the same with or without the mode (255 registers, 107,264 bytes).
-bool FloatControlsDisabled(uint64_t shader_hash) {
-	static const auto setting = [] {
-		struct Setting {
-			bool                  all = false;
-			std::vector<uint64_t> hashes;
-		} result;
-		const char* value = std::getenv("KYTY_NO_FLOAT_CONTROLS");
-		if (value == nullptr) {
-			return result;
-		}
-		const std::string_view list(value);
-		if (list == "all") {
-			result.all = true;
-			return result;
-		}
-		size_t start = 0;
-		while (start < list.size()) {
-			const auto end = std::min(list.find(',', start), list.size());
-			if (end > start) {
-				result.hashes.push_back(
-				    std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
-			}
-			start = end + 1;
-		}
-		return result;
-	}();
-	return setting.all || std::ranges::find(setting.hashes, shader_hash) != setting.hashes.end();
-}
 
 uint32_t TypeVoid(EmitterState& state) {
 	if (state.void_type == 0) {
@@ -72,14 +35,11 @@ uint32_t TypeU32(EmitterState& state) {
 }
 
 uint32_t TypeU64(EmitterState& state) {
-	return TypeU32Vector(state, 2);
-}
-
-uint32_t TypeScalarU64(EmitterState& state) {
-	if (state.native_u64_type == 0) {
-		state.native_u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
+	if (state.u64_type == 0) {
+		state.builder.RequireCapability(spv::CapabilityInt64);
+		state.u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
 	}
-	return state.native_u64_type;
+	return state.u64_type;
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
@@ -160,41 +120,39 @@ uint32_t TypeFunction(EmitterState& state) {
 	return state.function_type;
 }
 
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits) {
-	return bits == 32u ? TypeU32(state) : bits == 64u ? TypeScalarU64(state)
-	                                                   : state.builder.Type(spv::OpTypeInt, bits, 0);
-}
-
-uint32_t StorageRuntimeArrayType(EmitterState& state, uint32_t bits) {
-	return state.builder.DecoratedType(
-	    spv::OpTypeRuntimeArray,
-	    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}},
-	    TypeStorageBufferElement(state, bits));
-}
-
-uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32) {
-	return state.builder.DecoratedType(spv::OpTypeStruct,
-	                                   {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
-	                                    {spv::OpDecorate, {spv::DecorationBlock}}},
-	                                   StorageRuntimeArrayType(state, bits));
-}
-
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state, bits));
+uint32_t StorageBufferType(EmitterState& state, BufferDefinition& buffer, uint32_t bits = 32) {
+	if (buffer.type == 0) {
+		if (bits == 32u) {
+			buffer.element_type = TypeU32(state);
+		} else if (bits == 64u) {
+			buffer.element_type = TypeU64(state);
+		} else {
+			buffer.element_type = state.builder.Type(spv::OpTypeInt, bits, 0);
+		}
+		const auto array = state.builder.DecoratedType(
+		    spv::OpTypeRuntimeArray,
+		    {{spv::OpDecorate, {spv::DecorationArrayStride, bits / 8u}}}, buffer.element_type);
+		buffer.type = state.builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+	}
+	return buffer.type;
 }
 
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
-	return TypePointer(state, spv::StorageClassStorageBuffer, TypeStorageBufferElement(state, bits));
-}
-
-bool DispatchDimensionsIndirect(const EmitterState& state) {
-	return state.program.stage == ShaderType::Compute && state.input_info.compute != nullptr &&
-	       state.input_info.compute->dispatch_dimensions_indirect &&
-	       state.program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
-}
-
-bool UsesPhysicalAddresses(const EmitterState& state) {
-	return state.program.info.uses_dma || DispatchDimensionsIndirect(state);
+	auto* buffer = &state.storage_buffers[2];
+	if (bits == 8u) {
+		buffer = &state.storage_buffers[0];
+	} else if (bits == 16u) {
+		buffer = &state.storage_buffers[1];
+	} else if (bits == 64u) {
+		buffer = &state.storage_buffers[3];
+	}
+	if (buffer->element_pointer_type == 0) {
+		buffer->element_pointer_type =
+		    TypePointer(state, spv::StorageClassStorageBuffer, buffer->element_type);
+	}
+	return buffer->element_pointer_type;
 }
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
@@ -248,91 +206,74 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
-// Set 1 (BindlessBindings.h): one runtime array per image type, aliasing the binding of its
-// dimension, and the translation buffer. Declared before the entry point collects globals.
-void DefineBindlessImages(EmitterState& state) {
-	for (const auto& image: state.program.info.images) {
-		if (!image.bindless) {
-			continue;
-		}
-		const auto type = ImageType(state, image);
-		if (state.bindless_image_variables.contains(type)) {
-			continue;
-		}
-		uint32_t binding = IR::BindlessImages2D;
-		if (image.cube) {
-			binding = IR::BindlessImagesCube;
-		} else if (image.dimension == ImageDimension::Dim3D) {
-			binding = IR::BindlessImages3D;
-		} else if (image.dimension == ImageDimension::Dim2DArray ||
-		           image.dimension == ImageDimension::Dim2DMsaaArray) {
-			binding = IR::BindlessImages2DArray;
-		}
-		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray, type);
-		const auto variable = state.builder.DefineGlobalVariable(
-		    TypePointer(state, spv::StorageClassUniformConstant, array),
-		    spv::StorageClassUniformConstant);
-		state.builder.AddName(variable, "bindless_images");
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
-		state.bindless_image_variables[type] = variable;
-		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
-		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
-		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-		state.builder.RequireVersion(0x00010500u);
-	}
-	if (state.bindless_sampler_variable == 0 &&
-	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {
-		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray,
-		                                         state.builder.Type(spv::OpTypeSampler));
-		const auto variable = state.builder.DefineGlobalVariable(
-		    TypePointer(state, spv::StorageClassUniformConstant, array),
-		    spv::StorageClassUniformConstant);
-		state.builder.AddName(variable, "bindless_samplers");
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
-		                            IR::BindlessSamplers);
-		state.bindless_sampler_variable = variable;
-		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
-		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
-		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-		state.builder.RequireVersion(0x00010500u);
-	}
-	if (!state.bindless_image_variables.empty() && state.bindless_translation_variable == 0) {
-		const auto variable = state.builder.DefineGlobalVariable(
-		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
-		    spv::StorageClassStorageBuffer);
-		state.builder.AddName(variable, "bindless_translation");
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
-		                            IR::BindlessTranslation);
-		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
-		state.bindless_translation_variable = variable;
-		const auto feedback = state.builder.DefineGlobalVariable(
-		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
-		    spv::StorageClassStorageBuffer);
-		state.builder.AddName(feedback, "bindless_feedback");
-		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationDescriptorSet,
-		                            IR::BindlessDescriptorSet);
-		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationBinding,
-		                            IR::BindlessFeedback);
-		state.bindless_feedback_variable = feedback;
-	}
+void DefineImageArray(EmitterState& state, ImageDefinition& definition, const IR::ImageResource& image,
+                      uint32_t count, uint32_t set, uint32_t binding) {
+	definition.type     = ImageType(state, image);
+	const auto array    = state.builder.Type(spv::OpTypeArray, definition.type, ConstantU32(state, count));
+	definition.variable = state.builder.DefineGlobalVariable(
+	    TypePointer(state, spv::StorageClassUniformConstant, array), spv::StorageClassUniformConstant);
+	state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationDescriptorSet, set);
+	state.builder.AddAnnotation(spv::OpDecorate, definition.variable, spv::DecorationBinding, binding);
+	definition.pointer_type = TypePointer(state, spv::StorageClassUniformConstant, definition.type);
 }
 
 void DefineDescriptors(EmitterState& state) {
-	DefineBindlessImages(state);
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	using Kind = IR::DescriptorBindingKind;
+	auto& info = state.program.info;
+	auto& bindings = state.program.bindings;
+	auto& counts = bindings.descriptor_counts;
+	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
+	for (auto& buffer: info.buffers) {
+		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+	}
+	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
+	for (auto& image: info.images) {
+		const auto kind = IR::DescriptorBindingForImage(image);
+		if (!kind.has_value() || image.mip_count == 0u ||
+		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
+			EXIT("shader image has an invalid descriptor type or mip count");
+		}
+		if (image.heap) {
+			// Heap kinds alias one array; the root itself is never accessed.
+			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
+			if (image.indirect_resources.empty() && definition.variable == 0) {
+				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
+			}
+			continue;
+		}
+		auto& count = counts[static_cast<size_t>(*kind)];
+		image.descriptor_index = count;
+		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
+		count += image.mip_count;
+	}
+	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
+	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
+	counts[static_cast<size_t>(Kind::SharedMemory)] =
+	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
+	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
+	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
+	if (info.uses_dispatch_threads) {
+		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
+		bindings.memory_offset_dword += 3u;
+	}
+	bindings.push_data_start_dword =
+	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
+	counts[static_cast<size_t>(Kind::ShaderData)] =
+	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    state.object_primitive_id_variable != 0 || state.user_clip_planes != 0) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
 		state.builder.AddName(type, "BufferResource");
 		state.builder.AddName(state.push_constant_variable, "vsharp");
 	}
-	for (const auto& binding: state.program.bindings.descriptors) {
+	for (uint32_t index = 0; index < counts.size(); ++index) {
+		if (counts[index] == 0) continue;
+		bindings.descriptor_mask |= uint64_t{1} << index;
+		const auto kind = static_cast<Kind>(index);
 		const auto Define = [&](uint32_t type, const char* name,
 		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
 			const auto variable =
@@ -340,79 +281,66 @@ void DefineDescriptors(EmitterState& state) {
 			state.builder.AddName(variable, name);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
-			                            IR::NativeBinding(state.program.stage, binding.kind));
+			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
 		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
-			    ConstantU32(state, static_cast<uint32_t>(binding.resources.size())));
+			    ConstantU32(state, counts[index]));
 		};
-		switch (binding.kind) {
-			case IR::DescriptorBindingKind::Buffers:
-				state.storage_buffer_variable =
-				    Define(ArrayType(StorageBufferType(state)), "buffers");
-				if (state.requirements.buffer_u8) {
-					state.storage_buffer_u8_variable =
-					    Define(ArrayType(StorageBufferType(state, 8)), "buffers_u8");
-				}
-				if (state.requirements.buffer_u16) {
-					state.storage_buffer_u16_variable =
-					    Define(ArrayType(StorageBufferType(state, 16)), "buffers_u16");
-				}
-				if (state.requirements.buffer_int64_atomics) {
-					state.storage_buffer_u64_variable =
-					    Define(ArrayType(StorageBufferType(state, 64)), "buffers_u64");
-				}
-				for (const auto variable: {state.storage_buffer_variable, state.storage_buffer_u8_variable,
-				                           state.storage_buffer_u16_variable, state.storage_buffer_u64_variable}) {
-					if (variable == 0) continue;
-					if (state.storage_buffer_u8_variable != 0 || state.storage_buffer_u16_variable != 0 ||
-					    state.storage_buffer_u64_variable != 0) {
-						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+		switch (kind) {
+			case IR::DescriptorBindingKind::Buffers: {
+				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
+				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
+				for (uint32_t alias = 0; alias < used.size(); ++alias) {
+					if (!used[alias]) continue;
+					auto& buffer = state.storage_buffers[alias];
+					const auto type = StorageBufferType(state, buffer, 8u << alias);
+					buffer.variable = Define(ArrayType(type), names[alias]);
+					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
 					// must participate in visibility for cache-bypassing polling loads.
-					if (state.requirements.coherent_buffers) {
-						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationCoherent);
+					if (info.coherent_buffers) {
+						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationCoherent);
 					}
 				}
 				break;
+			}
 			case IR::DescriptorBindingKind::BdaPagetable:
-				state.bda_pagetable_variable = Define(StorageBufferType(state, 64), "bda_pagetable");
+				state.bda_pagetable_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
-				state.fault_buffer_variable = Define(StorageBufferType(state), "fault_buffer");
+				state.fault_buffer_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "fault_buffer");
 				break;
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
-				    Define(StorageBufferType(state), "shader_data");
-				// NVIDIA Ada (RTX 4070): read-only ShaderData идёт в Constant Cache
-				// (NonWritable SSBO — тот же быстрый путь, что UBO c[], но без
-				// std140-переупаковки и лимита 64КБ; 2D UI не задет).
-				state.builder.AddAnnotation(spv::OpDecorate,
-				                            state.shader_data_storage_variable,
-				                            spv::DecorationNonWritable);
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
-				state.flattened_srt_variable = Define(StorageBufferType(state), "flattened_srt");
-				// SRT читается каждый draw (матрицы/кости/ключи); NonWritable
-				// направляет в read-only кэш вместо generic-пути SSBO.
-				state.builder.AddAnnotation(spv::OpDecorate, state.flattened_srt_variable,
-				                            spv::DecorationNonWritable);
+				state.flattened_srt_variable =
+				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
 				break;
 			case IR::DescriptorBindingKind::Samplers:
-				state.sampler_variable = Define(ArrayType(state.builder.Type(spv::OpTypeSampler)),
-				                                "samplers", spv::StorageClassUniformConstant);
+				state.sampler_type = state.builder.Type(spv::OpTypeSampler);
+				state.sampler_pointer_type = TypePointer(
+				    state, spv::StorageClassUniformConstant, state.sampler_type);
+				state.sampler_variable = Define(ArrayType(state.sampler_type), "samplers",
+				                                spv::StorageClassUniformConstant);
 				break;
 			case IR::DescriptorBindingKind::Gds:
-				state.gds_variable = Define(StorageBufferType(state), "gds");
+				state.gds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "gds");
 				break;
 			case IR::DescriptorBindingKind::SharedMemory:
-				state.lds_variable = Define(StorageBufferType(state), "lds_dwords");
+				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
-				if (state.requirements.shared_int64_atomics) {
-					state.lds_u64_variable = Define(StorageBufferType(state, 64), "lds_qwords");
+				if (state.program.info.shared_int64_atomics) {
+					state.lds_u64_variable =
+					    Define(StorageBufferType(state, state.storage_buffers[3], 64), "lds_qwords");
 					state.builder.AddAnnotation(spv::OpDecorate, state.lds_u64_variable, spv::DecorationCoherent);
 					for (const auto variable: {state.lds_variable, state.lds_u64_variable}) {
 						state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
@@ -420,20 +348,13 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				break;
 			default: {
-				EXIT_IF(IR::ImageBindingResourceClass(binding.kind) ==
+				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
 				        IR::ImageResourceClass::None);
-				const auto& image = state.program.info.images.at(binding.resources.front());
-				const auto  name  = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
-				state.image_variables[IR::ImageBindingIndex(binding.kind)] =
-				    Define(ArrayType(ImageType(state, image)), name.c_str(),
-				           spv::StorageClassUniformConstant);
-				if (image.dimension == ImageDimension::Dim1D ||
-				    image.dimension == ImageDimension::Dim1DArray) {
-					state.builder.RequireCapability(image.resource_class ==
-					                                        IR::ImageResourceClass::Sampled
-					                                    ? spv::CapabilitySampled1D
-					                                    : spv::CapabilityImage1D);
-				}
+				auto& definition = state.images[IR::ImageBindingIndex(kind)];
+				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
+				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
+				state.builder.AddName(definition.variable,
+				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
 			}
 		}
@@ -464,18 +385,17 @@ uint32_t ConstantBool(EmitterState& state, bool value) {
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(spv::OpConstantComposite, TypeU64(state),
-	                              ConstantU32(state, static_cast<uint32_t>(value)),
-	                              ConstantU32(state, static_cast<uint32_t>(value >> 32u)));
+	return state.builder.Constant(spv::OpConstant, TypeU64(state), static_cast<uint32_t>(value),
+	                              static_cast<uint32_t>(value >> 32u));
 }
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components) {
 	EXIT_IF(components < 1u || components > 4u);
-	const auto            zero = ConstantU32(state, 0);
+	const auto zero = ConstantU32(state, 0);
 	if (components == 1u) return zero;
-	std::vector<uint32_t> values(components, zero);
+	const std::array values {zero, zero, zero, zero};
 	return state.builder.Constant(spv::OpConstantComposite, TypeU32Composite(state, components),
-	                              values);
+	                              std::span(values).first(components));
 }
 
 uint32_t GlslStd450(EmitterState& state) {
@@ -573,7 +493,7 @@ void DefineInputs(EmitterState& state) {
 			state.inputs.push_back({{kind, 0, components, name}});
 		}
 	};
-	if (IR::FindBinding(state.program.bindings, IR::DescriptorBindingKind::SharedMemory) != nullptr) {
+	if (state.program.info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
@@ -636,6 +556,11 @@ void DefineInputs(EmitterState& state) {
 		}
 		input.variable_id =
 		    DefineInterfaceVariable(state, type, spv::StorageClassInput, input.debug_name.c_str());
+		if (state.program.stage == ShaderType::Pixel && input.kind == IR::StageInputKind::PrimitiveId) {
+			// Fragment PrimitiveId accepts Tessellation, which the device already enables.
+			state.builder.RequireCapability(spv::CapabilityTessellation);
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
+		}
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
@@ -660,7 +585,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.requirements.subgroup_local_invocation_id) {
+	if (state.program.info.subgroup_local_invocation_id) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -684,14 +609,24 @@ void DefineOutputs(EmitterState& state) {
 			cull_distance_count = std::max(cull_distance_count, output.index + 1);
 		}
 	}
+	const bool position = std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		return output.kind == IR::StageOutputKind::Position;
+	});
+	if (position && state.input_info.vertex->user_clip_planes != 0) {
+		// PipelineCache rejects UCP_ENA with shader clip or cull distances.
+		EXIT_IF(clip_distance_count + cull_distance_count != 0);
+		state.user_clip_planes = state.input_info.vertex->user_clip_planes;
+		for (auto mask = state.user_clip_planes; mask != 0; mask &= mask - 1u) {
+			state.outputs.push_back(
+			    {{IR::StageOutputKind::ClipDistance, clip_distance_count++, 0, "gl_ClipDistance"}});
+		}
+	}
 	if (state.program.stage == ShaderType::Mesh) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u && position) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
@@ -747,17 +682,22 @@ void DefineOutputs(EmitterState& state) {
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
 				            spv::BuiltInSampleMask);
 				break;
+			case IR::StageOutputKind::ObjectPrimitiveId:
+				binding.variable_id = DefineInterfaceVariable(
+				    state, TypeU32(state), spv::StorageClassOutput, binding.debug_name.c_str());
+				state.object_primitive_id_variable = binding.variable_id;
+				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+				                            spv::DecorationLocation, binding.location);
+				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
-				const bool mrt = binding.kind == IR::StageOutputKind::Mrt &&
-				                 state.program.stage == ShaderType::Pixel;
 				const bool uint_output =
-				    mrt && (state.input_info.pixel->target_uint_mask & (1u << binding.index)) != 0;
-				const bool sint_output =
-				    mrt && (state.input_info.pixel->target_sint_mask & (1u << binding.index)) != 0;
-				const auto type     = uint_output   ? TypeU32Vector(state, 4)
-				                      : sint_output ? TypeI32Vector(state, 4)
-				                                    : TypeF32Vector(state, 4);
+				    binding.kind == IR::StageOutputKind::Mrt &&
+				    state.program.stage == ShaderType::Pixel &&
+				    binding.index < std::size(state.input_info.pixel->target_output_mode) &&
+				    (state.input_info.pixel->target_output_mode[binding.index] == 7u ||
+				     (state.input_info.pixel->target_packed_unorm_mask & (1u << binding.index)) != 0u);
+				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
@@ -786,10 +726,10 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
-	if (state.requirements.function_lds) {
+	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
-	if (state.requirements.function_scratch) {
+	if (state.program.info.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.scratch_variable[half] = state.builder.AllocateId();
 		}
@@ -805,12 +745,6 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
-		if (state.mesh_passes > 1u) {
-			state.mesh_pass_variable = state.builder.DefineGlobalVariable(
-			    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)),
-			    spv::StorageClassPrivate);
-			state.builder.AddName(state.mesh_pass_variable, "mesh_pass");
-		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
@@ -819,35 +753,28 @@ void DefineModule(EmitterState& state) {
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(spv::CapabilityShader);
-	const bool float_controls = state.float_controls;
-	if (float_controls) {
-		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
-	}
-	if (state.requirements.buffer_u8) {
+	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (state.program.info.buffer_u8) {
 		state.builder.RequireExtension("SPV_KHR_8bit_storage");
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer8BitAccess);
 	}
-	if (state.requirements.buffer_u16) {
+	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (UsesPhysicalAddresses(state)) {
+	if (state.program.info.uses_dma || state.program.info.uses_image_heap) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
+	if (state.program.info.buffer_int64_atomics || state.program.info.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
-	if (state.requirements.shared_int64_atomics &&
+	if (state.program.info.shared_int64_atomics &&
 	    state.lds_storage_class == spv::StorageClassWorkgroup) {
 		state.builder.RequireVersion(0x00010400u);
 		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
 		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
-	}
-	if (state.requirements.shader_clock) {
-		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
-		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
@@ -866,24 +793,28 @@ void DefineModule(EmitterState& state) {
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
 	}
-	if (state.requirements.image_gather_extended) {
+	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_barrier ||
-	    state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id) {
+	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
+	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
+	    state.program.info.subgroup_shuffle ||
+	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.requirements.subgroup_shuffle) {
+	if (state.program.info.subgroup_vote) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	}
+	if (state.program.info.subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (state.requirements.subgroup_arithmetic) {
+	if (state.program.info.subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
 		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
 	}
@@ -897,20 +828,16 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityFragmentBarycentricKHR);
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
-	if (float_controls) {
-		state.builder.RequireExtension("SPV_KHR_float_controls");
-	}
-	state.builder.AddMemoryModel(UsesPhysicalAddresses(state)
+	state.builder.RequireExtension("SPV_KHR_float_controls");
+	state.builder.AddMemoryModel(state.program.info.uses_dma || state.program.info.uses_image_heap
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
 	// GCN/RDNA arithmetic preserves 32-bit signed zero, infinity, and NaN. Declaring that
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
-	if (float_controls) {
-		state.builder.AddExecutionMode(state.main_func,
-		                               spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
-	}
-	if (state.requirements.float64) {
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+	                               32u);
+	if (state.program.info.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);
 		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
@@ -922,8 +849,8 @@ void DefineModule(EmitterState& state) {
 		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
 	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t    local_x = state.program.info.compute_derivatives ? 2u : 1u;
+		uint32_t    local_y = state.program.info.compute_derivatives ? 2u : 1u;
 		uint32_t    local_z = 1u;
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
@@ -931,13 +858,11 @@ void DefineModule(EmitterState& state) {
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
-			if (state.requirements.compute_derivatives) {
+			if (state.program.info.compute_derivatives) {
 				local_y = local_x / 2u;
 				local_x = 2u;
 			}
 		}
-		// A pass runs 1/mesh_passes of the waves (mesh threads are one-dimensional).
-		local_x /= state.mesh_passes;
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
 	}
@@ -952,14 +877,14 @@ void DefineModule(EmitterState& state) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}
-	if (state.requirements.compute_derivatives && state.program.stage == ShaderType::Compute) {
+	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");
-	if (state.requirements.function_lds) {
+	if (state.program.info.function_lds) {
 		state.builder.AddName(state.lds_variable, "lds_dwords");
 	}
-	if (state.requirements.function_scratch) {
+	if (state.program.info.function_scratch) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
 		}

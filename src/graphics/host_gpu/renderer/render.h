@@ -4,17 +4,12 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/indirectDispatch.h"
-#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <unordered_set>
 #include <array>
-#include <cstdint>
-#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -29,7 +24,6 @@ class Shader;
 
 struct GraphicContext;
 struct ShaderBufferResource;
-enum class ShaderType;
 struct ShaderComputeInputInfo;
 struct RenderDepthInfo;
 struct RenderColorInfo;
@@ -39,55 +33,26 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
-class CommandRecorder;
 struct RenderExecutorTestAccess;
-
-// Submit-cause telemetry: which boundary actually paid a vkQueueSubmit.
-// Recorded per Flush()/Submit() site, aggregated over 60 frames in TelemetryEndFrame.
-// GPU thread only. Lives here (not in commandProcessor.h) so CommandScheduler's
-// Flush()/Submit() signatures can name it without an include cycle.
-enum class SubmitCause : uint8_t {
-	Flush,       // Generic non-blocking flush (BufferFlush slice progress, suspend-point
-	             // drain, readback download drain). Refined per-site below as needed.
-	DrawFlush,   // CompleteDraw()'s periodic non-blocking flush (KYTY_DRAW_FLUSH_INTERVAL).
-	ReleaseWrite, // CompleteReleaseMemWrite()'s fence-write batching (32 per submit).
-	ReleaseIrq,  // CompleteReleaseMemInterrupt()'s event batching (8 per submit).
-	SliceFlush,  // Guest slice progress: BufferFlush() after a graphics/compute slice
-	             // made progress, or the suspend-point drain (SubmitType boundaries).
-	ReleaseFlush, // CpOpReleaseMem interrupt path, merged into the ReleaseIrq window
-	             // under KYTY_OPT_SUBMIT_MERGE_RELEASE_FLUSH (default on).
-	Readback,    // Async readback download drain (BufferCache downloads).
-	Present,     // Flip / PrepareCpuFlip / WaitFlipDone frame-boundary submit.
-	Wait,        // CommandScheduler::Wait() on the current tick: submits the open
-	             // buffer then blocks until the GPU drains it (stream-buffer wrap,
-	             // sync readback, fault handling). Additionally adds submit_wait_*
-	             // (m_master.Wait() only -- pure GPU idle, measured after Submit
-	             // returned and before BeginNext, never the submit overhead).
-	             // Waiting on an already-submitted tick adds nothing: its submit
-	             // cost went to the earlier cause's bucket (see Wait() else-branch).
-	Finish,      // CommandScheduler::Finish()/FlushAndWait(): submit plus host-side wait
-	             // for all prior ticks. Also adds its Wait() interval to submit_wait_*;
-	             // Shutdown()'s final drain stays uncounted (not on the GPU thread).
-	Count,
-};
 
 enum class CommandBufferDebugOp : uint32_t {
 	DispatchDirect,
 	DrawIndex,
 	DrawIndexAuto,
-	EopWrite,
-	EopInterrupt,
-	EopWriteBack,
-	EopFlip,
-	EopWriteBackFlip,
-	EopOnlyFlip,
-	DispatchIndirect,
+	DispatchIndirect = 9,
 	Unknown,
 };
 
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
 	IndirectArgs,
+};
+
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+struct DrawIndirectArgs {
+	uint64_t address = 0;
+	uint32_t count   = 0;
+	uint32_t stride  = 0;
 };
 
 struct DrawIndexArgs {
@@ -99,6 +64,8 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
@@ -108,13 +75,7 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
-	// DRAW_INDIRECT read on the GPU: the guest address of its DrawIndirectArgs (vertex count,
-	// instance count, start vertex, start instance). The counts above are then unknown on the
-	// CPU; only fast-launch mesh draws come this way.
-	uint64_t         gpu_args_address           = 0;
-	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
-	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
-	uint64_t         gpu_instance_count_address = 0;
+	DrawIndirectArgs indirect;
 };
 
 struct SubmitInfo {
@@ -156,11 +117,7 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
-	// this first waits until the thread has run everything queued; hot paths use Recorder().
 	[[nodiscard]] vk::CommandBuffer Handle() const;
-	// Records directly, or through the recording thread.
-	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -180,9 +137,6 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	CommandScheduler&   m_scheduler;
-	// Begun and not submitted yet; m_buffer is its handle when not recorded on a thread.
-	bool                m_open            = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
@@ -206,56 +160,30 @@ public:
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
-	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
-	                      uint32_t mode);
+	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
-	// the keys shaders flagged as pending.
-	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void ResolveBindlessRequests();
-	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
-	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
-	// they were settled; returns how many it resolved.
-	uint32_t RevalidateBindlessKeys(uint32_t budget);
-	void                           FindBuffers(PreparedBindings& bindings);
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
-	// Step 4b: content-based upload dedup (KYTY_OPT_UPLOAD_DEDUP, default on).
-	// Safety rests on content equality (memcmp): a slot collision across stages can
-	// only miss a dedup, never alias different bytes.
-	struct UploadDedupEntry {
-		bool                     valid = false;
-		uint64_t                 tick  = 0;
-		uint64_t                 frame = 0;
-		vk::DescriptorBufferInfo info {nullptr, 0, VK_WHOLE_SIZE};
-		std::vector<uint32_t>    words;
-	};
-	// Two upload kinds (0 flattened-SRT, 1 shader-data) x shader-stage enum value.
-	static constexpr size_t kUploadDedupKinds  = 2;
-	static constexpr size_t kUploadDedupStages = 16;
-	bool DedupUpload(ShaderType stage, size_t kind, std::span<const uint32_t> data,
-	                 vk::DescriptorBufferInfo& out);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False, with nothing drawn, when the draw's indirect records need CPU counts.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
 		std::optional<PreparedBindings> pixel;
 	};
 
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] TextureBinding FindResolvedTexture(
-	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
-	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
-	    vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -263,6 +191,8 @@ private:
 	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
@@ -277,46 +207,23 @@ private:
 	                                               std::span<PreparedBindings* const> stages = {});
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
-	// Bindless heaps already surveyed (base ^ table offset << 48).
-	std::unordered_set<uint64_t>          m_bindless_surveyed;
-
-	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
-	                    uint32_t index_offset, int32_t base_vertex, uint32_t first_vertex,
-	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
-	uint64_t                              m_bindless_frame = UINT64_MAX;
-	std::vector<uint32_t>                 m_bindless_requests;
-	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
-	std::vector<uint32_t>                 m_bindless_srt;
-	// Step 4b: per-(stage, upload kind) dedup of identical flattened-SRT / shader-data
-	// uploads within one scheduler tick of one presented frame. The stream ring never
-	// rewrites live memory (a wrap waits for the GPU), so a reused allocation stays
-	// valid while its tick is current; any tick/frame change invalidates the entries.
-	std::array<std::array<UploadDedupEntry, kUploadDedupStages>, kUploadDedupKinds>
-	    m_upload_dedup {};
-	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<uint32_t>                 m_image_occurrences;
-	// Created at the first thread-dimension indirect dispatch.
-	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
-	// Ring of VkDrawMeshTasksIndirectCommandEXT for indirect fast-launch mesh draws (16 bytes an
-	// entry); an entry is rewritten only after the ring has gone round, behind its last read.
-	std::unique_ptr<Buffer>                 m_mesh_indirect;
-	uint32_t                                m_mesh_indirect_next = 0;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

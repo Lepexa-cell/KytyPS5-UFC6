@@ -7,9 +7,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <atomic>
 #include <compare>
 #include <limits>
-#include <atomic>
 #include <optional>
 #include <span>
 #include <utility>
@@ -20,7 +20,6 @@ namespace Libs::Graphics {
 class Buffer;
 class CommandScheduler;
 class TileManager;
-class CommandRecorder;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
@@ -31,10 +30,8 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
-	bool texture       = false;
 	bool storage       = false;
 	bool render_target = false;
-	bool depth_target  = false;
 	bool video_out     = false;
 };
 
@@ -60,10 +57,8 @@ public:
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
-	// Records through the recording thread when given a threaded CommandBuffer::Recorder(); a raw
-	// command buffer converts.
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, const CommandRecorder& command_buffer);
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -74,40 +69,27 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
-	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
-			m_cpu_dirty        = true;
-			m_maybe_cpu_dirty  = false;
-			m_maybe_hash_valid = false;
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
-			m_maybe_cpu_dirty = true;
-		}
+	void MarkCpuDirty() {
+		m_cpu_dirty       = true;
+		m_maybe_cpu_dirty = false;
+		HeapChanged();
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
-		if (!m_cpu_dirty) {
+		if (!IsCpuDirty()) {
+			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			HeapChanged();
 		}
-	}
-	[[nodiscard]] bool NeedsMaybeCpuHash() const {
-		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
-	}
-	void SetMaybeCpuHash(uint64_t hash) {
-		if (!NeedsMaybeCpuHash()) {
-			EXIT("image cannot initialize maybe-dirty hash\n");
-		}
-		m_maybe_cpu_hash   = hash;
-		m_maybe_hash_valid = true;
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
+		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_maybe_cpu_dirty = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
 	}
@@ -116,9 +98,8 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
-		m_cpu_dirty        = false;
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_cpu_dirty       = false;
+		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -126,7 +107,10 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		HeapChanged();
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -142,6 +126,19 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
+		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+	}
+	// Resident image heaps sample an image without rediscovering it until one changes its
+	// contents, tracking, identity or layout.
+	void HeapChanged() const noexcept {
+		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
+			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
+		}
+	}
+
+	static inline std::atomic<uint64_t> heap_epoch {0};
 
 	ImageInfo        info;
 	VulkanImage      backing;
@@ -149,30 +146,18 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
-	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
-	// table (TextureCache::on_bindless_unregister) to repoint the slot.
-	bool             bindless_pinned = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	// Stencil associations that refer to this depth image.
+	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
-	// Presented frame of the last access: overlapping aliases age by frames as well as by ticks
-	// (TextureCache::ResolveOverlap, KYTY_IMAGE_ALIAS_AGE).
-	uint64_t         frame_accessed_last = 0;
 	size_t           lru_id             = 0;
-	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
-	bool             alias_owner        = false;
-	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
-	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
-	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip
-	// the synchronous GPU readback after the first one -- a real re-clear in a later recording
-	// still gets caught because the tick will have advanced by then.
-	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
-	uint32_t         dcc_clear_checked_first = 0;
-	uint32_t         dcc_clear_checked_count = 0;
+	// Resident image heap elements that select this image.
+	std::atomic<uint32_t> heap_refs {0};
 
 private:
 	friend struct ImageTestAccess;
@@ -185,23 +170,12 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash   = 0;
-	bool              m_cpu_dirty        = false;
-	bool              m_maybe_cpu_dirty  = false;
-	bool              m_maybe_hash_valid = false;
-	bool              m_gpu_modified     = false;
-	bool              m_buffer_modified  = false;
+	uint64_t          m_maybe_cpu_hash  = 0;
+	bool              m_cpu_dirty       = false;
+	bool              m_maybe_cpu_dirty = false;
+	bool              m_gpu_modified    = false;
+	bool              m_buffer_modified = false;
 };
-
-// Changes of a bindless-pinned image's state that the per-draw bindless pass checks
-// (RenderExecutor::CommitBindings): its layout, render-target use and registration. A heap is
-// rechecked only when this changed since it was last checked, or for the images resolved since.
-inline std::atomic<uint64_t> g_bindless_state_generation {1};
-inline void NoteBindlessStateChange(const Image& image) noexcept {
-	if (image.bindless_pinned) {
-		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
-	}
-}
 
 namespace ImageOps {
 

@@ -20,7 +20,6 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cinttypes>
 
 namespace Libs::Graphics {
@@ -98,6 +97,24 @@ uint64_t GraphicContext::GetDeviceMemoryUsage() const {
 	return usage;
 }
 
+uint32_t GraphicContext::GetHeapUsage(std::span<HeapUsage, VK_MAX_MEMORY_HEAPS> heaps) const {
+	if (allocator == nullptr) {
+		return 0;
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(allocator, budgets);
+	const auto count = physical_device_memory_properties.memoryHeapCount;
+	for (uint32_t heap = 0; heap < count; heap++) {
+		const auto& properties = physical_device_memory_properties.memoryHeaps[heap];
+		heaps[heap] = {.usage        = budgets[heap].usage,
+		               .budget       = budgets[heap].budget,
+		               .allocations  = budgets[heap].statistics.allocationCount,
+		               .device_local = static_cast<bool>(properties.flags &
+		                                                 vk::MemoryHeapFlagBits::eDeviceLocal)};
+	}
+	return count;
+}
+
 uint64_t GraphicContext::GetTotalMemoryBudget() const {
 	if (allocator == nullptr) {
 		return 0;
@@ -137,25 +154,9 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	auto             result       = static_cast<vk::Result>(
+	const auto        result       = static_cast<vk::Result>(
 	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
 	                   &alloc_info, &native_image, &image.allocation, nullptr));
-	if (result != vk::Result::eSuccess) {
-		// The device heap is full. The guest has a unified 16 GB pool, so the image is
-		// real; place it in host memory and pay in bandwidth rather than fail.
-		alloc_info.requiredFlags  = 0;
-		alloc_info.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
-		result                    = static_cast<vk::Result>(vmaCreateImage(
-            allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-            &alloc_info, &native_image, &image.allocation, nullptr));
-		static std::atomic<uint32_t> spill_count {0};
-		if (const auto seen = spill_count.fetch_add(1, std::memory_order_relaxed); seen < 32) {
-			LOGF("Image spilled to host memory (%u): %ux%ux%u layers=%u levels=%u format=%d -> %s\n",
-			     seen + 1, image_info.extent.width, image_info.extent.height,
-			     image_info.extent.depth, image_info.arrayLayers, image_info.mipLevels,
-			     static_cast<int>(image_info.format), vk::to_string(result).c_str());
-		}
-	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();

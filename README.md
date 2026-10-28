@@ -7,12 +7,12 @@
 [![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
-**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes and ongoing development.
+**[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes, and ongoing development.
 
 **[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
 
-KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
-with experimental macOS support. It is based on a heavily modified version of
+KytyPS5 is a free and open-source PlayStation 5 translation layer written in C++ for Windows
+and Linux, with experimental macOS support. It is based on a heavily modified version of
 [Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
 can change significantly between builds.
 
@@ -23,13 +23,13 @@ can change significantly between builds.
 
 ## Current Status
 
-KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
+KytyPS5 can boot 2D and 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
 planned.
 
 Development is currently focused on expanding game compatibility and improving boot reliability.
 
-Windows and Linux are the primary platforms and receive the most testing.
+Windows and Linux are the primary target platforms and receive the most testing.
 
 macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
@@ -48,12 +48,22 @@ or graphical glitches, so please include the version you tested when reporting a
 <table align="center">
   <tr>
     <td align="center">
+      <strong>Cyberpunk 2077</strong><br>
+      <img src="docs/screenshots/ps5-07.png" width="300" alt="Cyberpunk 2077 running in KytyPS5">
+    </td>
+    <td align="center">
+      <strong>MLB The Show 23</strong><br>
+      <img src="docs/screenshots/ps5-08.png" width="300" alt="MLB The Show 23 running in KytyPS5">
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
       <strong>Astro Bot</strong><br>
       <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Dreaming Sarah</strong><br>
-      <img src="docs/screenshots/ps5-03.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+      <strong>Saros</strong><br>
+      <img src="docs/screenshots/ps5-03.png" width="300" alt="Saros running in KytyPS5">
     </td>
   </tr>
   <tr>
@@ -85,14 +95,20 @@ or graphical glitches, so please include the version you tested when reporting a
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
 issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
-Code contributions should be focused, build successfully on the platforms they touch, and include
-relevant tests where practical. Windows is the primary target, so a change that alters shared code
-should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
-starting a large change.
+**Pull requests for general fixes, architectural changes, or refactoring that do not address a concrete bug or launch problem in a specific game will be automatically closed.**
+
+**Large, unfocused commits or pull requests that bundle unrelated changes without a clear purpose or game-related benefit will also be automatically closed.**
+
+Keep each PR focused. Name the affected game, describe the exact problem, and provide evidence showing what the change fixes.
+
+Windows and Linux are the primary target platforms, so changes to shared code should not
+introduce regressions on either platform. Changes confined to a platform's own code paths
+only need to build on that platform. Because KytyPS5 is still evolving quickly, consider
+opening an issue before starting a large change.
 
 ### Formatting
 
-Set up the clang-format hook after cloning:
+Set up the clang-format hook after cloning.
 
 Install `pre-commit` using the method appropriate for your platform:
 
@@ -141,7 +157,8 @@ the Vulkan/SPIR-V validation rules.
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
-- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
+- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslang` or `glslangValidator`) on `PATH`
+- Python 3 on `PATH`; the bundled SPIRV-Tools runs it at configure time
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
@@ -170,20 +187,20 @@ The finished application and its runtime dependencies will be placed in
 
 ### Building on Linux
 
-Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
-udev development packages SDL3 quietly configures itself without those backends, and the resulting
-build has no working sound and no gamepad hotplug:
+Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland, and
+udev development packages, SDL3 quietly configures itself without those backends, and the resulting
+build has no working audio or gamepad hotplug support:
 
 ```bash
 sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools pkg-config \
+  clang lld ninja-build cmake git glslang-tools python3 pkg-config \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
   libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
-(`qt6-base-dev`) or an official Qt installation.
+Qt 6 (Concurrent, Network, and Widgets) is required for the launcher. Use your distribution's
+packages (`qt6-base-dev`) or an official Qt installation.
 
 ```bash
 git submodule update --init --recursive
@@ -197,7 +214,7 @@ cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
 The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
+`_Build/linux/install` runs without a matching system Qt installation. FFmpeg is linked statically
 from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
 release, including VP9 and WebM support. System FFmpeg packages are not required.
 
@@ -241,6 +258,43 @@ sources, so it needs network access; a fully sandboxed `nix build` would require
 inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
 `hardware.graphics.enable = true`).
 
+### Building on Fedora and Fedora Atomic (Bazzite, Bluefin, Silverblue)
+
+On regular Fedora, install dependencies on the host. On Fedora Atomic variants such as Bazzite,
+Bluefin and Silverblue, use [Distrobox](https://distrobox.it/) and run the install and build steps
+inside the container. Keep the checkout in your home directory so it is shared with the container.
+Add `--nvidia` to the create command for hosts using the proprietary NVIDIA driver:
+
+```bash
+distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:latest
+distrobox enter kyty-build
+```
+
+Install the toolchain, Qt 6 and SDL3 dependencies:
+
+```bash
+sudo dnf install -y \
+  clang lld ninja-build cmake git glslang python3 pkgconf-pkg-config \
+  mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
+  libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
+  alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
+  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+```
+
+From the repository root, follow the launcher configure, build and install steps in
+[Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
+Fedora's packaged Qt 6 automatically.
+
+Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
+container build from the host, leave the container with `exit`, then run from the repository root:
+
+```bash
+distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
+```
+
+Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
+if its other system libraries are compatible with the container build.
+
 ### Building on macOS
 
 macOS builds target x86-64 and run under Rosetta 2 on Apple Silicon, so the PS5's x86-64 game
@@ -251,8 +305,8 @@ Requirements:
 
 - An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
 - Xcode (or the Command Line Tools)
-- Homebrew packages: `brew install cmake ninja glslang`
-- Qt 6 (Concurrent, Network, Widgets) with x86-64 support. The official Qt installation is
+- Homebrew packages: `brew install cmake ninja glslang python`
+- Qt 6 (Concurrent, Network, and Widgets) with x86-64 support. The official Qt installation is
   universal and works; Homebrew's Qt is arm64-only and will not link
 
 ```bash
@@ -268,14 +322,14 @@ cmake --install _Build/macos --prefix _Build/macos/install
 ```
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the install
+guest code; no manual signing step is required. When the launcher is built, the installation
 also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
 A flat `kyty_emulator` is kept for CLI usage.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
 `MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
+(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
@@ -301,7 +355,7 @@ Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
 Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
+`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
 compiler per platform, so on Linux configure from the command line as shown above.
 
 Before using it:
@@ -321,11 +375,11 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\_Build\windows\install\launcher.exe
+.\_Build\windows\install\kyty_launcher.exe
 ```
 
 ```bash
-./_Build/linux/install/launcher
+./_Build/linux/install/kyty_launcher
 ```
 
 ```bash
@@ -336,6 +390,14 @@ On first launch, add one or more game folders in the global settings. The launch
 folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
 whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
 ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
+
+Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
+or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
+for your platform from GitHub, checks its SHA-256 checksum, and restarts after installation. Close
+any running games first. Settings, saves, patches, and other files outside the release package are
+preserved; replacement failures restore the previous files. The installation folder must be writable.
+If a package cannot be installed automatically, the updater offers the GitHub release page.
+Source builds and builds from forks do not replace themselves with official releases.
 
 The emulator can also be started directly with a legally obtained game directory, ELF file, or
 ZArchive dump:
@@ -392,5 +454,5 @@ licenses included with those components.
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
 - [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
-  memory behavior, GPU resource aliasing and cache coherency,
+  memory behavior, GPU resource aliasing, cache coherency,
   and the AVPlayer implementation.

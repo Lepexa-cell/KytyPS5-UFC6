@@ -11,8 +11,8 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <array>
 #include <map>
-#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -25,44 +25,6 @@ class TextureCache;
 
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
-
-// Step 3a (measurement only): the last guest-GPU operation that marked a range
-// GPU-written. Recorded under KYTY_LOG_CLEAR_WAIT=1 only; writers that do not set the
-// scope below log as "unknown".
-enum class GpuWriteOp : uint8_t {
-	Unknown,
-	Draw,
-	Dispatch,
-	DmaFill,
-	DmaCopy,
-	WriteData,
-	EndOfPipe,
-};
-struct GpuWriteOrigin {
-	GpuWriteOp op = GpuWriteOp::Unknown;
-	// DmaFill/WriteData/EndOfPipe: fill value. DmaCopy: source address.
-	uint64_t value = 0;
-	// DmaFill/DmaCopy: byte size. WriteData/EndOfPipe: dword count / 4-or-8 size.
-	uint64_t size = 0;
-	uint64_t shader_hash = 0;
-	uint64_t tick = 0;
-	uint32_t frame_draw = 0;
-	uint32_t frame_dispatch = 0;
-};
-
-// Why a synchronous buffer download waits: every DownloadBufferCopies<false>
-// call goes through ReadMemoryStep, so tagging the ReadMemory entry attributes
-// the whole sync-download stall to its first CPU consumer. Diagnostic only.
-// Count is not a cause: it sizes the telemetry arrays and must stay last.
-enum class SyncDownloadCause : uint8_t {
-	General = 0,      // Unknown / diagnostic paths.
-	ClearMetadata,    // MaterializeColorClear DCC/Cmask metadata refresh.
-	IndirectDispatch, // DispatchIndirect workgroup-count refresh.
-	GpuFault,         // Tracked-page fault served on the GPU thread.
-	SrtGuestRead,     // SRT/materialize guest read of GPU-owned bytes.
-	WriteInvalidate,  // CPU write fault: InvalidateMemory downloads GPU-owned bytes.
-	Count
-};
 
 class BufferCache {
 public:
@@ -90,23 +52,13 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
-	                                 SyncDownloadCause cause = SyncDownloadCause::General);
+	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
-	// needs_device_address: the caller reads the data through a buffer device address, which
-	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer      = false,
-	                                                        BufferId id                   = {},
-	                                                        bool     needs_device_address = false);
-	// A written binding of which the shader's stores reach only [written_vaddr, written_vaddr +
-	// written_size): the whole range is synchronized, only that part becomes GPU-written.
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferWritten(uint64_t vaddr, uint64_t size,
-	                                                               uint64_t written_vaddr,
-	                                                               uint64_t written_size,
-	                                                               BufferId id = {});
+	                                                        bool     is_texel_buffer = false,
+	                                                        BufferId id              = {});
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -117,62 +69,31 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
-	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
-	// memory holds their current value even when their page is protected.
-	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
-	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void                            ProcessFaultBuffer();
-	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
-	// downloading the page: the host copy through the backing store, the GPU copy in the command
-	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
-	// sides and no longer need a download. False when there is nothing to save (the page is not
-	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
-	// no cached buffer covers them); the caller then writes normally.
-	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
-	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
-	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
-		return m_fault_manager.UnattributedFaults();
+	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
+	// until a GPU write or download.
+	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
+	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+	void               ProcessFaultBuffer();
+	void               SynchronizeBda(const RangeSet& mapped);
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.QueueBdaSync(vaddr, size);
 	}
-	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
-	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
-	void                            RunGarbageCollector();
-	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
-	// downloading what the GPU wrote there (drains the GPU).
-	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
-
-	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
-	inline static thread_local uint64_t s_diag_shader_hash = 0;
-
-	// Step 3a (measurement only): the current guest-GPU operation on this (GPU) thread, if any.
-	inline static thread_local GpuWriteOrigin s_diag_write_origin;
-	struct DiagWriteScope {
-		explicit DiagWriteScope(GpuWriteOrigin origin): m_prev(s_diag_write_origin) {
-			s_diag_write_origin = origin;
-		}
-		~DiagWriteScope() { s_diag_write_origin = m_prev; }
-		KYTY_CLASS_NO_COPY(DiagWriteScope);
-		GpuWriteOrigin m_prev;
-	};
-	void                          RecordGpuWriteOrigin(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] static GpuWriteOrigin FindGpuWriteOrigin(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] static const char*    GpuWriteOpName(GpuWriteOp op) noexcept;
+	void               RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
 
-	void ReleaseBuffer(BufferId id);
 	bool IsBufferInvalid(BufferId id) const {
 		const auto* buffer = m_slot_buffers.try_get(id);
 		return buffer == nullptr || buffer->is_deleted;
@@ -190,69 +111,48 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
-	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
-	void MarkGpuWritten(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void                   Unregister(BufferId id);
+	void Unregister(BufferId id);
 	template <bool insert>
-	void                     ChangeRegister(BufferId id);
-	void                     DeleteBuffer(BufferId id);
-	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                           bool is_written, bool is_texel_buffer);
+	void ChangeRegister(BufferId id);
+	void DeleteBuffer(BufferId id);
+	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                     bool is_written, bool is_texel_buffer);
+	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
-	// cause has no default: every internal hop must name its caller, so a missed
-	// argument is a compile error instead of a silent General.
-	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
-	                                      bool from_gpu_thread, bool async,
-	                                      SyncDownloadCause cause);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
-	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        SyncDownloadCause cause);
-	template <bool async>
-	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                        SyncDownloadCause cause);
-	template <bool async>
-	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-	                          uint64_t total_size, SyncDownloadCause cause);
+	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
-	GraphicContext&                                    m_graphics;
-	CommandScheduler&                                  m_scheduler;
-	FaultManager                                       m_fault_manager;
-	Buffer                                             m_gds_buffer;
-	Buffer                                             m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                         m_slot_buffers;
+	GraphicContext&                                   m_graphics;
+	CommandScheduler&                                 m_scheduler;
+	FaultManager                                      m_fault_manager;
+	Buffer                                            m_gds_buffer;
+	Buffer                                            m_bda_pagetable_buffer;
+	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                          m_buffers;
-	PageTable                                          m_page_table;
-	RangeSet                                           m_gpu_modified_ranges;
-	// Bytes whose download is recorded but not yet in guest memory.
-	RangeSet                                           m_downloading_ranges;
-	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
-	uint64_t                                           m_last_async_download_tick = 0;
-	// Guards changes to both range sets (GPU thread and download completions) against
-	// IsCleanForConcurrentRead; the GPU thread reads them without it.
-	mutable std::shared_mutex                          m_dirty_ranges_mutex;
-	MemoryTracker                                      m_memory_tracker;
-	StreamBuffer                                       m_staging_buffer;
-	StreamBuffer                                       m_stream_buffer;
-	StreamBuffer                                       m_download_buffer;
-	StreamBuffer                                       m_device_buffer;
-	TextureCache&                                      m_texture_cache;
-	uint64_t                                           m_total_used_memory = 0;
+	BufferMap                                         m_buffers;
+	PageTable                                         m_page_table;
+	RangeSet                                          m_gpu_modified_ranges;
+	// One per TileManager::ColorClearSlots key slot.
+	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	MemoryTracker                                     m_memory_tracker;
+	StreamBuffer                                      m_staging_buffer;
+	StreamBuffer                                      m_stream_buffer;
+	StreamBuffer                                      m_download_buffer;
+	StreamBuffer                                      m_device_buffer;
+	TextureCache&                                     m_texture_cache;
+	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
-	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
-	// stretch without presents still ages its entries.
-	[[nodiscard]] uint64_t LruClock() const noexcept;
 };
 
 } // namespace Libs::Graphics

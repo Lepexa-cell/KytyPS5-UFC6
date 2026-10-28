@@ -10,9 +10,6 @@ namespace Common {
 
 void InitializeThreads();
 
-// Current process id for startup diagnostics (portable wrapper).
-[[nodiscard]] unsigned long long CurrentProcessId() noexcept;
-
 using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 

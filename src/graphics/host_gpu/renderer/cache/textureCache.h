@@ -12,10 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
-#include <functional>
+#include <bitset>
 #include <map>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -27,37 +26,18 @@ class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
 class RenderExecutor;
+class TextureCache;
 struct TextureCacheTestAccess;
+
+namespace BcAlias {
+[[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
+[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
+void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+} // namespace BcAlias
 
 class TextureCache {
 public:
-	// Called before a bindless-pinned image is unregistered.
-	std::function<void(ImageId)> on_bindless_unregister;
-	// Called right before an image is destroyed; true keeps it one more GPU tick (a bindless slot
-	// still held one of its views and was repointed).
-	std::function<bool(const Image&)> on_image_release;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
-
-	// Step 3b regression fix: fill fragment module depends on the attachment class.
-	// Public so the anonymous-namespace classifier in textureCache.cpp can name it.
-	enum class ClearFillClass : uint8_t { Float, Uint, Sint };
-	// TryMaterializeColorClearGpu* attempt records one of these; the counters print in
-	// [FRAME_TELEMETRY_CLEARFB].
-	enum class ClearFbReason : uint8_t {
-		NoCondRendering,
-		Resources,
-		Unsupported,
-		NoCandidates,
-		TooManyCandidates,
-		MetaRange,
-		DepthOrMsaa,
-		IntFormat,
-		PipelineFail,
-	};
-	// Step 3b: outcome of the GPU-predicate attempt. SkippedNoCand means no metadata code
-	// decodes for this image, so the old path is a proven no-op and the wait is skipped
-	// without a readback.
-	enum class ClearPredicateResult : uint8_t { Applied, SyncFallback, SkippedNoCand };
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -88,6 +68,7 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
@@ -99,15 +80,9 @@ public:
 	void RunGarbageCollector();
 
 private:
-	enum class TransferDirection { Upload, Download };
-	struct TextureTransfer;
-	struct ImageDownload;
-
 	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile };
-
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {
@@ -137,11 +112,9 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
-	void                      ReleaseImage(ImageId id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
@@ -167,61 +140,22 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
-	// Step 3: GPU predicate for the color-clear metadata wait. Checks the decodable codes
-	// on the GPU and clears the image conditionally.
-	// Step 3b: on SyncFallback, out_reason (when non-null) receives the failing check so
-	// the caller can log it; every false return from the Dispatch/Draw halves assigns it.
-	[[nodiscard]] ClearPredicateResult
-	TryMaterializeColorClearGpu(ImageId id, const ImageDesc& desc, uint32_t first, uint32_t count,
-	                           uint64_t slice_size, uint64_t range_address, uint64_t range_size,
-	                           ClearFbReason* out_reason = nullptr);
-	[[nodiscard]] bool ClearPredicateEnsureResources();
-	// Step 3 dispatch half: records the check compute and the conditional clears.
-	// Candidates are (code byte, clear color) pairs decodable for this image.
-	struct ClearPredicateCandidate {
-		uint8_t             code;
-		vk::ClearColorValue clear;
-	};
-	// Step 3b: cached decodable (code, clear color) pairs per clear-relevant desc fields,
-	// so the 256-code DecodeColorClear loop doesn't run every frame.
-	struct ClearCandidatesKey {
-		ImageMetadataKind kind;
-		vk::Format        format;
-		BindingType       type;
-		uint32_t          clear_word;
-		bool              clear_register_valid;
-		bool              dcc_alpha_msb;
-		auto operator<=>(const ClearCandidatesKey&) const = default;
-	};
-	struct ClearCandidatesResult {
-		bool                                 too_many = false;
-		std::vector<ClearPredicateCandidate> candidates;
-	};
-	ClearCandidatesResult LookupClearCandidates(const ImageDesc& desc);
-	[[nodiscard]] ClearFillClass ClearFillClassFor(vk::Format format);
-	[[nodiscard]] bool TryMaterializeColorClearGpuDispatch(
-	    ImageId id, const ImageDesc& desc, uint32_t count, uint64_t slice_size,
-	    uint64_t range_address, uint64_t range_size, const ClearPredicateCandidate* candidates,
-	    size_t candidate_count, ClearFbReason* out_reason);
-	// Step 3 draw half: one predicated fullscreen-triangle draw per (slice, candidate).
-	// Conditional rendering gates draws, unlike transfer clears.
-	[[nodiscard]] bool TryMaterializeColorClearGpuDraw(ImageId id, const ImageDesc& desc,
-	                                                  uint32_t count,
-	                                                  const ClearPredicateCandidate* candidates,
-	                                                  size_t candidate_count, ClearFbReason* out_reason);
-	[[nodiscard]] vk::Pipeline ClearFillPipelineFor(vk::Format format);
 	void                        InitializeImage(ImageId id);
-	[[nodiscard]] TextureTransfer
-	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
-	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                       uint64_t destination_size, ImageDownload transfer);
+	                   uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
+	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
+	// render area.
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	                               vk::CommandBuffer command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -231,9 +165,7 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
-	// evicting: the collector writes the image back before freeing it; the write is dropped if
-	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
-	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false);
+	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -242,30 +174,8 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
-	// Step 3: persistent GPU resources for the color-clear predicate check shader.
-	vk::DescriptorSetLayout m_clear_predicate_desc_layout = nullptr;
-	vk::PipelineLayout      m_clear_predicate_layout      = nullptr;
-	vk::Pipeline            m_clear_predicate_pipeline    = nullptr;
-	// Step 3 fill path: fullscreen-triangle pipeline writing the clear color. One
-	// pipeline per color format; cached by format value.
-	vk::DescriptorSetLayout m_clear_fill_desc_layout = nullptr;
-	vk::PipelineLayout      m_clear_fill_layout      = nullptr;
-	vk::ShaderModule        m_clear_fill_vert        = nullptr;
-	vk::ShaderModule        m_clear_fill_frag        = nullptr;
-	struct ClearFillPipeline {
-		vk::Format   format = vk::Format::eUndefined;
-		vk::Pipeline handle = nullptr;
-	};
-	std::vector<ClearFillPipeline> m_clear_fill_pipelines;
-	std::unique_ptr<Buffer> m_clear_predicate_buffer;
-	vk::ShaderModule        m_clear_fill_frag_uint = nullptr;
-	vk::ShaderModule        m_clear_fill_frag_sint = nullptr;
-	// Step 3b: decodable clear-candidate pairs per clear-relevant desc fields. Bounded:
-	// cleared once it grows past 256 entries.
-	std::map<ClearCandidatesKey, ClearCandidatesResult> m_clear_candidates_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -274,20 +184,17 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
-	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.
-	uint64_t         m_gc_budget_frame        = 0;
-	uint64_t         m_gc_freed_bytes_frame   = 0;
-	size_t           m_gc_freed_images_frame  = 0;
-	uint64_t         m_gc_written_back_bytes_frame = 0;
-	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
-	// stretch without presents (a loading screen) still ages its entries.
-	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class ImageHeap;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics
